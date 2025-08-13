@@ -15,7 +15,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import scipy.signal as sps
 import httpx
-import websocket as ws_client  # Renamed to avoid any potential conflict
+import websocket
 from urllib.parse import parse_qs, urlparse
 from piopiy import StreamAction
 
@@ -445,7 +445,7 @@ def start_fast_deepgram():
         time.sleep(5)
         if DEEPGRAM_API_KEY:
             headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-            dg_ws_client = ws_client.WebSocketApp(
+            dg_ws_client = websocket.WebSocketApp(
                 DG_WS_URL,
                 header=headers,
                 on_open=on_open,
@@ -457,7 +457,7 @@ def start_fast_deepgram():
 
     if DEEPGRAM_API_KEY:
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-        dg_ws_client = ws_client.WebSocketApp(
+        dg_ws_client = websocket.WebSocketApp(
             DG_WS_URL,
             header=headers,
             on_open=on_open,
@@ -587,14 +587,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
                         if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                             processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, message["bytes"])
-                            dg_ws_client.send(processed_audio, opcode=ws_client.ABNF.OPCODE_BINARY)
+                            dg_ws_client.send_binary(processed_audio)
                             print("📤 Sent audio to Deepgram")
                         else:
                             print("⚠️ Deepgram WebSocket not connected")
-                            if not dg_ws_client:
-                                print("🔄 Attempting to restart Deepgram WebSocket")
-                                start_fast_deepgram()
-                                await asyncio.sleep(1)
                     except Exception as e:
                         print(f"⚠️ Error processing audio data: {e}")
     except Exception as e:
