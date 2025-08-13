@@ -126,7 +126,7 @@ class AgentConfig:
 # Initialize agent config
 agent_config = AgentConfig()
 
-@router.get("/")
+@router.get("")
 async def get_config():
     """Get current agent configuration"""
     try:
@@ -135,8 +135,8 @@ async def get_config():
     except Exception as e:
         return {"success": False, "error": str(e)}, 500
 
-@router.put("/")
-@router.post("/")
+@router.put("")
+@router.post("")
 async def update_config(data: ConfigUpdate):
     """Update agent configuration"""
     try:
