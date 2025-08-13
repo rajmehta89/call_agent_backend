@@ -4,21 +4,19 @@ MongoDB-based FastAPI for Leads Management
 Provides endpoints for managing leads, CSV upload, and calling functionality
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Path
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from datetime import datetime
-import json
+from datetime import datetime, timedelta
 import os
-import uuid
 import csv
 import io
+import time
 from dotenv import load_dotenv
 from bson import ObjectId
 from piopiy import RestClient, Action
 from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
-from config import ALLOWED_ORIGINS
 
 load_dotenv()
 
@@ -27,7 +25,9 @@ router = APIRouter(
     tags=["Leads Management"]
 )
 
-# Pydantic models
+# ---------------------------
+# Models
+# ---------------------------
 class Lead(BaseModel):
     id: Optional[str] = None
     name: str
@@ -49,11 +49,11 @@ class LeadUpdate(BaseModel):
     notes: Optional[str] = None
     status: Optional[str] = None
 
-# Piopiy Configuration
-APP_ID = os.getenv("APP_ID")
-APP_SECRET = os.getenv("APP_SECRET")
-CALLER_ID = os.getenv("CALLER_ID")
-WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
+# ---------------------------
+# Utilities
+# ---------------------------
+def is_valid_object_id(s: str) -> bool:
+    return isinstance(s, str) and len(s) == 24 and all(c in "0123456789abcdefABCDEF" for c in s)
 
 def clean_phone_number(phone_str):
     """Removes '+', '-', and spaces, then converts to integer."""
@@ -61,21 +61,27 @@ def clean_phone_number(phone_str):
         return int(phone_str.replace('+', '').replace('-', '').replace(' ', ''))
     return phone_str
 
+# ---------------------------
+# Piopiy Outbound Call
+# ---------------------------
+APP_ID = os.getenv("APP_ID")
+APP_SECRET = os.getenv("APP_SECRET")
+CALLER_ID = os.getenv("CALLER_ID")
+WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
+
 class OutboundCaller:
     def __init__(self):
         if not all([APP_ID, APP_SECRET, CALLER_ID, WEBSOCKET_URL]):
             print("⚠️ Warning: Piopiy credentials not configured. Call functionality will be simulated.")
             self.client = None
             return
-
         self.client = RestClient(int(APP_ID), APP_SECRET)
-        print(f"🔧 Outbound caller initialized.")
+        print("🔧 Outbound caller initialized.")
         print(f"   - Caller ID: {CALLER_ID}")
         print(f"   - WebSocket URL: {WEBSOCKET_URL}")
 
     def make_call(self, customer_number_str, lead_id: str | None = None):
         """Initiates an outbound call and connects it to the WebSocket voice agent."""
-        import time
         session_id = f"lead-{lead_id or 'unknown'}-{int(time.time()*1000)}"
 
         if not self.client:
@@ -115,7 +121,6 @@ class OutboundCaller:
             )
 
             print("✅ Call initiated successfully!")
-            print("   - Response from Piopiy:", response)
             return {
                 "status": "initiated",
                 "piopiy_response": response,
@@ -126,236 +131,185 @@ class OutboundCaller:
             print(f"❌ Failed to make call: {e}")
             return {"error": str(e)}
 
-# Initialize outbound caller
 outbound_caller = OutboundCaller()
 
+# ---------------------------
+# Data access helpers
+# ---------------------------
 def get_leads(filters: Dict = None, limit: int = 50, skip: int = 0):
     """Get leads from MongoDB with optional filters"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
 
-        query = {}
-        if filters:
-            if filters.get("status"):
-                query["status"] = filters["status"]
-            if filters.get("search"):
-                search_term = filters["search"]
-                query["$or"] = [
-                    {"name": {"$regex": search_term, "$options": "i"}},
-                    {"phone": {"$regex": search_term, "$options": "i"}},
-                    {"email": {"$regex": search_term, "$options": "i"}},
-                    {"company": {"$regex": search_term, "$options": "i"}}
-                ]
+    query = {}
+    if filters:
+        if filters.get("status"):
+            query["status"] = filters["status"]
+        if filters.get("search"):
+            search_term = filters["search"]
+            query["$or"] = [
+                {"name": {"$regex": search_term, "$options": "i"}},
+                {"phone": {"$regex": search_term, "$options": "i"}},
+                {"email": {"$regex": search_term, "$options": "i"}},
+                {"company": {"$regex": search_term, "$options": "i"}}
+            ]
 
-        leads = list(mongo_client.leads.find(query).sort("created_at", -1).skip(skip).limit(limit))
-        for lead in leads:
-            lead["_id"] = str(lead["_id"])
+    leads = list(mongo_client.leads.find(query).sort("created_at", -1).skip(skip).limit(limit))
+    for lead in leads:
+        lead["_id"] = str(lead["_id"])
 
-        total_count = mongo_client.leads.count_documents(query)
+    total_count = mongo_client.leads.count_documents(query)
 
-        return {
-            "success": True,
-            "data": leads,
-            "total": total_count,
-            "limit": limit,
-            "skip": skip
-        }
-
-    except Exception as e:
-        print(f"❌ Error getting leads: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    return {
+        "success": True,
+        "data": leads,
+        "total": total_count,
+        "limit": limit,
+        "skip": skip
+    }
 
 def add_lead(lead_data: Dict):
-    """Add a new lead to MongoDB"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
 
-        if not lead_data.get("name") or not lead_data.get("phone"):
-            raise HTTPException(status_code=400, detail={"success": False, "error": "Name and phone are required"})
+    if not lead_data.get("name") or not lead_data.get("phone"):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Name and phone are required"})
 
-        existing_lead = mongo_client.leads.find_one({"phone": lead_data["phone"]})
-        if existing_lead:
-            raise HTTPException(status_code=400, detail={"success": False, "error": "Phone number already exists"})
+    existing_lead = mongo_client.leads.find_one({"phone": lead_data["phone"]})
+    if existing_lead:
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Phone number already exists"})
 
-        lead_doc = {
-            "name": lead_data["name"],
-            "phone": lead_data["phone"],
-            "email": lead_data.get("email", ""),
-            "company": lead_data.get("company", ""),
-            "notes": lead_data.get("notes", ""),
-            "status": "new",
-            "call_attempts": 0,
-            "last_call": None,
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        }
+    lead_doc = {
+        "name": lead_data["name"],
+        "phone": lead_data["phone"],
+        "email": lead_data.get("email", ""),
+        "company": lead_data.get("company", ""),
+        "notes": lead_data.get("notes", ""),
+        "status": "new",
+        "call_attempts": 0,
+        "last_call": None,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
 
-        result = mongo_client.leads.insert_one(lead_doc)
-        lead_doc["_id"] = str(result.inserted_id)
-
-        return {"success": True, "data": lead_doc}
-
-    except Exception as e:
-        print(f"❌ Error adding lead: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    result = mongo_client.leads.insert_one(lead_doc)
+    lead_doc["_id"] = str(result.inserted_id)
+    return {"success": True, "data": lead_doc}
 
 def update_lead(lead_id: str, lead_data: Dict):
-    """Update a lead in MongoDB"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
 
-        if not lead_data.get("name") or not lead_data.get("phone"):
-            raise HTTPException(status_code=400, detail={"success": False, "error": "Name and phone are required"})
+    if not is_valid_object_id(lead_id):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Invalid lead id"})
 
-        existing_lead = mongo_client.leads.find_one({
-            "phone": lead_data["phone"],
-            "_id": {"$ne": ObjectId(lead_id)}
-        })
-        if existing_lead:
-            raise HTTPException(status_code=400, detail={"success": False, "error": "Phone number already exists"})
+    if not lead_data.get("name") or not lead_data.get("phone"):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Name and phone are required"})
 
-        update_data = {
-            "name": lead_data["name"],
-            "phone": lead_data["phone"],
-            "email": lead_data.get("email", ""),
-            "company": lead_data.get("company", ""),
-            "notes": lead_data.get("notes", ""),
-            "status": lead_data.get("status", "new"),
-            "updated_at": datetime.now()
-        }
+    existing_lead = mongo_client.leads.find_one({
+        "phone": lead_data["phone"],
+        "_id": {"$ne": ObjectId(lead_id)}
+    })
+    if existing_lead:
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Phone number already exists"})
 
-        result = mongo_client.leads.update_one(
-            {"_id": ObjectId(lead_id)},
-            {"$set": update_data}
-        )
+    update_data = {
+        "name": lead_data["name"],
+        "phone": lead_data["phone"],
+        "email": lead_data.get("email", ""),
+        "company": lead_data.get("company", ""),
+        "notes": lead_data.get("notes", ""),
+        "status": lead_data.get("status", "new"),
+        "updated_at": datetime.now()
+    }
 
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
+    result = mongo_client.leads.update_one(
+        {"_id": ObjectId(lead_id)},
+        {"$set": update_data}
+    )
 
-        updated_lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
-        updated_lead["_id"] = str(updated_lead["_id"])
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
-        return {"success": True, "data": updated_lead}
-
-    except Exception as e:
-        print(f"❌ Error updating lead: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    updated_lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
+    updated_lead["_id"] = str(updated_lead["_id"])
+    return {"success": True, "data": updated_lead}
 
 def delete_lead(lead_id: str):
-    """Delete a lead from MongoDB"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
 
-        result = mongo_client.leads.delete_one({"_id": ObjectId(lead_id)})
+    if not is_valid_object_id(lead_id):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Invalid lead id"})
 
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
-
-        return {"success": True, "message": "Lead deleted successfully"}
-
-    except Exception as e:
-        print(f"❌ Error deleting lead: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    result = mongo_client.leads.delete_one({"_id": ObjectId(lead_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
+    return {"success": True, "message": "Lead deleted successfully"}
 
 def get_lead_by_id(lead_id: str):
-    """Get a specific lead by ID"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not is_valid_object_id(lead_id):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Invalid lead id"})
 
-        lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
+    lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
+    if not lead:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
-        if not lead:
-            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
-
-        lead["_id"] = str(lead["_id"])
-        return {"success": True, "data": lead}
-
-    except Exception as e:
-        print(f"❌ Error getting lead: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    lead["_id"] = str(lead["_id"])
+    return {"success": True, "data": lead}
 
 def get_leads_stats():
-    """Get leads statistics"""
-    try:
-        if not mongo_client.is_connected():
-            raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
 
-        total_leads = mongo_client.leads.count_documents({})
-        status_counts = {}
-        for status in ["new", "called", "contacted", "converted"]:
-            status_counts[status] = mongo_client.leads.count_documents({"status": status})
+    total_leads = mongo_client.leads.count_documents({})
+    status_counts = {}
+    for status in ["new", "called", "contacted", "converted"]:
+        status_counts[status] = mongo_client.leads.count_documents({"status": status})
 
-        pipeline = [
-            {"$group": {"_id": None, "total_calls": {"$sum": "$call_attempts"}}}
-        ]
-        calls_result = list(mongo_client.leads.aggregate(pipeline))
-        total_calls = calls_result[0]["total_calls"] if calls_result else 0
+    pipeline = [{"$group": {"_id": None, "total_calls": {"$sum": "$call_attempts"}}}]
+    calls_result = list(mongo_client.leads.aggregate(pipeline))
+    total_calls = calls_result[0]["total_calls"] if calls_result else 0
 
-        return {
-            "success": True,
-            "data": {
-                "total": total_leads,
-                "new": status_counts.get("new", 0),
-                "called": status_counts.get("called", 0),
-                "contacted": status_counts.get("contacted", 0),
-                "converted": status_counts.get("converted", 0),
-                "total_calls": total_calls
-            }
+    return {
+        "success": True,
+        "data": {
+            "total": total_leads,
+            "new": status_counts.get("new", 0),
+            "called": status_counts.get("called", 0),
+            "contacted": status_counts.get("contacted", 0),
+            "converted": status_counts.get("converted", 0),
+            "total_calls": total_calls
         }
+    }
 
-    except Exception as e:
-        print(f"❌ Error getting leads stats: {e}")
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+# ---------------------------
+# Routes
+# IMPORTANT: Non-parameter routes BEFORE "/{lead_id}"
+# ---------------------------
 
 @router.get("/")
-async def get_leads_endpoint(status: Optional[str] = None, search: Optional[str] = None, limit: int = 50, skip: int = 0):
+async def get_leads_endpoint(
+        status: Optional[str] = Query(None),
+        search: Optional[str] = Query(None),
+        limit: int = Query(50, ge=1, le=200),
+        skip: int = Query(0, ge=0),
+):
     """Get leads with optional filters"""
-    try:
-        filters = {}
-        if status:
-            filters["status"] = status
-        if search:
-            filters["search"] = search
-
-        return get_leads(filters, limit, skip)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
-
-@router.get("/{lead_id}")
-async def get_lead_endpoint(lead_id: str):
-    """Get a specific lead by ID"""
-    return get_lead_by_id(lead_id)
+    filters = {}
+    if status:
+        filters["status"] = status
+    if search:
+        filters["search"] = search
+    return get_leads(filters, limit, skip)
 
 @router.post("/")
 async def add_lead_endpoint(lead: Lead):
     """Add a new lead"""
-    try:
-        lead_data = lead.dict(exclude_unset=True)
-        return add_lead(lead_data)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
-
-@router.put("/{lead_id}")
-async def update_lead_endpoint(lead_id: str, lead: LeadUpdate):
-    """Update a lead"""
-    try:
-        lead_data = lead.dict(exclude_unset=True)
-        return update_lead(lead_id, lead_data)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
-
-@router.delete("/{lead_id}")
-async def delete_lead_endpoint(lead_id: str):
-    """Delete a lead"""
-    return delete_lead(lead_id)
+    lead_data = lead.dict(exclude_unset=True)
+    return add_lead(lead_data)
 
 @router.get("/stats")
 async def get_leads_stats_endpoint():
@@ -365,122 +319,137 @@ async def get_leads_stats_endpoint():
 @router.post("/upload")
 async def upload_leads_csv(file: UploadFile = File(...)):
     """Upload leads from CSV file"""
-    try:
-        if not file.filename.endswith('.csv'):
-            raise HTTPException(status_code=400, detail={"success": False, "error": "File must be a CSV"})
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "File must be a CSV"})
 
-        content = await file.read()
-        stream = io.StringIO(content.decode("utf-8"))
-        csv_reader = csv.DictReader(stream)
+    content = await file.read()
+    stream = io.StringIO(content.decode("utf-8"))
+    csv_reader = csv.DictReader(stream)
 
-        imported_count = 0
-        errors = []
+    imported_count = 0
+    errors = []
 
-        for row_num, row in enumerate(csv_reader, start=2):
-            try:
-                if not row.get('name') or not row.get('phone'):
-                    errors.append(f"Row {row_num}: Missing name or phone")
-                    continue
+    for row_num, row in enumerate(csv_reader, start=2):
+        try:
+            if not row.get('name') or not row.get('phone'):
+                errors.append(f"Row {row_num}: Missing name or phone")
+                continue
 
-                existing_lead = mongo_client.leads.find_one({"phone": row['phone']})
-                if existing_lead:
-                    errors.append(f"Row {row_num}: Phone number {row['phone']} already exists")
-                    continue
+            existing_lead = mongo_client.leads.find_one({"phone": row['phone']})
+            if existing_lead:
+                errors.append(f"Row {row_num}: Phone number {row['phone']} already exists")
+                continue
 
-                lead_data = {
-                    "name": row['name'].strip(),
-                    "phone": row['phone'].strip(),
-                    "email": row.get('email', '').strip(),
-                    "company": row.get('company', '').strip(),
-                    "notes": row.get('notes', '').strip(),
-                    "status": "new",
-                    "call_attempts": 0,
-                    "last_call": None,
-                    "created_at": datetime.now(),
-                    "updated_at": datetime.now()
-                }
+            lead_data = {
+                "name": row['name'].strip(),
+                "phone": row['phone'].strip(),
+                "email": row.get('email', '').strip(),
+                "company": row.get('company', '').strip(),
+                "notes": row.get('notes', '').strip(),
+                "status": "new",
+                "call_attempts": 0,
+                "last_call": None,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now()
+            }
 
-                mongo_client.leads.insert_one(lead_data)
-                imported_count += 1
+            mongo_client.leads.insert_one(lead_data)
+            imported_count += 1
 
-            except Exception as e:
-                errors.append(f"Row {row_num}: {str(e)}")
+        except Exception as e:
+            errors.append(f"Row {row_num}: {str(e)}")
 
-        return {
-            "success": True,
-            "imported_count": imported_count,
-            "errors": errors,
-            "message": f"Successfully imported {imported_count} leads"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    return {
+        "success": True,
+        "imported_count": imported_count,
+        "errors": errors,
+        "message": f"Successfully imported {imported_count} leads"
+    }
 
 @router.post("/{lead_id}/call")
-async def call_lead_endpoint(lead_id: str):
+async def call_lead_endpoint(
+        lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")
+):
     """Initiate a call to a lead"""
-    try:
-        lead_result = get_lead_by_id(lead_id)
-        if not lead_result["success"]:
-            raise HTTPException(status_code=404, detail=lead_result)
+    lead_result = get_lead_by_id(lead_id)
+    if not lead_result["success"]:
+        raise HTTPException(status_code=404, detail=lead_result)
 
-        lead = lead_result["data"]
-        call_result = outbound_caller.make_call(lead["phone"], lead_id)
+    lead = lead_result["data"]
+    call_result = outbound_caller.make_call(lead["phone"], lead_id)
 
-        if call_result.get("error"):
-            raise HTTPException(status_code=500, detail={"success": False, "error": call_result["error"]})
+    if call_result.get("error"):
+        raise HTTPException(status_code=500, detail={"success": False, "error": call_result["error"]})
 
-        call_data = {
-            "direction": "outbound",
-            "status": "initiated",
-            "duration": 0,
-            "summary": f"Outbound call initiated to {lead['name']}",
-            "piopiy_response": call_result.get("piopiy_response", call_result),
-            "call_session_id": call_result.get("session_id")
-        }
+    call_data = {
+        "direction": "outbound",
+        "status": "initiated",
+        "duration": 0,
+        "summary": f"Outbound call initiated to {lead['name']}",
+        "piopiy_response": call_result.get("piopiy_response", call_result),
+        "call_session_id": call_result.get("session_id")
+    }
 
-        log_result = log_call(lead["phone"], lead_id, call_data)
-        if log_result["success"]:
-            print(f"✅ Call logged: {log_result['data']['_id']}")
+    log_result = log_call(lead["phone"], lead_id, call_data)
+    if log_result.get("success"):
+        print(f"✅ Call logged: {log_result['data']['_id']}")
 
-        mongo_client.leads.update_one(
-            {"_id": ObjectId(lead_id)},
-            {
-                "$inc": {"call_attempts": 1},
-                "$set": {
-                    "last_call": datetime.now(),
-                    "updated_at": datetime.now()
-                }
-            }
-        )
-
-        update_lead_status_from_call(lead["phone"], lead_id, call_data)
-
-        updated_lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
-        updated_lead["_id"] = str(updated_lead["_id"])
-
-        return {
-            "success": True,
-            "message": f"Call initiated to {lead['name']}",
-            "data": {
-                "lead": updated_lead,
-                "call": call_result,
-                "call_log": log_result.get("data")
+    mongo_client.leads.update_one(
+        {"_id": ObjectId(lead_id)},
+        {
+            "$inc": {"call_attempts": 1},
+            "$set": {
+                "last_call": datetime.now(),
+                "updated_at": datetime.now()
             }
         }
+    )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    update_lead_status_from_call(lead["phone"], lead_id, call_data)
+
+    updated_lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
+    updated_lead["_id"] = str(updated_lead["_id"])
+
+    return {
+        "success": True,
+        "message": f"Call initiated to {lead['name']}",
+        "data": {
+            "lead": updated_lead,
+            "call": call_result,
+            "call_log": log_result.get("data")
+        }
+    }
+
+# Put the parameterized routes LAST to avoid collisions with /stats, /upload, etc.
+@router.get("/{lead_id}")
+async def get_lead_endpoint(
+        lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")
+):
+    """Get a specific lead by ID"""
+    return get_lead_by_id(lead_id)
+
+@router.put("/{lead_id}")
+async def update_lead_endpoint(
+        lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$"),
+        lead: LeadUpdate = None
+):
+    """Update a lead"""
+    lead_data = (lead or LeadUpdate()).dict(exclude_unset=True)
+    return update_lead(lead_id, lead_data)
+
+@router.delete("/{lead_id}")
+async def delete_lead_endpoint(
+        lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")
+):
+    """Delete a lead"""
+    return delete_lead(lead_id)
 
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""
-    try:
-        return {
-            "success": True,
-            "message": "Leads API is running",
-            "database_connected": mongo_client.is_connected(),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+    return {
+        "success": True,
+        "message": "Leads API is running",
+        "database_connected": mongo_client.is_connected(),
+        "timestamp": datetime.now().isoformat()
+    }
