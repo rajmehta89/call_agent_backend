@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from bson import ObjectId
 from piopiy import RestClient, Action
 from mongo_client import mongo_client
-from calls_api import log_call, update_lead_status_from_call
+from routers.calls_api import log_call, update_lead_status_from_call
 from config import ALLOWED_ORIGINS
 
 load_dotenv()
