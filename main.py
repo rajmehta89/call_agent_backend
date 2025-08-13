@@ -8,7 +8,7 @@ import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import config_api, leads_api, calls_api, webhook_api, websocket_api, sms_api, caller_api, inbound_api
+from routers import config_api, leads_api, calls_api, webhook_api, websocket_api, sms_api, inbound_api
 
 # Create FastAPI app
 app = FastAPI(
