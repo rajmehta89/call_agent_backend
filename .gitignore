@@ -1,0 +1,79 @@
+# =============================
+# Python Backend .gitignore
+# =============================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# IDE / Editor directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing and coverage
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Logs and miscellaneous
+*.log
+logs/
+*.tmp
+
+# Local configuration files
+local_settings.py
+
+# SQLite databases
+*.sqlite3
+*.db
+
+# Build artifacts
+__pycache__/
+build/
+parts/
+sdist/
+share/python-wheels/
+pip-wheel-metadata/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Others
+pyenv
+.python-version
+celerybeat-schedule

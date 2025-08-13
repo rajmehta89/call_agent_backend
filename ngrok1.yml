@@ -1,0 +1,9 @@
+version: "2"
+authtoken: 30ft5SOY0ZMRqMtcJRAzFuByfOH_89U6vF2Dd89RytZCvgmdL
+tunnels:
+  webhook:
+    addr: 3001
+    proto: http
+  websocket:
+    addr: 8765
+    proto: http
