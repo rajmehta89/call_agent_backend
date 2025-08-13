@@ -54,7 +54,6 @@ app.include_router(calls_api.router)
 app.include_router(webhook_api.router)
 app.include_router(websocket_api.router)
 app.include_router(sms_api.router)
-app.include_router(caller_api.router)
 app.include_router(inbound_api.router)
 
 if __name__ == "__main__":
