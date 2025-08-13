@@ -4,14 +4,28 @@ Converted from Flask to FastAPI for Render deployment
 """
 
 from fastapi import APIRouter, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import json
 import os
+from datetime import datetime
 
+# Initialize FastAPI router
 router = APIRouter(
     prefix="/api/config",
     tags=["Configuration"]
+)
+
+# Add CORS middleware (equivalent to Flask's CORS configuration)
+from fastapi import FastAPI
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Pydantic models
@@ -46,6 +60,7 @@ class AgentConfig:
 
     def save_config(self):
         try:
+            self.config["last_updated"] = datetime.utcnow().isoformat()
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=2)
             return True
@@ -58,7 +73,8 @@ class AgentConfig:
             "exit_message": "Thank you for your time. Have a great day!",
             "system_prompt": "You are a helpful AI assistant.",
             "knowledge_base_enabled": False,
-            "knowledge_base": "{}"
+            "knowledge_base": "{}",
+            "last_updated": datetime.utcnow().isoformat()
         }
 
     def get_all_config(self):
@@ -110,35 +126,44 @@ class AgentConfig:
 # Initialize agent config
 agent_config = AgentConfig()
 
-@router.get("/")
+@router.get("")
 async def get_config():
     """Get current agent configuration"""
     try:
         config = agent_config.get_all_config()
-        return config
+        return jsonify(config)  # Mimic Flask's jsonify behavior
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
-@router.put("/")
-@router.post("/")
+@router.put("")
+@router.post("")
 async def update_config(data: ConfigUpdate):
     """Update agent configuration"""
     try:
+        if not data.dict(exclude_unset=True):
+            return {"success": False, "error": "No data provided"}, 400
+
+        valid_fields = ["greeting_message", "exit_message", "system_prompt", "knowledge_base_enabled", "knowledge_base"]
         updates = {}
 
-        if data.greeting_message is not None:
-            updates["greeting_message"] = data.greeting_message.strip()
-        if data.exit_message is not None:
-            updates["exit_message"] = data.exit_message.strip()
-        if data.system_prompt is not None:
-            updates["system_prompt"] = data.system_prompt.strip()
-        if data.knowledge_base_enabled is not None:
-            updates["knowledge_base_enabled"] = data.knowledge_base_enabled
-        if data.knowledge_base is not None:
-            updates["knowledge_base"] = data.knowledge_base
+        for field in valid_fields:
+            if getattr(data, field) is not None:
+                if field == "knowledge_base_enabled":
+                    if not isinstance(data.knowledge_base_enabled, bool):
+                        return {"success": False, "error": f"Invalid value for {field}. Must be a boolean."}, 400
+                    updates[field] = data.knowledge_base_enabled
+                elif field == "knowledge_base":
+                    if not isinstance(data.knowledge_base, str):
+                        return {"success": False, "error": f"Invalid value for {field}. Must be a string."}, 400
+                    updates[field] = data.knowledge_base
+                else:
+                    value = getattr(data, field)
+                    if not isinstance(value, str):
+                        return {"success": False, "error": f"Invalid value for {field}. Must be a string."}, 400
+                    updates[field] = value.strip()
 
         if not updates:
-            raise HTTPException(status_code=400, detail="No valid fields to update")
+            return {"success": False, "error": "No valid fields to update"}, 400
 
         success = agent_config.update_config(updates)
 
@@ -147,97 +172,95 @@ async def update_config(data: ConfigUpdate):
                 "success": True,
                 "message": "Configuration updated successfully",
                 "data": agent_config.get_all_config()
-            }
+            }, 200
         else:
-            raise HTTPException(status_code=500, detail="Failed to save configuration")
+            return {"success": False, "error": "Failed to save configuration"}, 500
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.post("/greeting")
 async def update_greeting(data: MessageUpdate):
     """Update greeting message only"""
     try:
-        if not data.message.strip():
-            raise HTTPException(status_code=400, detail="Message cannot be empty")
+        message = data.message.strip()
+        if not message:
+            return {"success": False, "error": "Message cannot be empty"}, 400
 
-        success = agent_config.set_greeting_message(data.message.strip())
+        success = agent_config.set_greeting_message(message)
 
         if success:
             return {
                 "success": True,
                 "message": "Greeting updated successfully",
                 "greeting_message": agent_config.get_greeting_message()
-            }
+            }, 200
         else:
-            raise HTTPException(status_code=500, detail="Failed to update greeting")
+            return {"success": False, "error": "Failed to update greeting"}, 500
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.post("/exit")
 async def update_exit(data: MessageUpdate):
     """Update exit message only"""
     try:
-        if not data.message.strip():
-            raise HTTPException(status_code=400, detail="Message cannot be empty")
+        message = data.message.strip()
+        if not message:
+            return {"success": False, "error": "Message cannot be empty"}, 400
 
-        success = agent_config.set_exit_message(data.message.strip())
+        success = agent_config.set_exit_message(message)
 
         if success:
             return {
                 "success": True,
                 "message": "Exit message updated successfully",
                 "exit_message": agent_config.get_exit_message()
-            }
+            }, 200
         else:
-            raise HTTPException(status_code=500, detail="Failed to update exit message")
+            return {"success": False, "error": "Failed to update exit message"}, 500
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.post("/prompt")
 async def update_prompt(data: MessageUpdate):
     """Update system prompt only"""
     try:
-        if not data.message.strip():
-            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+        prompt = data.message.strip()
+        if not prompt:
+            return {"success": False, "error": "Prompt cannot be empty"}, 400
 
-        success = agent_config.set_system_prompt(data.message.strip())
+        success = agent_config.set_system_prompt(prompt)
 
         if success:
             return {
                 "success": True,
                 "message": "System prompt updated successfully",
                 "system_prompt": agent_config.get_system_prompt()
-            }
+            }, 200
         else:
-            raise HTTPException(status_code=500, detail="Failed to update system prompt")
+            return {"success": False, "error": "Failed to update system prompt"}, 500
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.post("/knowledge-base")
 async def update_knowledge_base(data: KnowledgeBaseUpdate):
     """Update knowledge base settings"""
     try:
+        if not data.dict(exclude_unset=True):
+            return {"success": False, "error": "No data provided"}, 400
+
         if data.enabled is not None:
             success = agent_config.set_knowledge_base_enabled(data.enabled)
             if not success:
-                raise HTTPException(status_code=500, detail="Failed to update knowledge base enabled status")
+                return {"success": False, "error": "Failed to update knowledge base enabled status"}, 500
 
-        if data.knowledge_base:
+        if data.knowledge_base is not None:
             success = agent_config.set_knowledge_base(data.knowledge_base)
             if not success:
-                raise HTTPException(status_code=500, detail="Failed to update knowledge base")
+                return {"success": False, "error": "Failed to update knowledge base"}, 500
 
         return {
             "success": True,
@@ -246,12 +269,10 @@ async def update_knowledge_base(data: KnowledgeBaseUpdate):
                 "knowledge_base_enabled": agent_config.get_knowledge_base_enabled(),
                 "knowledge_base": agent_config.get_knowledge_base()
             }
-        }
+        }, 200
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.get("/knowledge-base")
 async def get_knowledge_base():
@@ -263,9 +284,9 @@ async def get_knowledge_base():
                 "knowledge_base_enabled": agent_config.get_knowledge_base_enabled(),
                 "knowledge_base": agent_config.get_knowledge_base()
             }
-        }
+        }, 200
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
 
 @router.post("/reset")
 async def reset_config():
@@ -278,9 +299,28 @@ async def reset_config():
                 "success": True,
                 "message": "Configuration reset to defaults",
                 "data": agent_config.get_all_config()
-            }
+            }, 200
         else:
-            raise HTTPException(status_code=500, detail="Failed to reset configuration")
+            return {"success": False, "error": "Failed to reset configuration"}, 500
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": str(e)}, 500
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        return {
+            "success": True,
+            "message": "Config API is running",
+            "timestamp": agent_config.get_all_config().get("last_updated")
+        }, 200
+    except Exception as e:
+        return {"success": False, "error": str(e)}, 500
+
+# Note: The FastAPI app should be run separately, typically in a main.py file
+# Example:
+# if __name__ == "__main__":
+#     import uvicorn
+#     print("🚀 Agent Configuration API running on port 8000")
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
