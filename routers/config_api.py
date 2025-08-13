@@ -4,7 +4,7 @@ Converted from Flask to FastAPI for Render deployment
 """
 
 from fastapi import APIRouter, HTTPException
-from fastapi.middleware.cors import CORS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import json
@@ -21,7 +21,7 @@ router = APIRouter(
 from fastapi import FastAPI
 app = FastAPI()
 app.add_middleware(
-    CORS,
+    CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
