@@ -10,9 +10,9 @@ load_dotenv()
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
 # This is your Piopiy virtual number
-CALLER_ID = os.getenv("CALLER_ID") 
+CALLER_ID = os.getenv("CALLER_ID")
 # This is the public URL for your WebSocket server from your tunnel
-WEBSOCKET_URL = os.getenv("WEBSOCKET_URL") 
+WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
 
 def clean_phone_number(phone_str):
     """Removes '+' and spaces, then converts to integer."""
@@ -25,7 +25,7 @@ class OutboundCaller:
         # Ensure all required variables are present
         if not all([APP_ID, APP_SECRET, CALLER_ID, WEBSOCKET_URL]):
             raise ValueError("One or more required environment variables are missing.")
-            
+
         self.client = RestClient(int(APP_ID), APP_SECRET)
         print(f"🔧 Outbound caller initialized.")
         print(f"   - Caller ID: {CALLER_ID}")
@@ -40,7 +40,7 @@ class OutboundCaller:
             piopiy_number = clean_phone_number(CALLER_ID)
 
             action = Action()
-            
+
             # The ONLY action is to stream the call to the WebSocket server.
             # The WebSocket server will handle the greeting.
             action.stream(
@@ -50,9 +50,9 @@ class OutboundCaller:
                     "stream_on_answer": True
                 }
             )
-            
+
             print(f"\n📞 Placing call to {customer_number_str}...")
-            
+
             # Make the API call to Piopiy
             response = self.client.voice.call(
                 to=customer_number,
@@ -60,7 +60,7 @@ class OutboundCaller:
                 to_or_array_pcmo=action.PCMO(),
                 options={'record': True} # Optional: record the call
             )
-            
+
             print("✅ Call initiated successfully!")
             print("   - Response from Piopiy:", response)
             return response
@@ -73,10 +73,10 @@ class OutboundCaller:
 if __name__ == "__main__":
     # Ensure your .env file is set up with:
     # APP_ID, APP_SECRET, PIOPIY_NUMBER, and the correct public WEBSOCKET_URL
-    
+
     caller = OutboundCaller()
-    
+
     # Replace with the number you want to call
-    customer_to_call = "+919898831184" 
-    
+    customer_to_call = "+919898831184"
+
     caller.make_call(customer_to_call)
