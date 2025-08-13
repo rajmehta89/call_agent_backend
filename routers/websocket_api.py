@@ -587,10 +587,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
                         if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                             processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, message["bytes"])
-                            dg_ws_client.send_binary(processed_audio)
+                            dg_ws_client.send(processed_audio, opcode=websocket.ABNF.OPCODE_BINARY)
                             print("📤 Sent audio to Deepgram")
                         else:
                             print("⚠️ Deepgram WebSocket not connected")
+                            if not dg_ws_client:
+                                print("🔄 Attempting to restart Deepgram WebSocket")
+                                start_fast_deepgram()
+                                await asyncio.sleep(1)
                     except Exception as e:
                         print(f"⚠️ Error processing audio data: {e}")
     except Exception as e:
