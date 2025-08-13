@@ -17,6 +17,7 @@ import scipy.signal as sps
 import httpx
 import websocket
 from urllib.parse import parse_qs, urlparse
+from piopiy import StreamAction
 
 # Import project dependencies
 from mongo_client import mongo_client
@@ -260,16 +261,12 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
     return None
 
 async def send_audio_ultra_fast(audio_b64: str):
-    """Send audio to Piopiy WebSocket"""
+    """Send audio to Piopiy WebSocket using StreamAction"""
     global piopiy_ws
     if piopiy_ws:
         try:
-            await piopiy_ws.send_text(json.dumps({
-                "type": "audio",
-                "audio_base64": audio_b64,
-                "audio_type": "raw",
-                "sample_rate": 8000
-            }))
+            action = StreamAction()
+            await piopiy_ws.send_text(action.playStream(audio_base64=audio_b64, audio_type="raw", sample_rate=8000))
             print(f"📤 Sent audio chunk, length={len(audio_b64)} base64 chars")
         except Exception as e:
             print(f"❌ Error sending audio: {e}")
@@ -534,9 +531,29 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "text" in message:
                     try:
                         print(f"📝 Received text message: {message['text'][:200]}...")
+                        # Handle UUID-like session ID messages
+                        if message["text"].replace("-", "").isalnum() and len(message["text"]) == 36:
+                            print(f"📋 Treating text as session_id: {message['text']}")
+                            current_call_data["call_session_id"] = message["text"]
+                            await log_call_message("system", f"Updated session_id: {message['text']}")
+                            # Try to find recent call by session_id
+                            if mongo_client and mongo_client.is_connected():
+                                try:
+                                    recent_call = mongo_client.calls.find_one({
+                                        "call_session_id": message["text"],
+                                        "status": "initiated",
+                                        "created_at": {"$gte": datetime.now() - timedelta(minutes=5)}
+                                    }, sort=[("created_at", -1)])
+                                    if recent_call:
+                                        current_call_data["phone_number"] = recent_call.get("phone_number", "unknown")
+                                        current_call_data["lead_id"] = recent_call.get("lead_id")
+                                        print(f"📋 Matched recent call: phone={current_call_data['phone_number']}, lead_id={current_call_data['lead_id']}")
+                                except Exception as e:
+                                    print(f"⚠️ Error finding recent call by session_id: {e}")
+                            continue
+                        # Parse JSON messages
                         data = json.loads(message["text"])
                         print(f"📋 Parsed JSON: {data}")
-
                         extra_params = data.get("extra_params")
                         if extra_params:
                             phone = extra_params.get("phone_number")
@@ -549,7 +566,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             if sess:
                                 current_call_data["call_session_id"] = str(sess)
                             await log_call_message("system", f"Call context: phone={phone}, lead_id={lead_id}, session={sess}")
-
                         meta = data.get("meta")
                         if isinstance(meta, dict):
                             phone = meta.get("phone_number") or meta.get("phone")
@@ -571,7 +587,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
                         if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                             processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, message["bytes"])
-                            dg_ws_client.send(processed_audio, opcode=websocket.ABNF.OPCODE_BINARY)
+                            dg_ws_client.send_binary(processed_audio)
                             print("📤 Sent audio to Deepgram")
                         else:
                             print("⚠️ Deepgram WebSocket not connected")
