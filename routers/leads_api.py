@@ -1,9 +1,4 @@
-"""
-Leads Management API Router - Leads and Calling Functionality
-Converted from Flask to FastAPI for Render deployment
-"""
-
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -12,6 +7,10 @@ import os
 import uuid
 import csv
 import io
+from dotenv import load_dotenv
+from piopiy import RestClient, Action
+
+load_dotenv()
 
 router = APIRouter(
     prefix="/api/leads",
@@ -40,36 +39,70 @@ class LeadUpdate(BaseModel):
     notes: Optional[str] = None
     status: Optional[str] = None
 
-# Simple OutboundCaller class
+# File storage configuration
+LEADS_FILE = "leads_data.json"
+
+# Piopiy Configuration
+APP_ID = os.getenv("APP_ID")
+APP_SECRET = os.getenv("APP_SECRET")
+CALLER_ID = os.getenv("CALLER_ID")
+WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
+
+def clean_phone_number(phone_str):
+    """Removes '+', '-', and spaces, then converts to integer."""
+    if isinstance(phone_str, str):
+        return int(phone_str.replace('+', '').replace('-', '').replace(' ', ''))
+    return phone_str
+
 class OutboundCaller:
     def __init__(self):
-        self.app_id = os.getenv("APP_ID")
-        self.app_secret = os.getenv("APP_SECRET")
-        self.caller_id = os.getenv("CALLER_ID")
-        self.websocket_url = os.getenv("WEBSOCKET_URL")
-
-        if not all([self.app_id, self.app_secret, self.caller_id, self.websocket_url]):
+        if not all([APP_ID, APP_SECRET, CALLER_ID, WEBSOCKET_URL]):
             print("⚠️ Warning: Piopiy credentials not configured. Call functionality will be simulated.")
             self.client = None
-        else:
-            # In production, initialize Piopiy client here
-            self.client = None  # Placeholder
-            print("📞 Outbound caller initialized.")
+            return
+
+        self.client = RestClient(int(APP_ID), APP_SECRET)
+        print(f"🔧 Outbound caller initialized.")
+        print(f"   - Caller ID: {CALLER_ID}")
+        print(f"   - WebSocket URL: {WEBSOCKET_URL}")
 
     def make_call(self, customer_number_str):
-        """Initiates an outbound call"""
+        """Initiates an outbound call and connects it to the WebSocket voice agent."""
         if not self.client:
-            print(f"[SIMULATED] Would call {customer_number_str}")
+            print(f"📞 [SIMULATED] Would call {customer_number_str}")
             return {"status": "simulated", "message": "Piopiy not configured"}
 
-        # In production, implement actual Piopiy call logic here
-        return {"status": "success", "message": "Call initiated"}
+        try:
+            customer_number = clean_phone_number(customer_number_str)
+            piopiy_number = clean_phone_number(CALLER_ID)
+
+            action = Action()
+            action.stream(
+                WEBSOCKET_URL,
+                {
+                    "listen_mode": "callee",
+                    "stream_on_answer": True
+                }
+            )
+
+            print(f"\n📞 Placing call to {customer_number_str}...")
+            response = self.client.voice.call(
+                to=customer_number,
+                piopiy_no=piopiy_number,
+                to_or_array_pcmo=action.PCMO(),
+                options={'record': True}
+            )
+
+            print("✅ Call initiated successfully!")
+            print("   - Response from Piopiy:", response)
+            return response
+
+        except Exception as e:
+            print(f"❌ Failed to make call: {e}")
+            return {"error": str(e)}
 
 # Initialize outbound caller
 outbound_caller = OutboundCaller()
-
-# File storage functions
-LEADS_FILE = "leads_data.json"
 
 def load_leads():
     """Load leads from JSON file"""
@@ -97,14 +130,24 @@ async def get_leads():
     """Get all leads"""
     try:
         leads = load_leads()
-        return {"success": True, "data": leads, "count": len(leads)}
+        return {
+            "success": True,
+            "data": leads,
+            "count": len(leads)
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.post("/")
 async def add_lead(lead: Lead):
     """Add a new lead manually"""
     try:
+        if not lead.name or not lead.phone:
+            raise HTTPException(
+                status_code=400,
+                detail={"success": False, "error": f"Missing required field: {'name' if not lead.name else 'phone'}"}
+            )
+
         lead_data = {
             "id": str(uuid.uuid4()),
             "name": lead.name.strip(),
@@ -122,15 +165,17 @@ async def add_lead(lead: Lead):
         leads = load_leads()
         leads.append(lead_data)
 
-        if save_leads(leads):
-            return {"success": True, "message": "Lead added successfully", "data": lead_data}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save lead")
+        if not save_leads(leads):
+            raise HTTPException(status_code=500, detail={"success": False, "error": "Failed to save lead"})
 
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "message": "Lead added successfully",
+            "data": lead_data
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.put("/{lead_id}")
 async def update_lead(lead_id: str, lead_update: LeadUpdate):
@@ -140,25 +185,27 @@ async def update_lead(lead_id: str, lead_update: LeadUpdate):
         lead_index = next((i for i, lead in enumerate(leads) if lead["id"] == lead_id), None)
 
         if lead_index is None:
-            raise HTTPException(status_code=404, detail="Lead not found")
+            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
         updatable_fields = ["name", "phone", "email", "company", "notes", "status"]
         for field in updatable_fields:
             value = getattr(lead_update, field)
             if value is not None:
-                leads[lead_index][field] = value
+                leads[lead_index][field] = value.strip() if isinstance(value, str) else value
 
         leads[lead_index]["updated_at"] = datetime.now().isoformat()
 
-        if save_leads(leads):
-            return {"success": True, "message": "Lead updated successfully", "data": leads[lead_index]}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to update lead")
+        if not save_leads(leads):
+            raise HTTPException(status_code=500, detail={"success": False, "error": "Failed to update lead"})
 
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "message": "Lead updated successfully",
+            "data": leads[lead_index]
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.delete("/{lead_id}")
 async def delete_lead(lead_id: str):
@@ -169,22 +216,25 @@ async def delete_lead(lead_id: str):
         leads = [lead for lead in leads if lead["id"] != lead_id]
 
         if len(leads) == original_count:
-            raise HTTPException(status_code=404, detail="Lead not found")
+            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
-        if save_leads(leads):
-            return {"success": True, "message": "Lead deleted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to delete lead")
+        if not save_leads(leads):
+            raise HTTPException(status_code=500, detail={"success": False, "error": "Failed to delete lead"})
+
+        return {
+            "success": True,
+            "message": "Lead deleted successfully"
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.post("/upload")
 async def upload_leads_csv(file: UploadFile = File(...)):
     """Upload leads from CSV file"""
     try:
         if not file.filename.lower().endswith('.csv'):
-            raise HTTPException(status_code=400, detail="File must be a CSV")
+            raise HTTPException(status_code=400, detail={"success": False, "error": "File must be a CSV"})
 
         content = await file.read()
         stream = io.StringIO(content.decode("utf-8"))
@@ -218,26 +268,27 @@ async def upload_leads_csv(file: UploadFile = File(...)):
                 errors.append(f"Row {row_num}: {str(e)}")
 
         if not new_leads:
-            raise HTTPException(status_code=400, detail="No valid leads found in CSV")
+            raise HTTPException(
+                status_code=400,
+                detail={"success": False, "error": "No valid leads found in CSV", "errors": errors}
+            )
 
         existing_leads = load_leads()
         all_leads = existing_leads + new_leads
 
-        if save_leads(all_leads):
-            return {
-                "success": True,
-                "message": f"Successfully imported {len(new_leads)} leads",
-                "imported_count": len(new_leads),
-                "total_count": len(all_leads),
-                "errors": errors
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save leads")
+        if not save_leads(all_leads):
+            raise HTTPException(status_code=500, detail={"success": False, "error": "Failed to save leads"})
 
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "message": f"Successfully imported {len(new_leads)} leads",
+            "imported_count": len(new_leads),
+            "total_count": len(all_leads),
+            "errors": errors
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.post("/{lead_id}/call")
 async def call_lead(lead_id: str):
@@ -247,7 +298,7 @@ async def call_lead(lead_id: str):
         lead_index = next((i for i, lead in enumerate(leads) if lead["id"] == lead_id), None)
 
         if lead_index is None:
-            raise HTTPException(status_code=404, detail="Lead not found")
+            raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
         lead = leads[lead_index]
         print(f"📞 Initiating call to {lead['name']} at {lead['phone']}")
@@ -281,10 +332,8 @@ async def call_lead(lead_id: str):
             }
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.get("/stats")
 async def get_leads_stats():
@@ -302,4 +351,16 @@ async def get_leads_stats():
         return {"success": True, "data": stats}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        return {
+            "success": True,
+            "message": "Leads API is running",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
