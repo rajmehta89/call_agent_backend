@@ -1,7 +1,7 @@
 """
 Ultra-Fast Voice Bot WebSocket Router
 Handles real-time voice bot functionality with Deepgram, Google TTS, and AI processing
-(Optimized for proper question-answer sync, faster response, and natural voice)
+(Optimized for proper question-answer sync, faster response, natural voice, and improved conversation flow)
 """
 from fastapi import APIRouter, WebSocket
 import asyncio
@@ -46,7 +46,8 @@ GOOGLE_TTS_PITCH = float(os.getenv("GOOGLE_TTS_PITCH", "-2.0"))        # Deeper,
 # Turn-taking controls
 LISTEN_HOLD_MS = int(os.getenv("LISTEN_HOLD_MS", "500"))               # Reduced to 500ms for faster response
 BOT_SPEAKING_PAD_MS = int(os.getenv("BOT_SPEAKING_PAD_MS", "150"))     # Small pad after TTS
-NUDGE_AFTER_SILENCE_S = int(os.getenv("NUDGE_AFTER_SILENCE_S", "15"))  # Nudge after 15s silence
+NUDGE_AFTER_SILENCE_S = int(os.getenv("NUDGE_AFTER_SILENCE_S", "10"))  # Nudge after 10s silence
+END_AFTER_SILENCE_S = int(os.getenv("END_AFTER_SILENCE_S", "15"))      # Goodbye and end after 15s silence
 END_AFTER_IDLE_S = int(os.getenv("END_AFTER_IDLE_S", "60"))            # End call after 60s idle
 
 # Audio buffer size for Deepgram
@@ -422,6 +423,7 @@ async def ultra_fast_llm_worker():
     - Waits briefly after user speech to catch add-ons.
     - Ignores user inputs during bot speech to prevent overlap.
     - Processes transcriptions in order to maintain question-answer sync.
+    - Starts with intro and purpose, responds only to user input, ends on silence.
     """
     bot = RealEstateQA(ai_services)
     history = []
@@ -429,20 +431,35 @@ async def ultra_fast_llm_worker():
     last_activity = now()
     last_transcription_time = now()
 
-    greeting = bot.get_greeting_message()
+    # Initial greeting with purpose and intro
+    greeting = "Hello, this is the real estate assistant from xAI Properties. I'm here to help with property inquiries, listings, and advice. How can I assist you today?"
     await log_call_message("greeting", greeting)
     tts_q.put(greeting)
-    print("📢 Sent initial greeting")
+    print("📢 Sent initial greeting with purpose")
 
     while True:
         try:
+            # Nudge if silent for NUDGE_AFTER_SILENCE_S seconds
             if (now() - last_transcription_time).total_seconds() > NUDGE_AFTER_SILENCE_S and not bot_is_speaking():
-                prompt = "Are you still there? How can I assist you with real estate today?"
+                prompt = "I haven't heard anything yet. If you don't have any questions, I can tell you about our latest properties. Or, how can I help?"
                 await log_call_message("bot", prompt)
                 tts_q.put(prompt)
-                print("📢 Sent prompt to encourage user speech")
+                print("📢 Sent nudge to encourage user speech or provide context")
                 last_transcription_time = now()
 
+            # Goodbye and end if silent for END_AFTER_SILENCE_S seconds
+            if (now() - last_transcription_time).total_seconds() > END_AFTER_SILENCE_S and session_started:
+                print("⏰ Silence for too long, saying goodbye and ending call")
+                goodbye = "It seems you've gone quiet. If you have no more questions, goodbye and have a great day!"
+                await log_call_message("exit", goodbye)
+                tts_q.put(goodbye)
+                await asyncio.sleep(5)  # Wait for goodbye to play
+                await trigger_call_hangup()
+                session_started = False
+                history = []
+                continue
+
+            # Overall idle check
             if (now() - last_activity).total_seconds() > END_AFTER_IDLE_S and session_started:
                 print("⏰ No activity for too long, ending session")
                 exit_message = bot.get_exit_message()
@@ -493,32 +510,34 @@ async def ultra_fast_llm_worker():
                     history = []
                     continue
 
-                try:
-                    start_time = now()
-                    reply = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(None, bot.get_response, user_text, history),
-                        timeout=12.0
-                    )
-                    response_time = (now() - start_time).total_seconds()
-                    print(f"⏱️ LLM response generated in {response_time:.2f}s")
-                    await log_call_message("bot", reply)
-                    tts_q.put(reply)
-                    print(f"📢 Queued bot response: '{reply[:80]}'")
-                except asyncio.TimeoutError:
-                    print("⚠️ LLM response timeout, sending fallback")
-                    reply = "I'm sorry, I'm taking a bit longer. Could you please repeat or clarify what you'd like help with?"
-                    await log_call_message("bot", reply)
-                    tts_q.put(reply)
-                except Exception as e:
-                    print(f"⚠️ Error generating response: {e}, type: {type(e).__name__}")
-                    if "api_key" in str(e).lower() or "authentication" in str(e).lower():
-                        reply = "I'm sorry, there's an authentication issue with my AI service. Please check the API configuration."
-                    elif "connection" in str(e).lower() or "timeout" in str(e).lower():
-                        reply = "I'm sorry, I'm having trouble connecting to my AI service. Please try again."
-                    else:
-                        reply = "I'm sorry, I encountered an error. Please try again."
-                    await log_call_message("bot", reply)
-                    tts_q.put(reply)
+                # Check if user asked a question; if not, provide brief context
+                is_question = "?" in user_text or any(word in user_text.lower() for word in ["what", "how", "why", "where", "who", "when", "can", "do", "is", "are"])
+                if not is_question:
+                    reply = "If you have no specific question, let me tell you about our services. We offer property listings, buying/selling advice, and market analysis. What would you like to know?"
+                else:
+                    try:
+                        start_time = now()
+                        reply = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(None, bot.get_response, user_text, history),
+                            timeout=12.0
+                        )
+                        response_time = (now() - start_time).total_seconds()
+                        print(f"⏱️ LLM response generated in {response_time:.2f}s")
+                    except asyncio.TimeoutError:
+                        print("⚠️ LLM response timeout, sending fallback")
+                        reply = "I'm sorry, I'm taking a bit longer. Could you please repeat or clarify what you'd like help with?"
+                    except Exception as e:
+                        print(f"⚠️ Error generating response: {e}, type: {type(e).__name__}")
+                        if "api_key" in str(e).lower() or "authentication" in str(e).lower():
+                            reply = "I'm sorry, there's an authentication issue with my AI service. Please check the API configuration."
+                        elif "connection" in str(e).lower() or "timeout" in str(e).lower():
+                            reply = "I'm sorry, I'm having trouble connecting to my AI service. Please try again."
+                        else:
+                            reply = "I'm sorry, I encountered an error. Please try again."
+
+                await log_call_message("bot", reply)
+                tts_q.put(reply)
+                print(f"📢 Queued bot response: '{reply[:80]}'")
 
                 history.extend([
                     {"role": "user", "content": user_text},
