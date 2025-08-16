@@ -1,8 +1,9 @@
 """
 Ultra-Fast Voice Bot WebSocket Router
 Handles real-time voice bot functionality with Deepgram, Google TTS, and AI processing
+(Updated for better turn-taking: waits after caller finishes, analyzes, then replies slowly)
 """
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket
 import asyncio
 import base64
 import json
@@ -26,16 +27,26 @@ from ai_services import AIServices
 
 router = APIRouter(tags=["WebSocket"])
 
+# ---------------------------
 # Environment variables
+# ---------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DG_API_KEY")
 
-# TTS tuning (human-like + slower)
-GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "en-IN-Neural2-A")  # good Indian English voice
-GOOGLE_TTS_RATE = float(os.getenv("GOOGLE_TTS_RATE", "0.88"))        # 0.75–0.95 feels natural & slower
-GOOGLE_TTS_PITCH = float(os.getenv("GOOGLE_TTS_PITCH", "-2.0"))      # in semitones, slightly deeper
+# Voice tuning (slower & more natural)
+GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "en-IN-Neural2-A")
+GOOGLE_TTS_RATE = float(os.getenv("GOOGLE_TTS_RATE", "0.88"))          # 0.75–0.95 = natural slower
+GOOGLE_TTS_PITCH = float(os.getenv("GOOGLE_TTS_PITCH", "-2.0"))        # deeper/relaxed
 
+# Turn-taking controls
+LISTEN_HOLD_MS = int(os.getenv("LISTEN_HOLD_MS", "900"))               # wait after ASR final to catch add-ons
+BOT_SPEAKING_PAD_MS = int(os.getenv("BOT_SPEAKING_PAD_MS", "150"))     # small pad after TTS finish
+NUDGE_AFTER_SILENCE_S = int(os.getenv("NUDGE_AFTER_SILENCE_S", "25"))  # gentle nudge if totally silent
+END_AFTER_IDLE_S = int(os.getenv("END_AFTER_IDLE_S", "60"))            # end call if idle too long
+
+# ---------------------------
 # Constants
+# ---------------------------
 GOOGLE_TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
 DG_WS_URL = (
     "wss://api.deepgram.com/v1/listen?"
@@ -43,13 +54,18 @@ DG_WS_URL = (
     "&language=en-IN&smart_format=true&vad_turnoff=1500&no_delay=true"
 )
 
-# Global variables
-transcript_q = SimpleQueue()
-tts_q = SimpleQueue()
+# ---------------------------
+# Globals
+# ---------------------------
+transcript_q = SimpleQueue()  # final utterances from ASR
+tts_q = SimpleQueue()         # bot texts awaiting TTS
 ai_services = AIServices()
 dg_ws_client = None
 piopiy_ws = None
-audio_buffer = bytearray()  # Buffer to accumulate audio chunks (from caller)
+audio_buffer = bytearray()    # incoming caller audio
+
+# Bot speaking window: during this time we ignore caller audio (no barge-in)
+bot_speaking_until: Optional[datetime] = None
 
 # Global call tracking
 current_call_data = {
@@ -62,48 +78,53 @@ current_call_data = {
     "call_session_id": None
 }
 
-# ---------------------------
+# ===========================
 # Utilities
-# ---------------------------
+# ===========================
 def _escape_ssml(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def text_to_ssml(text: str) -> str:
     """
     Convert raw text into SSML with natural sentence breaks
     and slightly slower, deeper prosody for human-like telephony.
     """
-    text = text.strip()
+    text = (text or "").strip()
     if not text:
         return "<speak></speak>"
 
-    # Split into sentences for controlled pauses
     parts = re.split(r'(?<=[.!?])\s+', text)
     segments = []
     for i, p in enumerate(parts):
         if not p:
             continue
         p_esc = _escape_ssml(p)
-        # Slight pause after each sentence, longer after the first greeting
-        if i == 0:
-            segments.append(f"<s>{p_esc}</s><break time='350ms'/>")
-        else:
-            segments.append(f"<s>{p_esc}</s><break time='300ms'/>")
+        # slightly longer pause after first sentence
+        pause = "350ms" if i == 0 else "300ms"
+        segments.append(f"<s>{p_esc}</s><break time='{pause}'/>")
 
     body = " ".join(segments)
-    # Global prosody: slow rate, slightly lower pitch (more relaxed & clear)
     return (
         "<speak>"
-        f"<prosody rate='slow' pitch='{GOOGLE_TTS_PITCH:+.1f}st'>"
-        f"{body}"
-        "</prosody>"
+        f"<prosody rate='slow' pitch='{GOOGLE_TTS_PITCH:+.1f}st'>{body}</prosody>"
         "</speak>"
     )
 
+def now() -> datetime:
+    return datetime.now()
+
+def set_bot_speaking_for_seconds(seconds: float):
+    """Mark bot as speaking for a computed duration (+ small pad)."""
+    global bot_speaking_until
+    pad = BOT_SPEAKING_PAD_MS / 1000.0
+    bot_speaking_until = now() + timedelta(seconds=max(0.0, seconds) + pad)
+
+def bot_is_speaking() -> bool:
+    return bool(bot_speaking_until and now() < bot_speaking_until)
+
+# ===========================
+# Logging & Call Tracking
+# ===========================
 async def log_call_message(message_type: str, content: str, phone_number: Optional[str] = None, lead_id: Optional[str] = None):
     """Log call message and track conversation"""
     try:
@@ -267,9 +288,9 @@ async def end_call_tracking():
         "call_session_id": None
     }
 
-# ---------------------------
-# TTS functions (slower, SSML)
-# ---------------------------
+# ===========================
+# TTS (slow, SSML) + sender
+# ===========================
 async def ultra_fast_tts(text: str) -> Optional[bytes]:
     """Async TTS using Google TTS with SSML prosody for slower, human-like delivery"""
     cleaned = (text or "").strip()
@@ -280,7 +301,7 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
 
     ssml = text_to_ssml(cleaned)
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         try:
             payload = {
                 "input": {"ssml": ssml},
@@ -288,8 +309,8 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
                 "audioConfig": {
                     "audioEncoding": "LINEAR16",
                     "sampleRateHertz": 8000,                 # telephony wideband
-                    "speakingRate": GOOGLE_TTS_RATE,         # slightly slower than normal
-                    "pitch": GOOGLE_TTS_PITCH,               # a touch deeper
+                    "speakingRate": GOOGLE_TTS_RATE,         # slower than default
+                    "pitch": GOOGLE_TTS_PITCH,               # slightly deeper
                     "effectsProfileId": ["telephony-class-application"]
                 }
             }
@@ -299,8 +320,6 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
                 if audio_b64:
                     raw = base64.b64decode(audio_b64)
                     print(f"✅ TTS HTTP 200, bytes: {len(raw)}")
-                    # Optional debug dump:
-                    # with open("tts_output.wav", "wb") as f: f.write(raw)
                     return raw
                 print("⚠️ TTS success but empty audioContent")
                 return None
@@ -311,25 +330,24 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
             print(f"❌ TTS request failed: {e}")
             return None
 
-async def send_audio_ultra_fast(audio_b64: str, retry_count: int = 3):
-    """Send audio to Piopiy WebSocket using StreamAction with retries"""
+async def send_audio_ultra_fast(audio_b64: str, raw_len_bytes: int):
+    """Send audio to Piopiy WebSocket using StreamAction and set speaking window."""
     global piopiy_ws
     if not piopiy_ws:
         print("⚠️ No active Piopiy WebSocket connection to send audio")
         return
 
-    for attempt in range(retry_count):
-        try:
-            action = StreamAction()
-            await piopiy_ws.send_text(action.playStream(audio_base64=audio_b64, audio_type="raw", sample_rate=8000))
-            print(f"📤 Sent audio chunk to Piopiy, length={len(audio_b64)} base64 chars, attempt={attempt+1}")
-            return
-        except Exception as e:
-            print(f"❌ Error sending audio to Piopiy (attempt {attempt+1}/{retry_count}): {e}")
-            if attempt < retry_count - 1:
-                await asyncio.sleep(1)
-            else:
-                print("⚠️ Failed to send audio to Piopiy after retries")
+    # Compute approximate duration from bytes (PCM16 mono @ 8kHz)
+    bytes_per_second = 8000 * 2  # sample_rate * 2 bytes
+    duration_s = raw_len_bytes / float(bytes_per_second)
+    set_bot_speaking_for_seconds(duration_s)
+
+    try:
+        action = StreamAction()
+        await piopiy_ws.send_text(action.playStream(audio_base64=audio_b64, audio_type="raw", sample_rate=8000))
+        print(f"📤 Sent audio chunk to Piopiy (≈{duration_s:.2f}s, {len(audio_b64)} b64 chars)")
+    except Exception as e:
+        print(f"❌ Error sending audio to Piopiy: {e}")
 
 async def trigger_call_hangup():
     """Trigger call hangup by closing WebSocket connection"""
@@ -347,11 +365,11 @@ async def trigger_call_hangup():
         print(f"❌ Error triggering call hangup: {e}")
         await log_call_message("system", f"Call hangup error: {str(e)}")
 
-# ---------------------------
+# ===========================
 # Workers
-# ---------------------------
+# ===========================
 async def ultra_fast_tts_worker():
-    """TTS processing worker (keeps voice slow & natural)"""
+    """TTS processing worker (keeps voice slow & natural)."""
     while True:
         try:
             if not tts_q.empty():
@@ -362,10 +380,10 @@ async def ultra_fast_tts_worker():
                 print(f"🔔 TTS worker dequeued text: '{text[:80]}'")
                 raw_audio = await ultra_fast_tts(text)
                 if raw_audio:
-                    # Already LINEAR16 @ 8kHz from Google; send as-is for best quality
+                    # Already LINEAR16 @ 8kHz from Google; send as-is
                     audio_b64 = base64.b64encode(raw_audio).decode()
                     print(f"🎼 TTS bytes ready: {len(raw_audio)}")
-                    await send_audio_ultra_fast(audio_b64)
+                    await send_audio_ultra_fast(audio_b64, raw_len_bytes=len(raw_audio))
                 else:
                     print(f"⚠️ No audio produced by TTS for text: '{text[:80]}'")
             await asyncio.sleep(0.0005)
@@ -374,39 +392,36 @@ async def ultra_fast_tts_worker():
             await asyncio.sleep(0.1)
 
 async def ultra_fast_llm_worker():
-    """LLM processing worker"""
+    """
+    LLM worker with improved turn-taking:
+    - Waits a short 'hold' after the user finishes speaking to catch add-ons.
+    - Ignores user inputs while bot is speaking (prevents talking over the caller).
+    """
     bot = RealEstateQA(ai_services)
     history = []
     session_started = False
-    last_activity = datetime.now()
-    last_transcription_time = datetime.now()
+    last_activity = now()
+    last_transcription_time = now()
 
-    # Initial greeting (will be spoken slowly via SSML settings)
+    # Initial greeting (slow via SSML settings). Keep it brief.
     greeting = bot.get_greeting_message()
     await log_call_message("greeting", greeting)
     tts_q.put(greeting)
     print("📢 Sent initial greeting to start conversation")
 
-    # Optional gentle prompt to confirm audio path
-    await asyncio.sleep(4)
-    test_message = "Can you hear me clearly? Please say how I can help you with your real estate needs."
-    await log_call_message("bot", test_message)
-    tts_q.put(test_message)
-    print("📢 Sent test message to ensure audio output")
-
     while True:
         try:
-            # Nudge if silent
-            if session_started and (datetime.now() - last_transcription_time).total_seconds() > 15:
-                prompt = "I haven't heard from you. Are you still there? Please tell me how I can assist you."
+            # Gentle nudge if totally silent for a while
+            if (now() - last_transcription_time).total_seconds() > NUDGE_AFTER_SILENCE_S and not bot_is_speaking():
+                prompt = "Are you still there? How can I assist you with real estate today?"
                 await log_call_message("bot", prompt)
                 tts_q.put(prompt)
                 print("📢 Sent prompt to encourage user speech")
-                last_transcription_time = datetime.now()
+                last_transcription_time = now()
 
-            # End if no activity
-            if session_started and (datetime.now() - last_activity).total_seconds() > 30:
-                print("⏰ No activity for 30 seconds, ending session")
+            # End if overall idle too long
+            if session_started and (now() - last_activity).total_seconds() > END_AFTER_IDLE_S:
+                print("⏰ No activity for a while, ending session")
                 exit_message = bot.get_exit_message()
                 await log_call_message("exit", exit_message)
                 tts_q.put(exit_message)
@@ -417,9 +432,30 @@ async def ultra_fast_llm_worker():
                 continue
 
             if not transcript_q.empty():
-                user_text = transcript_q.get()
-                last_activity = datetime.now()
-                last_transcription_time = datetime.now()
+                # If bot is speaking, defer processing user input (no barge-in)
+                if bot_is_speaking():
+                    # Drop or delay? We delay by re-queueing once with a tiny wait
+                    await asyncio.sleep(0.2)
+                    continue
+
+                # Take first final transcript and hold briefly to gather follow-ups
+                first = transcript_q.get()
+                buffer = [first]
+                hold_until = now() + timedelta(milliseconds=LISTEN_HOLD_MS)
+
+                while now() < hold_until:
+                    if not transcript_q.empty():
+                        buffer.append(transcript_q.get())
+                        # extend the hold a bit if user keeps adding phrases rapidly
+                        hold_until = now() + timedelta(milliseconds=LISTEN_HOLD_MS // 2)
+                    await asyncio.sleep(0.02)
+
+                user_text = " ".join(x.strip() for x in buffer if x and x.strip())
+                if not user_text:
+                    continue
+
+                last_activity = now()
+                last_transcription_time = now()
 
                 if not session_started:
                     session_started = True
@@ -427,6 +463,7 @@ async def ultra_fast_llm_worker():
 
                 await log_call_message("user", user_text)
 
+                # Exit intent
                 if bot.is_exit_intent(user_text):
                     exit_message = bot.get_exit_message()
                     await log_call_message("exit", exit_message)
@@ -437,17 +474,18 @@ async def ultra_fast_llm_worker():
                     history = []
                     continue
 
+                # Generate response after the short listening hold
                 try:
                     reply = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(None, bot.get_response, user_text, history),
-                        timeout=10.0
+                        timeout=12.0
                     )
                     await log_call_message("bot", reply)
                     tts_q.put(reply)
                     print(f"📢 Queued bot response for TTS: '{reply[:80]}'")
                 except asyncio.TimeoutError:
                     print("⚠️ LLM response timeout, sending fallback")
-                    reply = "I apologize, but I'm having trouble processing your request right now. Could you please try again?"
+                    reply = "I'm sorry, I'm taking a bit longer. Could you please repeat or clarify what you'd like help with?"
                     await log_call_message("bot", reply)
                     tts_q.put(reply)
                 except Exception as e:
@@ -468,14 +506,14 @@ async def ultra_fast_llm_worker():
                 if len(history) > 8:
                     history = history[-6:]
 
-            await asyncio.sleep(0.0001)
+            await asyncio.sleep(0.0005)
         except Exception as e:
             print(f"⚠️ LLM worker error: {e}")
             await asyncio.sleep(0.1)
 
-# ---------------------------
+# ===========================
 # Deepgram WebSocket client
-# ---------------------------
+# ===========================
 def start_fast_deepgram():
     """Start Deepgram WebSocket client with reconnection logic"""
     global dg_ws_client
@@ -495,11 +533,10 @@ def start_fast_deepgram():
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            # print(f"📥 Deepgram message: {json.dumps(data)[:200]}")
+            # We only push final transcripts to the queue
             if data.get("type") == "Results":
                 alt = data.get("channel", {}).get("alternatives", [{}])[0]
                 transcript = alt.get("transcript", "")
-                confidence = alt.get("confidence", 0.0)
                 is_final = (
                         bool(data.get("is_final")) or
                         bool(data.get("speech_final")) or
@@ -508,9 +545,12 @@ def start_fast_deepgram():
                         bool(alt.get("final"))
                 )
                 if transcript and is_final:
-                    print(f"🎧 ASR: {transcript} (final, conf={confidence:.2f})")
+                    if bot_is_speaking():
+                        # Ignore caller while bot is speaking (prevents overlap)
+                        print("🔇 Ignored transcript while bot speaking")
+                        return
+                    print(f"🎧 ASR (final): {transcript}")
                     transcript_q.put(transcript)
-                # else: partials are ignored for now
         except Exception as e:
             print(f"⚠️ Deepgram message parse error: {e}")
 
@@ -563,9 +603,9 @@ def get_websocket_url():
         return f"{ws_url}/ws"
     return "ws://localhost:8000/ws"
 
-# ---------------------------
+# ===========================
 # WebSocket endpoint
-# ---------------------------
+# ===========================
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket client handler"""
@@ -634,6 +674,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "text" in message:
                     try:
                         print(f"📝 Received text message: {message['text'][:200]}...")
+                        # bare session id?
                         if message["text"].replace("-", "").isalnum() and len(message["text"]) == 36:
                             print(f"📋 Treating text as session_id: {message['text']}")
                             current_call_data["call_session_id"] = message["text"]
@@ -652,6 +693,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 except Exception as e:
                                     print(f"⚠️ Error finding recent call by session_id: {e}")
                             continue
+
                         data = json.loads(message["text"])
                         print(f"📋 Parsed JSON: {data}")
                         extra_params = data.get("extra_params")
@@ -666,6 +708,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if sess:
                                 current_call_data["call_session_id"] = str(sess)
                             await log_call_message("system", f"Call context: phone={phone}, lead_id={lead_id}, session={sess}")
+
                         meta = data.get("meta", data)
                         if isinstance(meta, dict):
                             phone = meta.get("phone_number") or meta.get("phone")
@@ -678,15 +721,22 @@ async def websocket_endpoint(websocket: WebSocket):
                             if sess:
                                 current_call_data["call_session_id"] = str(sess)
                             await log_call_message("system", f"Call context from meta: phone={phone}, lead_id={lead_id}, session={sess}")
+
                     except json.JSONDecodeError as e:
                         print(f"⚠️ Non-JSON text message received: {message['text'][:200]}, error: {e}")
                     except Exception as e:
                         print(f"⚠️ Error processing text message: {e}, message: {message['text'][:200]}")
+
                 elif "bytes" in message:
                     try:
                         # Incoming audio from caller (assumed PCM16, 8kHz, mono)
                         incoming = message["bytes"]
-                        print(f"🎵 Received audio: {len(incoming)} bytes")
+                        # If bot is speaking, we ignore incoming (no barge-in)
+                        if bot_is_speaking():
+                            # We still read it, but don't forward to ASR
+                            print(f"🔇 Dropped {len(incoming)} bytes while bot speaking")
+                            continue
+
                         audio_buffer.extend(incoming)
 
                         # Stream to Deepgram in ~200 ms chunks for low latency & better ASR
@@ -696,7 +746,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                                 try:
                                     dg_ws_client.send(chunk, opcode=ABNF.OPCODE_BINARY)
-                                    # print(f"📤 Sent {len(chunk)} bytes to Deepgram")
                                 except Exception as e:
                                     print(f"⚠️ Failed to send chunk to Deepgram: {e}")
                                     break
@@ -730,7 +779,9 @@ async def websocket_endpoint(websocket: WebSocket):
         piopiy_ws = None
         audio_buffer.clear()
 
-# Log API key presence at startup
+# ---------------------------
+# Startup logs
+# ---------------------------
 print(f"[WebSocket Server] 🔧 GOOGLE_API_KEY present: {'Yes' if GOOGLE_API_KEY else 'No'}")
 print(f"[WebSocket Server] 🔧 DG_API_KEY present: {'Yes' if DEEPGRAM_API_KEY else 'No'}")
 print("Call tracking enabled with MongoDB")
