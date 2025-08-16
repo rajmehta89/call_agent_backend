@@ -245,7 +245,7 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
             response = await client.post(GOOGLE_TTS_URL, json={
                 "input": {"text": text},
                 "voice": {"languageCode": "en-US", "name": "en-US-Standard-D", "ssmlGender": "MALE"},
-                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 22050, "speakingRate": 1.15}
+                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 8000, "speakingRate": 1.15}
             })
             if response.status_code == 200:
                 audio_b64 = response.json().get("audioContent", "")
@@ -254,11 +254,13 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
                     print(f"✅ TTS HTTP 200, bytes: {len(raw)}")
                     return raw
                 print("⚠️ TTS success but empty audioContent")
+                return None
             else:
                 print(f"⚠️ TTS HTTP {response.status_code}: {response.text[:200]}")
+                return None
         except Exception as e:
             print(f"❌ TTS request failed: {e}")
-    return None
+            return None
 
 async def send_audio_ultra_fast(audio_b64: str):
     """Send audio to Piopiy WebSocket using StreamAction"""
@@ -267,11 +269,11 @@ async def send_audio_ultra_fast(audio_b64: str):
         try:
             action = StreamAction()
             await piopiy_ws.send_text(action.playStream(audio_base64=audio_b64, audio_type="raw", sample_rate=8000))
-            print(f"📤 Sent audio chunk, length={len(audio_b64)} base64 chars")
+            print(f"📤 Sent audio chunk to Piopiy, length={len(audio_b64)} base64 chars")
         except Exception as e:
-            print(f"❌ Error sending audio: {e}")
+            print(f"❌ Error sending audio to Piopiy: {e}")
     else:
-        print("⚠️ No active WebSocket connection to send audio")
+        print("⚠️ No active Piopiy WebSocket connection to send audio")
 
 async def trigger_call_hangup():
     """Trigger call hangup by closing WebSocket connection"""
@@ -279,12 +281,12 @@ async def trigger_call_hangup():
         await log_call_message("system", "Triggering call hangup due to exit intent")
         global piopiy_ws
         if piopiy_ws:
-            print("🛑 Closing WebSocket connection to hangup call")
+            print("🛑 Closing Piopiy WebSocket connection to hangup call")
             await piopiy_ws.close()
-            await log_call_message("system", "WebSocket connection closed - call should end")
+            await log_call_message("system", "Piopiy WebSocket connection closed - call should end")
         else:
-            print("⚠️ No active WebSocket connection to close")
-            await log_call_message("system", "No active WebSocket connection found")
+            print("⚠️ No active Piopiy WebSocket connection to close")
+            await log_call_message("system", "No active Piopiy WebSocket connection found")
     except Exception as e:
         print(f"❌ Error triggering call hangup: {e}")
         await log_call_message("system", f"Call hangup error: {str(e)}")
@@ -297,6 +299,7 @@ async def ultra_fast_tts_worker():
             if not tts_q.empty():
                 text = tts_q.get()
                 if text is None:
+                    print("🔇 TTS worker received None, stopping")
                     break
                 print(f"🔔 TTS worker dequeued text: '{text[:80]}'")
                 raw_audio = await ultra_fast_tts(text)
@@ -306,7 +309,7 @@ async def ultra_fast_tts_worker():
                     print(f"🎼 Processed audio bytes: in={len(raw_audio)} -> out={len(processed)}")
                     await send_audio_ultra_fast(audio_b64)
                 else:
-                    print("⚠️ No audio produced by TTS")
+                    print("⚠️ No audio produced by TTS for text: '{text[:80]}'")
             await asyncio.sleep(0.0005)
         except Exception as e:
             print(f"⚠️ TTS worker error: {e}")
@@ -319,6 +322,13 @@ async def ultra_fast_llm_worker():
     session_started = False
     has_sent_greeting = False
     last_activity = datetime.now()
+
+    # Send initial greeting to start the conversation
+    greeting = bot.get_greeting_message()
+    await log_call_message("greeting", greeting)
+    tts_q.put(greeting)
+    has_sent_greeting = True
+    print("📢 Sent initial greeting to start conversation")
 
     while True:
         try:
@@ -344,13 +354,6 @@ async def ultra_fast_llm_worker():
 
                 await log_call_message("user", user_text)
 
-                if not has_sent_greeting:
-                    greeting = bot.get_greeting_message()
-                    await log_call_message("greeting", greeting)
-                    tts_q.put(greeting)
-                    has_sent_greeting = True
-                    continue
-
                 if bot.is_exit_intent(user_text):
                     exit_message = bot.get_exit_message()
                     await log_call_message("exit", exit_message)
@@ -368,10 +371,14 @@ async def ultra_fast_llm_worker():
                         timeout=10.0
                     )
                     await log_call_message("bot", reply)
+                    tts_q.put(reply)
+                    print(f"📢 Queued bot response for TTS: '{reply[:80]}'")
                 except asyncio.TimeoutError:
                     print("⚠️ LLM response timeout, sending fallback")
                     reply = "I apologize, but I'm having trouble processing your request right now. Could you please try again?"
                     await log_call_message("bot", reply)
+                    tts_q.put(reply)
+                    print(f"📢 Queued fallback response for TTS: '{reply[:80]}'")
                 except Exception as e:
                     print(f"⚠️ Error generating response: {e}, type: {type(e).__name__}")
                     if "api_key" in str(e).lower() or "authentication" in str(e).lower():
@@ -381,8 +388,9 @@ async def ultra_fast_llm_worker():
                     else:
                         reply = "I'm sorry, I encountered an error. Please try again."
                     await log_call_message("bot", reply)
+                    tts_q.put(reply)
+                    print(f"📢 Queued error response for TTS: '{reply[:80]}'")
 
-                tts_q.put(reply)
                 history.extend([
                     {"role": "user", "content": user_text},
                     {"role": "assistant", "content": reply}
@@ -428,6 +436,7 @@ def start_fast_deepgram():
                     print(f"🎧 ASR: {transcript}{' (final)' if is_final else ' (partial)'}")
                 if transcript and is_final:
                     transcript_q.put(transcript)
+                    print(f"📢 Transcription queued: '{transcript[:80]}'")
         except Exception as e:
             print(f"⚠️ Deepgram message parse error: {e}")
 
