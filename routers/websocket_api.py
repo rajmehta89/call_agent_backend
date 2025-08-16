@@ -161,18 +161,26 @@ async def end_call_tracking():
             "status": "completed"
         }
 
+        # Try to update existing call record if we have meaningful conversation data
         if current_call_data["transcription"] or current_call_data["ai_responses"]:
+            # First, try to update via session_id if we have it
             if current_call_data.get("call_session_id"):
                 result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
                 if result["success"]:
                     print(f"✅ Call logged to MongoDB: {phone_to_log} (session: {current_call_data.get('call_session_id')})")
                     update_lead_status_from_call(phone_to_log, current_call_data["lead_id"], call_data)
+                    if result.get("note") == "updated_existing_by_session":
+                        print("✅ Updated existing call record via session_id")
                 else:
                     print(f"⚠️ Failed to log call: {result.get('error', 'Unknown error')}")
+            # If no session_id, try to find and update recent "initiated" call by phone number or lead_id
             elif phone_to_log != "unknown" and mongo_client and mongo_client.is_connected():
                 try:
                     five_minutes_ago = datetime.now() - timedelta(minutes=5)
-                    query = {"status": "initiated", "created_at": {"$gte": five_minutes_ago}}
+                    query = {
+                        "status": "initiated",
+                        "created_at": {"$gte": five_minutes_ago}
+                    }
                     if current_call_data["lead_id"]:
                         query["lead_id"] = current_call_data["lead_id"]
                     else:
@@ -201,6 +209,7 @@ async def end_call_tracking():
                 except Exception as e:
                     print(f"⚠️ Error updating existing call: {e}")
                     result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
+            # Fallback: create new record if we have conversation data but no way to link
             else:
                 result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
                 print(f"✅ Created fallback call record")
@@ -500,7 +509,7 @@ async def websocket_endpoint(websocket: WebSocket):
         query_params = parse_qs(urlparse(websocket.scope["path"]).query)
         extracted_phone = query_params.get("phone_number", ["unknown"])[0]
         extracted_lead_id = query_params.get("lead_id", [None])[0]
-        session_id = query_params.get("session", [None])[0]
+        session_id = query_params.get("session", [None])[0] or query_params.get("sid", [None])[0]
         print(f"📋 Extracted from query params: phone={extracted_phone}, lead_id={extracted_lead_id}, session={session_id}")
     except Exception as e:
         print(f"⚠️ Error parsing query parameters: {e}")
@@ -610,3 +619,4 @@ async def websocket_endpoint(websocket: WebSocket):
 # Log API key presence at startup
 print(f"[WebSocket Server] 🔧 GOOGLE_API_KEY present: {'Yes' if GOOGLE_API_KEY else 'No'}")
 print(f"[WebSocket Server] 🔧 DG_API_KEY present: {'Yes' if DEEPGRAM_API_KEY else 'No'}")
+print("Call tracking enabled with MongoDB")
