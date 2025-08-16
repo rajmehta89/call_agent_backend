@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import numpy as np
 import scipy.signal as sps
+import scipy.io.wavfile
 import httpx
 from websocket import ABNF, WebSocketApp
 from urllib.parse import parse_qs, urlparse
@@ -36,7 +37,7 @@ GOOGLE_TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={G
 DG_WS_URL = (
     "wss://api.deepgram.com/v1/listen?"
     "sample_rate=8000&encoding=linear16&model=nova-2"
-    "&language=en-IN&smart_format=true&vad_turnoff=1500"
+    "&language=en-IN&smart_format=true&vad_turnoff=1500&no_delay=true"
 )
 
 # Global variables
@@ -223,11 +224,17 @@ async def end_call_tracking():
 
 # Audio processing
 def fast_audio_convert(raw_audio: bytes) -> bytes:
-    """Fastest possible audio conversion to Deepgram-compatible format"""
+    """Fastest possible audio conversion to Deepgram-compatible format with noise filtering"""
     try:
         samples = np.frombuffer(raw_audio, dtype=np.int16)
-        resampled = sps.resample_poly(samples, 8000, 22050)
+        # Apply high-pass filter to remove low-frequency noise
+        b, a = sps.butter(4, 100.0 / (8000 / 2), btype='high', analog=False)
+        filtered = sps.filtfilt(b, a, samples)
+        resampled = sps.resample_poly(filtered, 8000, 22050)
         normalized = np.clip(resampled * 0.8, -32767, 32767).astype(np.int16)
+        # Save a sample for debugging
+        scipy.io.wavfile.write("input_audio_sample.wav", 8000, normalized)
+        print(f"🎵 Saved audio sample to input_audio_sample.wav")
         return normalized.tobytes()
     except Exception as e:
         print(f"⚠️ Audio conversion error: {e}")
@@ -235,7 +242,7 @@ def fast_audio_convert(raw_audio: bytes) -> bytes:
 
 # TTS functions
 async def ultra_fast_tts(text: str) -> Optional[bytes]:
-    """Ultra-fast async TTS using Google TTS"""
+    """Ultra-fast async TTS using Google TTS with natural settings"""
     if not text.strip():
         print("🔇 TTS skipped: empty text")
         return None
@@ -245,14 +252,18 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
         try:
             response = await client.post(GOOGLE_TTS_URL, json={
                 "input": {"text": text},
-                "voice": {"languageCode": "en-US", "name": "en-US-Standard-D", "ssmlGender": "MALE"},
-                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 8000, "speakingRate": 1.15}
+                "voice": {"languageCode": "en-US", "name": "en-US-Neural2-D", "ssmlGender": "MALE"},
+                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 8000, "speakingRate": 1.0, "pitch": 0.0}
             })
             if response.status_code == 200:
                 audio_b64 = response.json().get("audioContent", "")
                 if audio_b64:
                     raw = base64.b64decode(audio_b64)
                     print(f"✅ TTS HTTP 200, bytes: {len(raw)}")
+                    # Save TTS output for debugging
+                    with open("tts_output.wav", "wb") as f:
+                        f.write(raw)
+                    print(f"🎵 Saved TTS output to tts_output.wav")
                     return raw
                 print("⚠️ TTS success but empty audioContent")
                 return None
@@ -330,6 +341,7 @@ async def ultra_fast_llm_worker():
     session_started = False
     has_sent_greeting = False
     last_activity = datetime.now()
+    last_transcription_time = datetime.now()
 
     # Send initial greeting to start the conversation
     greeting = bot.get_greeting_message()
@@ -347,6 +359,14 @@ async def ultra_fast_llm_worker():
 
     while True:
         try:
+            # Check for no transcription activity
+            if session_started and (datetime.now() - last_transcription_time).total_seconds() > 15:
+                prompt = "I haven't heard from you. Are you still there? Please tell me how I can assist you."
+                await log_call_message("bot", prompt)
+                tts_q.put(prompt)
+                print("📢 Sent prompt to encourage user speech")
+                last_transcription_time = datetime.now()
+
             if session_started and (datetime.now() - last_activity).total_seconds() > 30:
                 print("⏰ No activity for 30 seconds, ending session")
                 exit_message = bot.get_exit_message()
@@ -362,6 +382,7 @@ async def ultra_fast_llm_worker():
             if not transcript_q.empty():
                 user_text = transcript_q.get()
                 last_activity = datetime.now()
+                last_transcription_time = datetime.now()
 
                 if not session_started:
                     session_started = True
@@ -441,6 +462,7 @@ def start_fast_deepgram():
             print(f"📥 Deepgram message received: {json.dumps(data)[:200]}")
             if data.get("type") == "Results":
                 transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
+                confidence = data.get("channel", {}).get("alternatives", [{}])[0].get("confidence", 0.0)
                 is_final = (
                         bool(data.get("is_final"))
                         or bool(data.get("speech_final"))
@@ -448,13 +470,12 @@ def start_fast_deepgram():
                         or bool(data.get("channel", {}).get("is_final"))
                         or bool(data.get("channel", {}).get("alternatives", [{}])[0].get("final"))
                 )
-                if transcript:
-                    print(f"🎧 ASR: {transcript}{' (final)' if is_final else ' (partial)'}")
                 if transcript and is_final:
+                    print(f"🎧 ASR: {transcript} (final, confidence={confidence:.2f})")
                     transcript_q.put(transcript)
                     print(f"📢 Transcription queued: '{transcript[:80]}'")
                 else:
-                    print("⚠️ No valid transcript or not final")
+                    print(f"⚠️ No valid transcript (transcript='{transcript}', is_final={is_final}, confidence={confidence:.2f})")
             else:
                 print(f"ℹ️ Non-results Deepgram message: {data.get('type')}")
         except Exception as e:
@@ -541,6 +562,21 @@ async def websocket_endpoint(websocket: WebSocket):
         call_session_id=session_id
     )
 
+    # Update call context from MongoDB
+    if mongo_client and mongo_client.is_connected() and session_id:
+        try:
+            recent_call = mongo_client.calls.find_one({
+                "call_session_id": session_id,
+                "status": "initiated",
+                "created_at": {"$gte": datetime.now() - timedelta(minutes=5)}
+            }, sort=[("created_at", -1)])
+            if recent_call:
+                current_call_data["phone_number"] = recent_call.get("phone_number", extracted_phone)
+                current_call_data["lead_id"] = recent_call.get("lead_id", extracted_lead_id)
+                print(f"📋 Updated call context from MongoDB: phone={current_call_data['phone_number']}, lead_id={current_call_data['lead_id']}")
+        except Exception as e:
+            print(f"⚠️ Error updating call context from MongoDB: {e}")
+
     # Start workers
     tts_task = asyncio.create_task(ultra_fast_tts_worker())
     llm_task = asyncio.create_task(ultra_fast_llm_worker())
@@ -612,8 +648,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     try:
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
                         audio_buffer.extend(message["bytes"])
-                        # Send audio to Deepgram if buffer has at least 2 seconds of audio (3200 bytes at 8000 Hz, 16-bit)
-                        if len(audio_buffer) >= 3200:
+                        # Send audio to Deepgram if buffer has at least 5 seconds of audio (8000 bytes at 8000 Hz, 16-bit)
+                        if len(audio_buffer) >= 8000:
                             if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                                 processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, bytes(audio_buffer))
                                 dg_ws_client.send(processed_audio, opcode=ABNF.OPCODE_BINARY)
