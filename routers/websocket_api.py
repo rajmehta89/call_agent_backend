@@ -45,6 +45,7 @@ tts_q = SimpleQueue()
 ai_services = AIServices()
 dg_ws_client = None
 piopiy_ws = None
+audio_buffer = bytearray()  # Buffer to accumulate audio chunks
 
 # Global call tracking
 current_call_data = {
@@ -262,18 +263,25 @@ async def ultra_fast_tts(text: str) -> Optional[bytes]:
             print(f"❌ TTS request failed: {e}")
             return None
 
-async def send_audio_ultra_fast(audio_b64: str):
-    """Send audio to Piopiy WebSocket using StreamAction"""
+async def send_audio_ultra_fast(audio_b64: str, retry_count: int = 3):
+    """Send audio to Piopiy WebSocket using StreamAction with retries"""
     global piopiy_ws
-    if piopiy_ws:
+    if not piopiy_ws:
+        print("⚠️ No active Piopiy WebSocket connection to send audio")
+        return
+
+    for attempt in range(retry_count):
         try:
             action = StreamAction()
             await piopiy_ws.send_text(action.playStream(audio_base64=audio_b64, audio_type="raw", sample_rate=8000))
-            print(f"📤 Sent audio chunk to Piopiy, length={len(audio_b64)} base64 chars")
+            print(f"📤 Sent audio chunk to Piopiy, length={len(audio_b64)} base64 chars, attempt={attempt+1}")
+            return
         except Exception as e:
-            print(f"❌ Error sending audio to Piopiy: {e}")
-    else:
-        print("⚠️ No active Piopiy WebSocket connection to send audio")
+            print(f"❌ Error sending audio to Piopiy (attempt {attempt+1}/{retry_count}): {e}")
+            if attempt < retry_count - 1:
+                await asyncio.sleep(1)
+            else:
+                print("⚠️ Failed to send audio to Piopiy after retries")
 
 async def trigger_call_hangup():
     """Trigger call hangup by closing WebSocket connection"""
@@ -309,7 +317,7 @@ async def ultra_fast_tts_worker():
                     print(f"🎼 Processed audio bytes: in={len(raw_audio)} -> out={len(processed)}")
                     await send_audio_ultra_fast(audio_b64)
                 else:
-                    print("⚠️ No audio produced by TTS for text: '{text[:80]}'")
+                    print(f"⚠️ No audio produced by TTS for text: '{text[:80]}'")
             await asyncio.sleep(0.0005)
         except Exception as e:
             print(f"⚠️ TTS worker error: {e}")
@@ -329,6 +337,13 @@ async def ultra_fast_llm_worker():
     tts_q.put(greeting)
     has_sent_greeting = True
     print("📢 Sent initial greeting to start conversation")
+
+    # Send a follow-up test message to ensure audio output
+    await asyncio.sleep(5)
+    test_message = "Can you hear me? Please say something, and I'll assist you with your real estate needs."
+    await log_call_message("bot", test_message)
+    tts_q.put(test_message)
+    print("📢 Sent test message to ensure audio output")
 
     while True:
         try:
@@ -423,6 +438,7 @@ def start_fast_deepgram():
     def on_message(ws, message):
         try:
             data = json.loads(message)
+            print(f"📥 Deepgram message received: {json.dumps(data)[:200]}")
             if data.get("type") == "Results":
                 transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
                 is_final = (
@@ -437,6 +453,10 @@ def start_fast_deepgram():
                 if transcript and is_final:
                     transcript_q.put(transcript)
                     print(f"📢 Transcription queued: '{transcript[:80]}'")
+                else:
+                    print("⚠️ No valid transcript or not final")
+            else:
+                print(f"ℹ️ Non-results Deepgram message: {data.get('type')}")
         except Exception as e:
             print(f"⚠️ Deepgram message parse error: {e}")
 
@@ -492,7 +512,7 @@ def get_websocket_url():
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Ultra-fast WebSocket client handler"""
-    global piopiy_ws
+    global piopiy_ws, audio_buffer
     piopiy_ws = websocket
 
     await websocket.accept()
@@ -591,14 +611,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif "bytes" in message:
                     try:
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
-                        if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
-                            processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, message["bytes"])
-                            dg_ws_client.send(processed_audio, opcode=ABNF.OPCODE_BINARY)
-                            print("📤 Sent audio to Deepgram")
-                        else:
-                            print("⚠️ Deepgram WebSocket not connected")
+                        audio_buffer.extend(message["bytes"])
+                        # Send audio to Deepgram if buffer has at least 2 seconds of audio (3200 bytes at 8000 Hz, 16-bit)
+                        if len(audio_buffer) >= 3200:
+                            if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
+                                processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, bytes(audio_buffer))
+                                dg_ws_client.send(processed_audio, opcode=ABNF.OPCODE_BINARY)
+                                print(f"📤 Sent {len(processed_audio)} bytes of buffered audio to Deepgram")
+                                audio_buffer.clear()
+                            else:
+                                print("⚠️ Deepgram WebSocket not connected")
+                                audio_buffer.clear()
                     except Exception as e:
                         print(f"⚠️ Error processing audio data: {e}")
+                        audio_buffer.clear()
     except Exception as e:
         print(f"❌ WebSocket connection error: {e}")
     finally:
@@ -612,6 +638,7 @@ async def websocket_endpoint(websocket: WebSocket):
         except asyncio.CancelledError:
             pass
         piopiy_ws = None
+        audio_buffer.clear()
 
 # Log API key presence at startup
 print(f"[WebSocket Server] 🔧 GOOGLE_API_KEY present: {'Yes' if GOOGLE_API_KEY else 'No'}")
