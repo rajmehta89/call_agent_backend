@@ -12,9 +12,7 @@ import time
 from queue import SimpleQueue
 from datetime import datetime, timedelta
 from typing import Optional
-import numpy as np
-import scipy.signal as sps
-import scipy.io.wavfile
+import re
 import httpx
 from websocket import ABNF, WebSocketApp
 from urllib.parse import parse_qs, urlparse
@@ -32,6 +30,11 @@ router = APIRouter(tags=["WebSocket"])
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DG_API_KEY")
 
+# TTS tuning (human-like + slower)
+GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "en-IN-Neural2-A")  # good Indian English voice
+GOOGLE_TTS_RATE = float(os.getenv("GOOGLE_TTS_RATE", "0.88"))        # 0.75–0.95 feels natural & slower
+GOOGLE_TTS_PITCH = float(os.getenv("GOOGLE_TTS_PITCH", "-2.0"))      # in semitones, slightly deeper
+
 # Constants
 GOOGLE_TTS_URL = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={GOOGLE_API_KEY}"
 DG_WS_URL = (
@@ -46,7 +49,7 @@ tts_q = SimpleQueue()
 ai_services = AIServices()
 dg_ws_client = None
 piopiy_ws = None
-audio_buffer = bytearray()  # Buffer to accumulate audio chunks
+audio_buffer = bytearray()  # Buffer to accumulate audio chunks (from caller)
 
 # Global call tracking
 current_call_data = {
@@ -58,6 +61,48 @@ current_call_data = {
     "end_time": None,
     "call_session_id": None
 }
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def _escape_ssml(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+def text_to_ssml(text: str) -> str:
+    """
+    Convert raw text into SSML with natural sentence breaks
+    and slightly slower, deeper prosody for human-like telephony.
+    """
+    text = text.strip()
+    if not text:
+        return "<speak></speak>"
+
+    # Split into sentences for controlled pauses
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    segments = []
+    for i, p in enumerate(parts):
+        if not p:
+            continue
+        p_esc = _escape_ssml(p)
+        # Slight pause after each sentence, longer after the first greeting
+        if i == 0:
+            segments.append(f"<s>{p_esc}</s><break time='350ms'/>")
+        else:
+            segments.append(f"<s>{p_esc}</s><break time='300ms'/>")
+
+    body = " ".join(segments)
+    # Global prosody: slow rate, slightly lower pitch (more relaxed & clear)
+    return (
+        "<speak>"
+        f"<prosody rate='slow' pitch='{GOOGLE_TTS_PITCH:+.1f}st'>"
+        f"{body}"
+        "</prosody>"
+        "</speak>"
+    )
 
 async def log_call_message(message_type: str, content: str, phone_number: Optional[str] = None, lead_id: Optional[str] = None):
     """Log call message and track conversation"""
@@ -222,48 +267,40 @@ async def end_call_tracking():
         "call_session_id": None
     }
 
-# Audio processing
-def fast_audio_convert(raw_audio: bytes) -> bytes:
-    """Fastest possible audio conversion to Deepgram-compatible format with noise filtering"""
-    try:
-        samples = np.frombuffer(raw_audio, dtype=np.int16)
-        # Apply high-pass filter to remove low-frequency noise
-        b, a = sps.butter(4, 100.0 / (8000 / 2), btype='high', analog=False)
-        filtered = sps.filtfilt(b, a, samples)
-        resampled = sps.resample_poly(filtered, 8000, 22050)
-        normalized = np.clip(resampled * 0.8, -32767, 32767).astype(np.int16)
-        # Save a sample for debugging
-        scipy.io.wavfile.write("input_audio_sample.wav", 8000, normalized)
-        print(f"🎵 Saved audio sample to input_audio_sample.wav")
-        return normalized.tobytes()
-    except Exception as e:
-        print(f"⚠️ Audio conversion error: {e}")
-        return raw_audio
-
-# TTS functions
+# ---------------------------
+# TTS functions (slower, SSML)
+# ---------------------------
 async def ultra_fast_tts(text: str) -> Optional[bytes]:
-    """Ultra-fast async TTS using Google TTS with natural settings"""
-    if not text.strip():
+    """Async TTS using Google TTS with SSML prosody for slower, human-like delivery"""
+    cleaned = (text or "").strip()
+    if not cleaned:
         print("🔇 TTS skipped: empty text")
         return None
-    print(f"🗣️ TTS request: '{text[:80]}'")
+    print(f"🗣️ TTS request: '{cleaned[:80]}'")
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    ssml = text_to_ssml(cleaned)
+
+    async with httpx.AsyncClient(timeout=15) as client:
         try:
-            response = await client.post(GOOGLE_TTS_URL, json={
-                "input": {"text": text},
-                "voice": {"languageCode": "en-US", "name": "en-US-Neural2-D", "ssmlGender": "MALE"},
-                "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 8000, "speakingRate": 1.0, "pitch": 0.0}
-            })
+            payload = {
+                "input": {"ssml": ssml},
+                "voice": {"languageCode": "en-IN", "name": GOOGLE_TTS_VOICE},
+                "audioConfig": {
+                    "audioEncoding": "LINEAR16",
+                    "sampleRateHertz": 8000,                 # telephony wideband
+                    "speakingRate": GOOGLE_TTS_RATE,         # slightly slower than normal
+                    "pitch": GOOGLE_TTS_PITCH,               # a touch deeper
+                    "effectsProfileId": ["telephony-class-application"]
+                }
+            }
+            response = await client.post(GOOGLE_TTS_URL, json=payload)
             if response.status_code == 200:
                 audio_b64 = response.json().get("audioContent", "")
                 if audio_b64:
                     raw = base64.b64decode(audio_b64)
                     print(f"✅ TTS HTTP 200, bytes: {len(raw)}")
-                    # Save TTS output for debugging
-                    with open("tts_output.wav", "wb") as f:
-                        f.write(raw)
-                    print(f"🎵 Saved TTS output to tts_output.wav")
+                    # Optional debug dump:
+                    # with open("tts_output.wav", "wb") as f: f.write(raw)
                     return raw
                 print("⚠️ TTS success but empty audioContent")
                 return None
@@ -310,9 +347,11 @@ async def trigger_call_hangup():
         print(f"❌ Error triggering call hangup: {e}")
         await log_call_message("system", f"Call hangup error: {str(e)}")
 
-# Worker functions
+# ---------------------------
+# Workers
+# ---------------------------
 async def ultra_fast_tts_worker():
-    """TTS processing worker"""
+    """TTS processing worker (keeps voice slow & natural)"""
     while True:
         try:
             if not tts_q.empty():
@@ -323,9 +362,9 @@ async def ultra_fast_tts_worker():
                 print(f"🔔 TTS worker dequeued text: '{text[:80]}'")
                 raw_audio = await ultra_fast_tts(text)
                 if raw_audio:
-                    processed = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, raw_audio)
-                    audio_b64 = base64.b64encode(processed).decode()
-                    print(f"🎼 Processed audio bytes: in={len(raw_audio)} -> out={len(processed)}")
+                    # Already LINEAR16 @ 8kHz from Google; send as-is for best quality
+                    audio_b64 = base64.b64encode(raw_audio).decode()
+                    print(f"🎼 TTS bytes ready: {len(raw_audio)}")
                     await send_audio_ultra_fast(audio_b64)
                 else:
                     print(f"⚠️ No audio produced by TTS for text: '{text[:80]}'")
@@ -339,27 +378,25 @@ async def ultra_fast_llm_worker():
     bot = RealEstateQA(ai_services)
     history = []
     session_started = False
-    has_sent_greeting = False
     last_activity = datetime.now()
     last_transcription_time = datetime.now()
 
-    # Send initial greeting to start the conversation
+    # Initial greeting (will be spoken slowly via SSML settings)
     greeting = bot.get_greeting_message()
     await log_call_message("greeting", greeting)
     tts_q.put(greeting)
-    has_sent_greeting = True
     print("📢 Sent initial greeting to start conversation")
 
-    # Send a follow-up test message to ensure audio output
-    await asyncio.sleep(5)
-    test_message = "Can you hear me? Please say something, and I'll assist you with your real estate needs."
+    # Optional gentle prompt to confirm audio path
+    await asyncio.sleep(4)
+    test_message = "Can you hear me clearly? Please say how I can help you with your real estate needs."
     await log_call_message("bot", test_message)
     tts_q.put(test_message)
     print("📢 Sent test message to ensure audio output")
 
     while True:
         try:
-            # Check for no transcription activity
+            # Nudge if silent
             if session_started and (datetime.now() - last_transcription_time).total_seconds() > 15:
                 prompt = "I haven't heard from you. Are you still there? Please tell me how I can assist you."
                 await log_call_message("bot", prompt)
@@ -367,6 +404,7 @@ async def ultra_fast_llm_worker():
                 print("📢 Sent prompt to encourage user speech")
                 last_transcription_time = datetime.now()
 
+            # End if no activity
             if session_started and (datetime.now() - last_activity).total_seconds() > 30:
                 print("⏰ No activity for 30 seconds, ending session")
                 exit_message = bot.get_exit_message()
@@ -376,7 +414,6 @@ async def ultra_fast_llm_worker():
                 await trigger_call_hangup()
                 session_started = False
                 history = []
-                has_sent_greeting = False
                 continue
 
             if not transcript_q.empty():
@@ -398,7 +435,6 @@ async def ultra_fast_llm_worker():
                     await trigger_call_hangup()
                     session_started = False
                     history = []
-                    has_sent_greeting = False
                     continue
 
                 try:
@@ -414,7 +450,6 @@ async def ultra_fast_llm_worker():
                     reply = "I apologize, but I'm having trouble processing your request right now. Could you please try again?"
                     await log_call_message("bot", reply)
                     tts_q.put(reply)
-                    print(f"📢 Queued fallback response for TTS: '{reply[:80]}'")
                 except Exception as e:
                     print(f"⚠️ Error generating response: {e}, type: {type(e).__name__}")
                     if "api_key" in str(e).lower() or "authentication" in str(e).lower():
@@ -425,7 +460,6 @@ async def ultra_fast_llm_worker():
                         reply = "I'm sorry, I encountered an error. Please try again."
                     await log_call_message("bot", reply)
                     tts_q.put(reply)
-                    print(f"📢 Queued error response for TTS: '{reply[:80]}'")
 
                 history.extend([
                     {"role": "user", "content": user_text},
@@ -439,7 +473,9 @@ async def ultra_fast_llm_worker():
             print(f"⚠️ LLM worker error: {e}")
             await asyncio.sleep(0.1)
 
+# ---------------------------
 # Deepgram WebSocket client
+# ---------------------------
 def start_fast_deepgram():
     """Start Deepgram WebSocket client with reconnection logic"""
     global dg_ws_client
@@ -459,25 +495,22 @@ def start_fast_deepgram():
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            print(f"📥 Deepgram message received: {json.dumps(data)[:200]}")
+            # print(f"📥 Deepgram message: {json.dumps(data)[:200]}")
             if data.get("type") == "Results":
-                transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
-                confidence = data.get("channel", {}).get("alternatives", [{}])[0].get("confidence", 0.0)
+                alt = data.get("channel", {}).get("alternatives", [{}])[0]
+                transcript = alt.get("transcript", "")
+                confidence = alt.get("confidence", 0.0)
                 is_final = (
-                        bool(data.get("is_final"))
-                        or bool(data.get("speech_final"))
-                        or bool(data.get("final"))
-                        or bool(data.get("channel", {}).get("is_final"))
-                        or bool(data.get("channel", {}).get("alternatives", [{}])[0].get("final"))
+                        bool(data.get("is_final")) or
+                        bool(data.get("speech_final")) or
+                        bool(data.get("final")) or
+                        bool(data.get("channel", {}).get("is_final")) or
+                        bool(alt.get("final"))
                 )
                 if transcript and is_final:
-                    print(f"🎧 ASR: {transcript} (final, confidence={confidence:.2f})")
+                    print(f"🎧 ASR: {transcript} (final, conf={confidence:.2f})")
                     transcript_q.put(transcript)
-                    print(f"📢 Transcription queued: '{transcript[:80]}'")
-                else:
-                    print(f"⚠️ No valid transcript (transcript='{transcript}', is_final={is_final}, confidence={confidence:.2f})")
-            else:
-                print(f"ℹ️ Non-results Deepgram message: {data.get('type')}")
+                # else: partials are ignored for now
         except Exception as e:
             print(f"⚠️ Deepgram message parse error: {e}")
 
@@ -530,9 +563,12 @@ def get_websocket_url():
         return f"{ws_url}/ws"
     return "ws://localhost:8000/ws"
 
+# ---------------------------
+# WebSocket endpoint
+# ---------------------------
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Ultra-fast WebSocket client handler"""
+    """WebSocket client handler"""
     global piopiy_ws, audio_buffer
     piopiy_ws = websocket
 
@@ -586,6 +622,8 @@ async def websocket_endpoint(websocket: WebSocket):
         start_fast_deepgram()
         await asyncio.sleep(1)
 
+    # Stream loop
+    CHUNK_SIZE = 3200  # ~200 ms at 8kHz 16-bit mono
     try:
         while True:
             message = await websocket.receive()
@@ -646,24 +684,40 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"⚠️ Error processing text message: {e}, message: {message['text'][:200]}")
                 elif "bytes" in message:
                     try:
-                        print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
-                        audio_buffer.extend(message["bytes"])
-                        # Send audio to Deepgram if buffer has at least 5 seconds of audio (8000 bytes at 8000 Hz, 16-bit)
-                        if len(audio_buffer) >= 8000:
+                        # Incoming audio from caller (assumed PCM16, 8kHz, mono)
+                        incoming = message["bytes"]
+                        print(f"🎵 Received audio: {len(incoming)} bytes")
+                        audio_buffer.extend(incoming)
+
+                        # Stream to Deepgram in ~200 ms chunks for low latency & better ASR
+                        while len(audio_buffer) >= CHUNK_SIZE:
+                            chunk = audio_buffer[:CHUNK_SIZE]
+                            del audio_buffer[:CHUNK_SIZE]
                             if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
-                                processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, bytes(audio_buffer))
-                                dg_ws_client.send(processed_audio, opcode=ABNF.OPCODE_BINARY)
-                                print(f"📤 Sent {len(processed_audio)} bytes of buffered audio to Deepgram")
-                                audio_buffer.clear()
+                                try:
+                                    dg_ws_client.send(chunk, opcode=ABNF.OPCODE_BINARY)
+                                    # print(f"📤 Sent {len(chunk)} bytes to Deepgram")
+                                except Exception as e:
+                                    print(f"⚠️ Failed to send chunk to Deepgram: {e}")
+                                    break
                             else:
-                                print("⚠️ Deepgram WebSocket not connected")
+                                print("⚠️ Deepgram WS not connected; dropping chunk")
                                 audio_buffer.clear()
+                                break
                     except Exception as e:
                         print(f"⚠️ Error processing audio data: {e}")
                         audio_buffer.clear()
     except Exception as e:
         print(f"❌ WebSocket connection error: {e}")
     finally:
+        # Flush any remaining audio once (best-effort) on disconnect
+        try:
+            if audio_buffer and dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
+                dg_ws_client.send(bytes(audio_buffer), opcode=ABNF.OPCODE_BINARY)
+                print(f"📤 Flushed {len(audio_buffer)} bytes to Deepgram on close")
+        except Exception as e:
+            print(f"⚠️ Flush error: {e}")
+
         print("🔌 WebSocket client disconnected - ending call tracking")
         await end_call_tracking()
         tts_task.cancel()
