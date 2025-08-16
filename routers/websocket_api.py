@@ -11,7 +11,7 @@ import threading
 import time
 from queue import SimpleQueue
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Optional
 import numpy as np
 import scipy.signal as sps
 import httpx
@@ -161,26 +161,18 @@ async def end_call_tracking():
             "status": "completed"
         }
 
-        # Try to update existing call record if we have meaningful conversation data
         if current_call_data["transcription"] or current_call_data["ai_responses"]:
-            # First, try to update via session_id if we have it
             if current_call_data.get("call_session_id"):
                 result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
                 if result["success"]:
                     print(f"✅ Call logged to MongoDB: {phone_to_log} (session: {current_call_data.get('call_session_id')})")
                     update_lead_status_from_call(phone_to_log, current_call_data["lead_id"], call_data)
-                    if result.get("note") == "updated_existing_by_session":
-                        print("✅ Updated existing call record via session_id")
                 else:
                     print(f"⚠️ Failed to log call: {result.get('error', 'Unknown error')}")
-            # If no session_id, try to find and update recent "initiated" call by phone number or lead_id
             elif phone_to_log != "unknown" and mongo_client and mongo_client.is_connected():
                 try:
                     five_minutes_ago = datetime.now() - timedelta(minutes=5)
-                    query = {
-                        "status": "initiated",
-                        "created_at": {"$gte": five_minutes_ago}
-                    }
+                    query = {"status": "initiated", "created_at": {"$gte": five_minutes_ago}}
                     if current_call_data["lead_id"]:
                         query["lead_id"] = current_call_data["lead_id"]
                     else:
@@ -209,7 +201,6 @@ async def end_call_tracking():
                 except Exception as e:
                     print(f"⚠️ Error updating existing call: {e}")
                     result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
-            # Fallback: create new record if we have conversation data but no way to link
             else:
                 result = log_call(phone_to_log, current_call_data["lead_id"], call_data)
                 print(f"✅ Created fallback call record")
@@ -507,7 +498,7 @@ async def websocket_endpoint(websocket: WebSocket):
     extracted_lead_id = None
     try:
         query_params = parse_qs(urlparse(websocket.scope["path"]).query)
-        extracted_phone = query_params.get("phone_number", ["unknown"])[0]
+        extracted_phone = query_params.get("phone_number", ["unknown"])[0] or query_params.get("phone", ["unknown"])[0]
         extracted_lead_id = query_params.get("lead_id", [None])[0]
         session_id = query_params.get("session", [None])[0] or query_params.get("sid", [None])[0]
         print(f"📋 Extracted from query params: phone={extracted_phone}, lead_id={extracted_lead_id}, session={session_id}")
@@ -540,12 +531,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "text" in message:
                     try:
                         print(f"📝 Received text message: {message['text'][:200]}...")
-                        # Handle UUID-like session ID messages
                         if message["text"].replace("-", "").isalnum() and len(message["text"]) == 36:
                             print(f"📋 Treating text as session_id: {message['text']}")
                             current_call_data["call_session_id"] = message["text"]
                             await log_call_message("system", f"Updated session_id: {message['text']}")
-                            # Try to find recent call by session_id
                             if mongo_client and mongo_client.is_connected():
                                 try:
                                     recent_call = mongo_client.calls.find_one({
@@ -560,14 +549,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                 except Exception as e:
                                     print(f"⚠️ Error finding recent call by session_id: {e}")
                             continue
-                        # Parse JSON messages
                         data = json.loads(message["text"])
                         print(f"📋 Parsed JSON: {data}")
                         extra_params = data.get("extra_params")
                         if extra_params:
-                            phone = extra_params.get("phone_number")
+                            phone = extra_params.get("phone_number") or extra_params.get("phone")
                             lead_id = extra_params.get("lead_id")
-                            sess = extra_params.get("session")
+                            sess = extra_params.get("session") or extra_params.get("sid")
                             if phone:
                                 current_call_data["phone_number"] = str(phone)
                             if lead_id:
@@ -575,18 +563,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             if sess:
                                 current_call_data["call_session_id"] = str(sess)
                             await log_call_message("system", f"Call context: phone={phone}, lead_id={lead_id}, session={sess}")
-                        meta = data.get("meta")
+                        meta = data.get("meta", data)
                         if isinstance(meta, dict):
                             phone = meta.get("phone_number") or meta.get("phone")
                             lead_id = meta.get("lead_id")
-                            sess = meta.get("session") or meta.get("sid")
+                            sess = meta.get("session") or meta.get("sid") or session_id
                             if phone:
                                 current_call_data["phone_number"] = str(phone)
                             if lead_id:
                                 current_call_data["lead_id"] = str(lead_id)
                             if sess:
                                 current_call_data["call_session_id"] = str(sess)
-                            await log_call_message("system", f"Call context from meta: phone={phone}, lead_id={lead_id}")
+                            await log_call_message("system", f"Call context from meta: phone={phone}, lead_id={lead_id}, session={sess}")
                     except json.JSONDecodeError as e:
                         print(f"⚠️ Non-JSON text message received: {message['text'][:200]}, error: {e}")
                     except Exception as e:
@@ -596,7 +584,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         print(f"🎵 Received audio data: {len(message['bytes'])} bytes")
                         if dg_ws_client and dg_ws_client.sock and dg_ws_client.sock.connected:
                             processed_audio = await asyncio.get_event_loop().run_in_executor(None, fast_audio_convert, message["bytes"])
-                            dg_ws_client.send_binary(processed_audio)
+                            dg_ws_client.send(processed_audio, opcode=websocket.ABNF.OPCODE_BINARY)
                             print("📤 Sent audio to Deepgram")
                         else:
                             print("⚠️ Deepgram WebSocket not connected")
