@@ -21,6 +21,7 @@ router = APIRouter(prefix="/api/twilio", tags=["twilio"])
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID")
 TWILIO_HUMAN_AGENT_NUMBER = os.getenv("TWILIO_HUMAN_AGENT_NUMBER") or os.getenv("AGENT_NUMBER")
 TWILIO_PUBLIC_BASE_URL = (
     os.getenv("TWILIO_PUBLIC_BASE_URL")
@@ -29,6 +30,7 @@ TWILIO_PUBLIC_BASE_URL = (
     or "http://localhost:8000"
 )
 TWILIO_CONVERSATION_LANG = os.getenv("TWILIO_CONVERSATION_LANG", "en-US")
+OUTBOUND_CALL_CONTEXT: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_ws_base_url() -> str:
@@ -55,6 +57,10 @@ def _build_conversation_twiml() -> str:
         "</Connect>"
         "</Response>"
     )
+
+
+def _build_outbound_conversation_twiml() -> str:
+    return _build_conversation_twiml()
 
 
 def _build_transfer_twiml() -> str:
@@ -118,6 +124,50 @@ def _get_twilio_client() -> Client | None:
     return Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
+def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, lead_name: Optional[str] = None) -> Dict[str, Any]:
+    client = _get_twilio_client()
+    if not client:
+        return {"error": "Twilio credentials are not configured"}
+    if not TWILIO_CALLER_ID:
+        return {"error": "TWILIO_CALLER_ID is not configured"}
+
+    status_callback = f"{_get_http_base_url()}/api/twilio/status"
+    connect_url = f"{_get_http_base_url()}/api/twilio/outbound/connect"
+
+    try:
+        outbound_call = client.calls.create(
+            to=customer_number,
+            from_=TWILIO_CALLER_ID,
+            url=connect_url,
+            method="POST",
+            status_callback=status_callback,
+            status_callback_method="POST",
+            status_callback_event=["initiated", "ringing", "answered", "completed"],
+        )
+        OUTBOUND_CALL_CONTEXT[outbound_call.sid] = {
+            "phone_number": customer_number,
+            "lead_id": lead_id,
+            "lead_name": lead_name,
+            "direction": "outbound",
+            "created_at": datetime.now().isoformat(),
+        }
+        transfer_service.register_call(outbound_call.sid, customer_number, lead_id, direction="outbound")
+        return {
+            "status": "initiated",
+            "provider": "twilio",
+            "call_sid": outbound_call.sid,
+            "session_id": outbound_call.sid,
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def get_outbound_call_context(call_sid: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not call_sid:
+        return None
+    return OUTBOUND_CALL_CONTEXT.get(call_sid)
+
+
 async def _send_text(websocket: WebSocket, text: str, last: bool = True):
     await websocket.send_text(json.dumps({
         "type": "text",
@@ -142,6 +192,11 @@ def _serialize_messages(messages: List[Dict[str, Any]], speaker: str) -> List[Di
 @router.post("/inbound", response_class=PlainTextResponse)
 async def inbound_call():
     return PlainTextResponse(_build_conversation_twiml(), media_type="text/xml")
+
+
+@router.post("/outbound/connect", response_class=PlainTextResponse)
+async def outbound_connect():
+    return PlainTextResponse(_build_outbound_conversation_twiml(), media_type="text/xml")
 
 
 @router.post("/status")
@@ -180,6 +235,11 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 session["call_sid"] = data.get("callSid")
                 session["phone_number"] = data.get("from") or "unknown"
                 session["direction"] = data.get("direction") or "inbound"
+                outbound_context = get_outbound_call_context(session["call_sid"])
+                if outbound_context:
+                    session["phone_number"] = outbound_context.get("phone_number") or session["phone_number"]
+                    session["lead_id"] = outbound_context.get("lead_id")
+                    session["direction"] = "outbound"
                 transfer_service.register_call(
                     session["session_id"],
                     session["phone_number"],
@@ -288,12 +348,12 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 session["phone_number"],
                 session.get("lead_id"),
                 {
-                    "direction": "inbound",
+                    "direction": session.get("direction", "inbound"),
                     "status": "completed",
                     "duration": duration,
                     "transcription": _serialize_messages(user_transcript, "user"),
                     "ai_responses": _serialize_messages(ai_responses, "bot"),
-                    "summary": f"Twilio inbound call with {len(user_transcript)} caller turns",
+                    "summary": f"Twilio {session.get('direction', 'inbound')} call with {len(user_transcript)} caller turns",
                     "sentiment": "neutral",
                     "transfer_requested": handoff.get("transfer_requested", False),
                     "transfer_reason": handoff.get("transfer_reason"),
@@ -301,3 +361,5 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     "call_session_id": session.get("session_id"),
                 },
             )
+        if session.get("call_sid"):
+            OUTBOUND_CALL_CONTEXT.pop(session["call_sid"], None)
