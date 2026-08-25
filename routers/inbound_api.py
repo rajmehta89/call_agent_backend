@@ -1,8 +1,23 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from piopiy import Action
 import os
 from dotenv import load_dotenv
+
+try:
+    from piopiy import Action
+except ImportError:
+    class Action:
+        def __init__(self):
+            self._actions = []
+
+        def stream(self, *args, **kwargs):
+            self._actions.append({"type": "stream", "args": args, "kwargs": kwargs})
+
+        def call(self, *args, **kwargs):
+            self._actions.append({"type": "call", "args": args, "kwargs": kwargs})
+
+        def PCMO(self):
+            return {"actions": self._actions}
 
 load_dotenv()
 

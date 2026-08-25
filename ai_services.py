@@ -3,28 +3,114 @@ import base64
 import numpy as np
 import time
 from groq import Groq
+from openai import OpenAI
 from config import Config
 from real_estate_data import REAL_ESTATE_INFO
+
+
+class _CompletionAdapter:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def create(self, messages, model=None, max_tokens=80, temperature=0.7, top_p=0.9, stream=False):
+        text = self.parent.chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        class _Message:
+            def __init__(self, content):
+                self.content = content
+
+        class _Choice:
+            def __init__(self, content):
+                self.message = _Message(content)
+
+        class _Response:
+            def __init__(self, content):
+                self.choices = [_Choice(content)]
+
+        return _Response(text)
+
+
+class _ChatAdapter:
+    def __init__(self, parent):
+        self.completions = _CompletionAdapter(parent)
+
+
+class _ClientAdapter:
+    def __init__(self, parent):
+        self.chat = _ChatAdapter(parent)
 
 class AIServices:
     def __init__(self):
         self.config = Config()
-        
-        # Debug API key configuration
+        self.provider = self._resolve_provider()
+        self.groq_client = None
+        self.openai_client = None
+
         print(f"Initializing AIServices...")
+        print(f"LLM provider selected: {self.provider}")
         print(f"GROQ_API_KEY present: {'Yes' if self.config.GROQ_API_KEY else 'No'}")
-        if self.config.GROQ_API_KEY:
-            print(f"GROQ_API_KEY length: {len(self.config.GROQ_API_KEY)}")
-            print(f"GROQ_API_KEY starts with: {self.config.GROQ_API_KEY[:10]}...")
-        else:
-            print("GROQ_API_KEY is None or empty")
-        
-        try:
-            self.groq_client = Groq(api_key=self.config.GROQ_API_KEY)
-            print("Groq client initialized successfully")
-        except Exception as e:
-            print(f"Failed to initialize Groq client: {e}")
-            self.groq_client = None
+        print(f"OPENAI_API_KEY present: {'Yes' if self.config.OPENAI_API_KEY else 'No'}")
+
+        if self.provider == "groq" and self.config.GROQ_API_KEY:
+            try:
+                self.groq_client = Groq(api_key=self.config.GROQ_API_KEY)
+                print("Groq client initialized successfully")
+            except Exception as e:
+                print(f"Failed to initialize Groq client: {e}")
+
+        if self.provider == "openai" and self.config.OPENAI_API_KEY:
+            try:
+                self.openai_client = OpenAI(api_key=self.config.OPENAI_API_KEY)
+                self.groq_client = _ClientAdapter(self)
+                if not self.config.GROQ_API_KEY:
+                    self.config.GROQ_API_KEY = "openai-proxy"
+                print("OpenAI client initialized successfully")
+            except Exception as e:
+                print(f"Failed to initialize OpenAI client: {e}")
+
+    def _resolve_provider(self) -> str:
+        if self.config.LLM_PROVIDER in {"groq", "openai"}:
+            return self.config.LLM_PROVIDER
+        if self.config.GROQ_API_KEY and self.config.GROQ_API_KEY != "your_groq_api_key_here":
+            return "groq"
+        if self.config.OPENAI_API_KEY:
+            return "openai"
+        return "groq"
+
+    def is_llm_configured(self) -> bool:
+        if self.provider == "openai":
+            return bool(self.openai_client and self.config.OPENAI_API_KEY)
+        return bool(self.groq_client and self.config.GROQ_API_KEY and self.config.GROQ_API_KEY != "your_groq_api_key_here")
+
+    def chat_completion(self, messages, max_tokens=80, temperature=0.7, top_p=0.9):
+        if self.provider == "openai":
+            if not self.openai_client:
+                raise RuntimeError("OpenAI client is not initialized")
+            response = self.openai_client.chat.completions.create(
+                model=self.config.OPENAI_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return (response.choices[0].message.content or "").strip()
+
+        if not self.groq_client:
+            raise RuntimeError("Groq client is not initialized")
+        response = self.groq_client.chat.completions.create(
+            messages=messages,
+            model=self.config.GROQ_MODEL,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=False
+        )
+        return (response.choices[0].message.content or "").strip()
     
     def transcribe_audio(self, audio_data, attempt=1):
         """Transcribe audio using Google STT with retry logic"""
@@ -104,16 +190,12 @@ class AIServices:
                 *conversation_history[-4:]  # Last 2 exchanges
             ]
             
-            response = self.groq_client.chat.completions.create(
+            ai_text = self.chat_completion(
                 messages=messages,
-                model="llama-3.3-70b-versatile",
                 max_tokens=self.config.MAX_TOKENS,
                 temperature=self.config.TEMPERATURE,
                 top_p=0.9,
-                stream=False
             )
-            
-            ai_text = response.choices[0].message.content
             conversation_history.append({"role": "assistant", "content": ai_text})
             
             print(f"Bot: {ai_text}")

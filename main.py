@@ -5,10 +5,24 @@ Combines all backend services into one FastAPI application
 """
 
 import os
+import sys
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import config_api, calls_api, webhook_api, websocket_api, leads_api_mongo, inbound_api
+from routers import config_api, calls_api, transfer_api, twilio_api
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+optional_routers = []
+for module_name in ("leads_api_mongo", "webhook_api", "websocket_api", "inbound_api"):
+    try:
+        module = __import__(f"routers.{module_name}", fromlist=["router"])
+        optional_routers.append(module.router)
+    except Exception as exc:
+        print(f"Skipping optional router {module_name}: {exc}")
 
 # Create FastAPI app
 app = FastAPI(
@@ -50,10 +64,10 @@ async def health_check():
 # Register all routers
 app.include_router(config_api.router)
 app.include_router(calls_api.router)
-app.include_router(webhook_api.router)
-app.include_router(websocket_api.router)
-app.include_router(leads_api_mongo.router)
-app.include_router(inbound_api.router)
+app.include_router(transfer_api.router)
+app.include_router(twilio_api.router)
+for router in optional_routers:
+    app.include_router(router)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

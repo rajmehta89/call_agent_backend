@@ -17,10 +17,21 @@ import re
 import httpx
 from websocket import ABNF, WebSocketApp
 from urllib.parse import parse_qs, urlparse
-from piopiy import StreamAction
 import numpy as np
 import scipy.signal as sps
 import scipy.io.wavfile
+
+try:
+    from piopiy import StreamAction
+except ImportError:
+    class StreamAction:
+        def playStream(self, audio_base64: str, audio_type: str = "raw", sample_rate: int = 8000):
+            return json.dumps({
+                "type": "playStream",
+                "audio_base64": audio_base64,
+                "audio_type": audio_type,
+                "sample_rate": sample_rate,
+            })
 
 # Import project dependencies
 from mongo_client import mongo_client

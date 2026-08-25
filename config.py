@@ -1,9 +1,8 @@
 import os
-from dotenv import load_dotenv
 from real_estate_data import REAL_ESTATE_INFO
+from env_loader import load_project_env
 
-# Load environment variables from .env
-load_dotenv()
+load_project_env()
 
 # === Backend service hosts/ports ===
 BACKEND_HOST = os.getenv("BACKEND_HOST", "0.0.0.0")
@@ -36,6 +35,10 @@ class Config:
     GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY")
     GOOGLE_STT_API_KEY = os.getenv("GOOGLE_STT_API_KEY")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # === Audio Settings ===
     SAMPLE_RATE = 16000

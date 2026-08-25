@@ -8,9 +8,9 @@ import os
 from pymongo import MongoClient
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from dotenv import load_dotenv
+from env_loader import load_project_env
 
-load_dotenv()
+load_project_env()
 
 class MongoDBClient:
     def __init__(self):
