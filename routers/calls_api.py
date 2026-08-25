@@ -105,6 +105,28 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
 
+        now = datetime.now()
+        lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id and ObjectId.is_valid(lead_id) else None
+        mongo_client.customers.update_one(
+            {"phone": phone_number},
+            {
+                "$set": {"updated_at": now},
+                "$addToSet": {"channels": "voice"},
+                "$setOnInsert": {
+                    "name": (lead or {}).get("name", ""),
+                    "phone": phone_number,
+                    "email": (lead or {}).get("email", ""),
+                    "location": "",
+                    "lead_status": (lead or {}).get("status", "none"),
+                    "tags": [],
+                    "notes": "",
+                    "archived": False,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+
         call_record = {
             "phone_number": phone_number,
             "lead_id": lead_id,
@@ -336,6 +358,9 @@ async def get_call_stats():
             "outbound_calls": outbound_calls,
             "completed_calls": completed_calls,
             "failed_calls": failed_calls,
+            "missed_calls": status_counts["missed"],
+            "human_transfers": mongo_client.calls.count_documents({"transfer_status": {"$in": ["requested", "accepted", "completed"]}}),
+            "leads_generated": mongo_client.leads.count_documents({"source": {"$in": ["voice", "call", "inbound_call"]}}),
             "calls_today": calls_today,
             "calls_this_week": calls_this_week,
             "total_duration": total_duration,

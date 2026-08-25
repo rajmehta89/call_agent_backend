@@ -9,7 +9,7 @@ import sys
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import config_api, calls_api, transfer_api, twilio_api
+from routers import config_api, calls_api, omnichannel_api, platform_api, transfer_api, twilio_api, whatsapp_api
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -64,8 +64,11 @@ async def health_check():
 # Register all routers
 app.include_router(config_api.router)
 app.include_router(calls_api.router)
+app.include_router(omnichannel_api.router)
+app.include_router(platform_api.router)
 app.include_router(transfer_api.router)
 app.include_router(twilio_api.router)
+app.include_router(whatsapp_api.router)
 for router in optional_routers:
     app.include_router(router)
 

@@ -180,7 +180,7 @@ class DynamicQA:
         
         return prompt
 
-    def get_response(self, user_input: str, conversation_history=None) -> str:
+    def get_response(self, user_input: str, conversation_history=None, system_context: str = "") -> str:
         """Calls LLM with up-to-date context. Returns the assistant's reply."""
         try:
             # Check if Groq client is properly initialized
@@ -194,6 +194,8 @@ class DynamicQA:
                 return "I'm sorry, the AI service API key is not configured."
             
             system_prompt = self.build_system_prompt()
+            if system_context:
+                system_prompt = f"{system_prompt}\n\nShared platform context:\n{system_context}"
             print(f"System Prompt: {system_prompt[:200]}...")  # Print first 200 chars for debugging
             if conversation_history is None:
                 conversation_history = []
@@ -209,15 +211,12 @@ class DynamicQA:
             print(f"🤖 API Key length: {len(self.ai_services.config.GROQ_API_KEY) if self.ai_services.config.GROQ_API_KEY else 0}")
             
             # You may need to change `.chat.completions.create` call to match your ai_services object
-            response = self.ai_services.groq_client.chat.completions.create(
+            return self.ai_services.chat_completion(
                 messages=messages,
-                model="llama-3.3-70b-versatile",
-                max_tokens=80,  # Reduced for shorter responses
-                temperature=0.7,
+                max_tokens=160,
+                temperature=0.4,
                 top_p=0.9,
-                stream=False
             )
-            return response.choices[0].message.content.strip()
         except Exception as e:
             print(f"❌ LLM error: {e}")
             print(f"❌ Error type: {type(e).__name__}")

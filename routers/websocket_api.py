@@ -38,6 +38,7 @@ from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
 from qa_engine import RealEstateQA
 from ai_services import AIServices
+from brain_service import brain_service
 
 router = APIRouter(tags=["WebSocket"])
 
@@ -97,6 +98,16 @@ current_call_data = {
     "end_time": None,
     "call_session_id": None
 }
+
+
+def get_shared_voice_response(user_text: str, history: list) -> str:
+    response = brain_service.respond(
+        user_text,
+        history,
+        channel="voice",
+        customer_phone=current_call_data.get("phone_number"),
+    )
+    return response or "I'm sorry, the AI service is not available right now."
 
 # ===========================
 # Utilities
@@ -507,7 +518,7 @@ async def ultra_fast_llm_worker():
                 try:
                     start_time = now()
                     reply = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(None, bot.get_response, user_text, history),
+                        asyncio.get_event_loop().run_in_executor(None, get_shared_voice_response, user_text, history),
                         timeout=12.0
                     )
                     response_time = (now() - start_time).total_seconds()

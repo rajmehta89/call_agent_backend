@@ -37,6 +37,17 @@ class MongoDBClient:
             # Initialize collections
             self.leads = self.db.leads
             self.calls = self.db.calls
+            self.whatsapp_conversations = self.db.whatsapp_conversations
+            self.whatsapp_messages = self.db.whatsapp_messages
+            self.customers = self.db.customers
+            self.platform_settings = self.db.platform_settings
+            self.automations = self.db.automations
+            self.whatsapp_templates = self.db.whatsapp_templates
+            self.ai_activity = self.db.ai_activity
+            self.team_members = self.db.team_members
+            self.shopify_sync_history = self.db.shopify_sync_history
+            self.audit_logs = self.db.audit_logs
+            self.notifications = self.db.notifications
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
@@ -54,6 +65,35 @@ class MongoDBClient:
             except Exception:
                 # Index may already exist
                 pass
+
+            self.whatsapp_conversations.create_index("customer_phone", unique=True)
+            self.whatsapp_conversations.create_index("updated_at")
+            self.whatsapp_conversations.create_index("status")
+
+            self.whatsapp_messages.create_index("conversation_id")
+            self.whatsapp_messages.create_index("customer_phone")
+            self.whatsapp_messages.create_index("created_at")
+            try:
+                self.whatsapp_messages.create_index("provider_message_id", unique=True, sparse=True)
+            except Exception:
+                pass
+
+            self.customers.create_index("phone", unique=True, sparse=True)
+            self.customers.create_index("email", sparse=True)
+            self.customers.create_index("updated_at")
+            self.platform_settings.create_index("key", unique=True)
+            self.automations.create_index("enabled")
+            self.automations.create_index("updated_at")
+            self.whatsapp_templates.create_index("name", unique=True)
+            self.ai_activity.create_index("created_at")
+            self.ai_activity.create_index("channel")
+            self.ai_activity.create_index("customer_phone")
+            self.team_members.create_index("email", unique=True, sparse=True)
+            self.shopify_sync_history.create_index("created_at")
+            self.audit_logs.create_index("created_at")
+            self.audit_logs.create_index("resource")
+            self.notifications.create_index("created_at")
+            self.notifications.create_index("read")
             
             print("MongoDB connected successfully")
             
