@@ -408,6 +408,6 @@ async def health_check():
     return {
         "success": True,
         "message": "Leads API is running",
-        "database_connected": mongo_client.is_connected(),
+        "database": mongo_client.get_connection_status(),
         "timestamp": datetime.now().isoformat(),
     }

@@ -17,17 +17,21 @@ class MongoDBClient:
         # Get MongoDB Atlas connection string from environment
         self.mongo_uri = os.getenv("MONGO_URI")
         self.database_name = os.getenv("MONGO_DB", "ai_agent_assist")
+        self.last_error: Optional[str] = None
         
         if not self.mongo_uri:
             print("MONGO_URI not found in environment variables")
             print("Please add your MongoDB Atlas connection string to .env file")
             self.client = None
             self.db = None
+            self.last_error = "MONGO_URI not configured"
             return
         
         try:
             print("Connecting to MongoDB Atlas...")
-            self.client = MongoClient(self.mongo_uri)
+            self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
+            # Force a real connection during startup so bad URIs or Atlas access issues fail early.
+            self.client.admin.command("ping")
             self.db = self.client[self.database_name]
             
             # Initialize collections
@@ -57,10 +61,20 @@ class MongoDBClient:
             print(f"MongoDB connection failed: {e}")
             self.client = None
             self.db = None
+            self.last_error = str(e)
     
     def is_connected(self) -> bool:
         """Check if MongoDB is connected"""
-        return self.client is not None
+        if self.client is None:
+            return False
+
+        try:
+            self.client.admin.command("ping")
+            self.last_error = None
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
     
     def get_database_stats(self) -> Dict[str, Any]:
         """Get database statistics"""
@@ -84,6 +98,13 @@ class MongoDBClient:
             }
         except Exception as e:
             return {"error": str(e), "connected": False}
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        return {
+            "connected": self.is_connected(),
+            "database": self.database_name,
+            "last_error": self.last_error,
+        }
 
 # Global MongoDB client instance
 mongo_client = MongoDBClient() 

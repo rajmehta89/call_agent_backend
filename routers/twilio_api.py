@@ -132,17 +132,20 @@ def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, le
         return {"error": "TWILIO_CALLER_ID is not configured"}
 
     status_callback = f"{_get_http_base_url()}/api/twilio/status"
-    connect_url = f"{_get_http_base_url()}/api/twilio/outbound/connect"
+    outbound_twiml = _build_outbound_conversation_twiml()
 
     try:
         outbound_call = client.calls.create(
             to=customer_number,
             from_=TWILIO_CALLER_ID,
-            url=connect_url,
-            method="POST",
+            twiml=outbound_twiml,
             status_callback=status_callback,
             status_callback_method="POST",
             status_callback_event=["initiated", "ringing", "answered", "completed"],
+        )
+        print(
+            f"Twilio outbound call created for {customer_number} "
+            f"using ConversationRelay websocket {_get_ws_base_url()}/api/twilio/ws"
         )
         OUTBOUND_CALL_CONTEXT[outbound_call.sid] = {
             "phone_number": customer_number,
