@@ -5,9 +5,9 @@ Converted from Flask to FastAPI for Render deployment
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import json
-import os
+from typing import Optional, Dict, Any, List
+
+from agent_config import agent_config
 
 router = APIRouter(
     prefix="/api/config",
@@ -21,6 +21,7 @@ class ConfigUpdate(BaseModel):
     system_prompt: Optional[str] = None
     knowledge_base_enabled: Optional[bool] = None
     knowledge_base: Optional[str] = None
+    human_transfer: Optional[Dict[str, Any]] = None
 
 class MessageUpdate(BaseModel):
     message: str
@@ -28,87 +29,6 @@ class MessageUpdate(BaseModel):
 class KnowledgeBaseUpdate(BaseModel):
     enabled: Optional[bool] = None
     knowledge_base: Optional[Dict[str, Any]] = None
-
-# Simple agent config class (replace agent_config import)
-class AgentConfig:
-    def __init__(self):
-        self.config_file = "agent_config.json"
-        self.config = self.load_config()
-
-    def load_config(self):
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return self.get_defaults()
-
-    def save_config(self):
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=2)
-            return True
-        except:
-            return False
-
-    def get_defaults(self):
-        return {
-            "greeting_message": "Hello! How can I help you today?",
-            "exit_message": "Thank you for your time. Have a great day!",
-            "system_prompt": "You are a helpful AI assistant.",
-            "knowledge_base_enabled": False,
-            "knowledge_base": "{}"
-        }
-
-    def get_all_config(self):
-        return self.config
-
-    def update_config(self, updates):
-        self.config.update(updates)
-        return self.save_config()
-
-    def set_greeting_message(self, message):
-        self.config["greeting_message"] = message
-        return self.save_config()
-
-    def set_exit_message(self, message):
-        self.config["exit_message"] = message
-        return self.save_config()
-
-    def set_system_prompt(self, prompt):
-        self.config["system_prompt"] = prompt
-        return self.save_config()
-
-    def set_knowledge_base_enabled(self, enabled):
-        self.config["knowledge_base_enabled"] = enabled
-        return self.save_config()
-
-    def set_knowledge_base(self, knowledge_base):
-        self.config["knowledge_base"] = json.dumps(knowledge_base) if isinstance(knowledge_base, dict) else knowledge_base
-        return self.save_config()
-
-    def get_greeting_message(self):
-        return self.config.get("greeting_message", "")
-
-    def get_exit_message(self):
-        return self.config.get("exit_message", "")
-
-    def get_system_prompt(self):
-        return self.config.get("system_prompt", "")
-
-    def get_knowledge_base_enabled(self):
-        return self.config.get("knowledge_base_enabled", False)
-
-    def get_knowledge_base(self):
-        return self.config.get("knowledge_base", "{}")
-
-    def reset_to_defaults(self):
-        self.config = self.get_defaults()
-        return self.save_config()
-
-# Initialize agent config
-agent_config = AgentConfig()
 
 @router.get("/")
 async def get_config():
@@ -136,6 +56,8 @@ async def update_config(data: ConfigUpdate):
             updates["knowledge_base_enabled"] = data.knowledge_base_enabled
         if data.knowledge_base is not None:
             updates["knowledge_base"] = data.knowledge_base
+        if data.human_transfer is not None:
+            updates["human_transfer"] = data.human_transfer
 
         if not updates:
             raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -244,7 +166,8 @@ async def update_knowledge_base(data: KnowledgeBaseUpdate):
             "message": "Knowledge base updated successfully",
             "data": {
                 "knowledge_base_enabled": agent_config.get_knowledge_base_enabled(),
-                "knowledge_base": agent_config.get_knowledge_base()
+                "knowledge_base": agent_config.get_knowledge_base(),
+                "human_transfer": agent_config.get_human_transfer()
             }
         }
 
@@ -261,7 +184,8 @@ async def get_knowledge_base():
             "success": True,
             "data": {
                 "knowledge_base_enabled": agent_config.get_knowledge_base_enabled(),
-                "knowledge_base": agent_config.get_knowledge_base()
+                "knowledge_base": agent_config.get_knowledge_base(),
+                "human_transfer": agent_config.get_human_transfer()
             }
         }
     except Exception as e:

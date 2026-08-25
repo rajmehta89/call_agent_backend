@@ -1,7 +1,8 @@
 import json
 import os
+import re
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -60,10 +61,53 @@ def _build_transfer_twiml() -> str:
     target = (TWILIO_HUMAN_AGENT_NUMBER or "").strip()
     if not target:
         raise RuntimeError("TWILIO_HUMAN_AGENT_NUMBER is not configured")
+    return _build_team_transfer_twiml([{"phone_number": target}])
+
+
+def _normalize_agent(agent: Dict[str, Any]) -> Dict[str, Any]:
+    aliases = agent.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [item.strip() for item in aliases.split(",") if item.strip()]
+    return {
+        "name": str(agent.get("name", "")).strip(),
+        "phone_number": str(agent.get("phone_number", "")).strip(),
+        "enabled": bool(agent.get("enabled", True)),
+        "aliases": [str(item).strip().lower() for item in aliases if str(item).strip()],
+    }
+
+
+def _get_transfer_settings() -> Dict[str, Any]:
+    settings = agent_config.get_human_transfer()
+    agents = [_normalize_agent(agent) for agent in settings.get("agents", []) if isinstance(agent, dict)]
+    settings["agents"] = [agent for agent in agents if agent["phone_number"]]
+    return settings
+
+
+def _find_dedicated_agent(caller_text: str, agents: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    normalized_text = re.sub(r"[^a-z0-9\s]", " ", caller_text.lower())
+    for agent in agents:
+        if not agent.get("enabled"):
+            continue
+        candidate_terms = [agent["name"].lower(), *agent.get("aliases", [])]
+        for term in candidate_terms:
+            if term and re.search(rf"\b{re.escape(term)}\b", normalized_text):
+                return agent
+    return None
+
+
+def _build_team_transfer_twiml(agents: List[Dict[str, Any]]) -> str:
+    active_agents = [agent for agent in agents if agent.get("enabled", True) and agent.get("phone_number")]
+    if not active_agents:
+        raise RuntimeError("No enabled human agents are configured")
+
+    number_nodes = "".join(
+        f'<Number>{agent["phone_number"]}</Number>'
+        for agent in active_agents
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"<Dial>{target}</Dial>"
+        f'<Dial answerOnBridge="true" timeout="20">{number_nodes}</Dial>'
         "</Response>"
     )
 
@@ -184,9 +228,32 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 await _send_text(websocket, handoff_text)
 
                 client = _get_twilio_client()
-                if client and session.get("call_sid") and TWILIO_HUMAN_AGENT_NUMBER:
+                transfer_settings = _get_transfer_settings()
+                active_agents = [agent for agent in transfer_settings.get("agents", []) if agent.get("enabled")]
+                dedicated_agent = _find_dedicated_agent(caller_text, active_agents)
+
+                if dedicated_agent:
+                    transfer_service.append_message(
+                        session["session_id"],
+                        "system",
+                        f"Dedicated human agent matched: {dedicated_agent['name']}",
+                    )
+                    transfer_twiml = _build_team_transfer_twiml([dedicated_agent])
+                elif active_agents:
+                    transfer_service.append_message(
+                        session["session_id"],
+                        "system",
+                        f"Routing to human team: {', '.join(agent['name'] for agent in active_agents if agent.get('name'))}",
+                    )
+                    transfer_twiml = _build_team_transfer_twiml(active_agents)
+                elif TWILIO_HUMAN_AGENT_NUMBER:
+                    transfer_twiml = _build_transfer_twiml()
+                else:
+                    transfer_twiml = None
+
+                if client and session.get("call_sid") and transfer_twiml:
                     try:
-                        client.calls(session["call_sid"]).update(twiml=_build_transfer_twiml())
+                        client.calls(session["call_sid"]).update(twiml=transfer_twiml)
                     except Exception as exc:
                         print(f"Twilio transfer failed: {exc}")
                 continue

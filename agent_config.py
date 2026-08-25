@@ -21,6 +21,12 @@ class AgentConfig:
             ),
             "knowledge_base_enabled": False,
             "knowledge_base": {},
+            "human_transfer": {
+                "enabled": True,
+                "team_mode": "ring_all",
+                "fallback_message": "I am transferring you to a human agent now. They will have the context from this call.",
+                "agents": []
+            },
             "last_updated": datetime.now().isoformat(),
             "version": "1.0"
         }
@@ -159,7 +165,22 @@ class AgentConfig:
         return self.update_config({"knowledge_base": knowledge_base})
 
     def get_all_config(self) -> Dict[str, Any]:
+        self.reload_config()
         return self.config.copy()
+
+    def get_human_transfer(self) -> Dict[str, Any]:
+        self.reload_config()
+        human_transfer = self.config.get("human_transfer", self.default_config["human_transfer"])
+        if not isinstance(human_transfer, dict):
+            human_transfer = self.default_config["human_transfer"].copy()
+        human_transfer.setdefault("enabled", True)
+        human_transfer.setdefault("team_mode", "ring_all")
+        human_transfer.setdefault("fallback_message", self.default_config["human_transfer"]["fallback_message"])
+        human_transfer.setdefault("agents", [])
+        return human_transfer
+
+    def set_human_transfer(self, human_transfer: Dict[str, Any]) -> bool:
+        return self.update_config({"human_transfer": human_transfer})
 
     def reset_to_defaults(self) -> bool:
         return self.save_config(self.default_config.copy())
