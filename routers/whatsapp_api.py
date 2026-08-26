@@ -15,6 +15,8 @@ from ai_services import AIServices
 from mongo_client import mongo_client
 from qa_engine import DynamicQA
 from brain_service import brain_service
+from automation_service import automation_service
+from notification_service import notify_human_assignment, notify_recipients
 
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
@@ -128,6 +130,9 @@ def _ensure_conversation(customer_phone: str, customer_name: Optional[str] = Non
         "lead_id": lead["lead_id"] if lead else None,
         "ai_enabled": True,
         "assigned_to": None,
+        "handoff_status": "ai",
+        "handoff_reason": None,
+        "assigned_at": None,
         "tags": [],
         "notes": "",
         "unread_count": 0,
@@ -251,6 +256,8 @@ def _send_via_meta(to: str, text: str) -> Dict[str, Any]:
 
 
 def _send_message(to: str, text: str) -> Dict[str, Any]:
+    if WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID:
+        return _send_via_meta(to, text)
     if TWILIO_WHATSAPP_NUMBER and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
         return _send_via_twilio(to, text)
     return _send_via_meta(to, text)
@@ -263,6 +270,37 @@ def _generate_ai_reply(conversation_id: str, customer_text: str) -> Optional[str
     try:
         history = _build_conversation_history(conversation_id)
         conversation = mongo_client.whatsapp_conversations.find_one({"_id": ObjectId(conversation_id)})
+        if conversation and conversation.get("ai_enabled") is False:
+            return None
+        workspace_settings = brain_service._setting("workspace_settings", {}) or {}
+        inbox_settings = workspace_settings.get("inbox") if isinstance(workspace_settings, dict) else {}
+        inbox_settings = inbox_settings if isinstance(inbox_settings, dict) else {}
+        transfer_terms = ("human", "agent", "representative", "real person", "talk to someone", "speak to someone", "customer service", "complaint", "not satisfied")
+        handoff_requested = inbox_settings.get("handoff_on_request", True) and any(term in customer_text.lower() for term in transfer_terms)
+        if handoff_requested:
+            transfer_settings = brain_service.channel_config("whatsapp").get("human_transfer") or {}
+            active_agents = [agent for agent in transfer_settings.get("agents", []) if isinstance(agent, dict) and agent.get("enabled", True) and agent.get("name")]
+            if not active_agents and inbox_settings.get("no_human_fallback", "continue_ai") == "continue_ai":
+                handoff_requested = False
+            assignment_mode = inbox_settings.get("assignment_mode", "configured_team")
+            configured_team_mode = transfer_settings.get("team_mode", "ring_all")
+            team_mode = "ring_all" if assignment_mode == "ring_all" else "first_available" if assignment_mode == "first_available" else configured_team_mode
+            recipients = [agent.get("name") for agent in active_agents] or ["Human team"]
+            assigned_agent = recipients[0] if active_agents and team_mode != "ring_all" else ("Human team" if not active_agents else ", ".join(recipients))
+            if handoff_requested and transfer_settings.get("enabled", True):
+                now = _now()
+                mongo_client.whatsapp_conversations.update_one(
+                    {"_id": ObjectId(conversation_id)},
+                    {"$set": {"ai_enabled": False, "assigned_to": assigned_agent, "handoff_status": "requested", "handoff_reason": "Customer requested human assistance", "assigned_at": now, "updated_at": now}},
+                )
+                notify_recipients(
+                    channel="whatsapp",
+                    customer=(conversation or {}).get("customer_name") or (conversation or {}).get("customer_phone") or "customer",
+                    recipients=recipients if team_mode == "ring_all" else [assigned_agent],
+                    conversation_id=conversation_id,
+                    message=f"WhatsApp customer requested human assistance: {(conversation or {}).get('customer_name') or (conversation or {}).get('customer_phone') or 'customer'}.",
+                )
+                return "I’ll connect you with a human team member now. They’ll continue this conversation with the context from your messages."
         reply = brain_service.respond(
             customer_text,
             history,
@@ -387,12 +425,33 @@ async def update_conversation(conversation_id: str, payload: ConversationControl
         object_id = ObjectId(conversation_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid conversation id") from exc
+    before = mongo_client.whatsapp_conversations.find_one({"_id": object_id})
+    if not before:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     updates = {key: value for key, value in payload.dict().items() if value is not None}
+    if payload.ai_enabled is True:
+        updates.update({"assigned_to": None, "handoff_status": "ai", "handoff_reason": None, "assigned_at": None})
+    elif payload.ai_enabled is False or payload.assigned_to is not None:
+        updates["handoff_status"] = "assigned"
+        updates["assigned_at"] = _now()
     updates["updated_at"] = _now()
     mongo_client.whatsapp_conversations.update_one({"_id": object_id}, {"$set": updates})
     row = mongo_client.whatsapp_conversations.find_one({"_id": object_id})
     if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    assigned_to = str(row.get("assigned_to") or "").strip()
+    was_human = before.get("ai_enabled") is False
+    is_human = row.get("ai_enabled") is False
+    assignment_changed = is_human and (assigned_to or "Human team") != (str(before.get("assigned_to") or "").strip() or "AI agent")
+    takeover_changed = is_human and not was_human
+    if assignment_changed or takeover_changed:
+        notify_human_assignment(
+            channel="whatsapp",
+            customer=row.get("customer_name") or row.get("customer_phone") or "customer",
+            recipient=assigned_to or "Human team",
+            conversation_id=str(row["_id"]),
+            message=f"{row.get('customer_name') or row.get('customer_phone') or 'A customer'} needs a WhatsApp reply.",
+        )
     return {"success": True, "data": _serialize_document(row)}
 
 
@@ -464,6 +523,7 @@ async def receive_whatsapp_webhook(request: Request):
     stored = 0
     for record in records:
         try:
+            existing_conversation = mongo_client.whatsapp_conversations.find_one({"customer_phone": record["customer_phone"]})
             inbound_message = _store_message(
                 customer_phone=record["customer_phone"],
                 text=record["text"],
@@ -474,6 +534,28 @@ async def receive_whatsapp_webhook(request: Request):
                 raw_payload=record.get("raw_payload"),
             )
             stored += 1
+
+            automation_context = {
+                "customer_phone": record.get("customer_phone"),
+                "customer_name": record.get("customer_name"),
+                "conversation_id": inbound_message.get("conversation_id"),
+                "message": record.get("text", ""),
+                "channel": "whatsapp",
+                "source": "whatsapp",
+            }
+            automation_service.run("whatsapp_message", automation_context)
+            if existing_conversation:
+                automation_service.run("customer_reply", automation_context)
+
+            current_conversation = mongo_client.whatsapp_conversations.find_one({"_id": ObjectId(inbound_message["conversation_id"])})
+            if current_conversation and current_conversation.get("ai_enabled") is False:
+                notify_human_assignment(
+                    channel="whatsapp",
+                    customer=current_conversation.get("customer_name") or record.get("customer_phone") or "customer",
+                    recipient=current_conversation.get("assigned_to") or "Human team",
+                    conversation_id=inbound_message["conversation_id"],
+                    message=f"New WhatsApp message from {current_conversation.get('customer_name') or record.get('customer_phone') or 'a customer'}.",
+                )
 
             ai_reply = _generate_ai_reply(inbound_message["conversation_id"], record["text"])
             if ai_reply:

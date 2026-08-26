@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from transfer_service import transfer_service
+from routers.calls_api import update_call_from_twilio
 
 
 router = APIRouter(prefix="/api/handoffs", tags=["handoffs"])
@@ -35,6 +36,7 @@ async def accept_handoff(session_id: str, request: AcceptTransferRequest):
     record = transfer_service.accept_transfer(session_id, request.agent_name.strip() or "Human Agent")
     if not record:
         raise HTTPException(status_code=404, detail="Handoff not found")
+    update_call_from_twilio(session_id, transfer_status="accepted", transfer_destination=record.get("accepted_by"))
     return {"success": True, "data": record}
 
 
@@ -43,4 +45,5 @@ async def resolve_handoff(session_id: str, request: ResolveTransferRequest):
     record = transfer_service.resolve_transfer(session_id, request.notes)
     if not record:
         raise HTTPException(status_code=404, detail="Handoff not found")
+    update_call_from_twilio(session_id, transfer_status="completed", transfer_destination=record.get("handled_by"))
     return {"success": True, "data": record}

@@ -42,9 +42,15 @@ class MongoDBClient:
             self.customers = self.db.customers
             self.platform_settings = self.db.platform_settings
             self.automations = self.db.automations
+            self.automation_runs = self.db.automation_runs
             self.whatsapp_templates = self.db.whatsapp_templates
             self.ai_activity = self.db.ai_activity
+            self.brain_documents = self.db.brain_documents
+            self.brain_sources = self.db.brain_sources
             self.team_members = self.db.team_members
+            self.users = self.db.users
+            self.roles = self.db.roles
+            self.invitations = self.db.invitations
             self.shopify_sync_history = self.db.shopify_sync_history
             self.audit_logs = self.db.audit_logs
             self.notifications = self.db.notifications
@@ -84,11 +90,24 @@ class MongoDBClient:
             self.platform_settings.create_index("key", unique=True)
             self.automations.create_index("enabled")
             self.automations.create_index("updated_at")
+            self.automation_runs.create_index("automation_id")
+            self.automation_runs.create_index("created_at")
             self.whatsapp_templates.create_index("name", unique=True)
             self.ai_activity.create_index("created_at")
             self.ai_activity.create_index("channel")
             self.ai_activity.create_index("customer_phone")
+            self.brain_documents.create_index("source_key")
+            self.brain_documents.create_index("source_id")
+            self.brain_documents.create_index("source_type")
+            self.brain_documents.create_index("updated_at")
+            self.brain_sources.create_index("source_id", unique=True)
+            self.brain_sources.create_index("updated_at")
             self.team_members.create_index("email", unique=True, sparse=True)
+            self.users.create_index("email", unique=True)
+            self.users.create_index("workspace_id")
+            self.roles.create_index("name", unique=True)
+            self.invitations.create_index("token_hash", unique=True)
+            self.invitations.create_index("expires_at")
             self.shopify_sync_history.create_index("created_at")
             self.audit_logs.create_index("created_at")
             self.audit_logs.create_index("resource")

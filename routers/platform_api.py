@@ -1,16 +1,20 @@
 import csv
 import io
 import os
+import secrets
+from fastapi import BackgroundTasks
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_config import agent_config
 from brain_service import DEFAULT_TOOLS, brain_service
+from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitation_hash, require_permission, require_user, role_document
+from email_service import email_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
 
@@ -19,7 +23,7 @@ router = APIRouter(prefix="/api/platform", tags=["platform"])
 
 ROLE_PERMISSIONS = {
     "owner": ["*"],
-    "admin": ["manage_workspace", "manage_team", "manage_agents", "manage_integrations", "manage_data", "view_analytics"],
+    "admin": ["manage_workspace", "manage_team", "manage_roles", "manage_agents", "manage_integrations", "manage_data", "view_analytics"],
     "manager": ["manage_agents", "manage_data", "assign_leads", "view_analytics"],
     "agent": ["handle_conversations", "handle_calls", "manage_assigned_leads", "view_customers"],
     "viewer": ["view_dashboard", "view_analytics"],
@@ -28,6 +32,17 @@ ROLE_PERMISSIONS = {
 
 class ValuePayload(BaseModel):
     value: Dict[str, Any]
+
+
+class BrainUrlPayload(BaseModel):
+    url: str
+
+
+class ShopifyConfigPayload(BaseModel):
+    store_domain: str
+    access_token: str = ""
+    api_version: str = "2025-10"
+    test_connection: bool = True
 
 
 class AutomationPayload(BaseModel):
@@ -44,6 +59,20 @@ class TeamMemberPayload(BaseModel):
     email: str
     role: str = "agent"
     active: bool = True
+    permissions: List[str] = Field(default_factory=list)
+
+
+class TeamMemberUpdatePayload(BaseModel):
+    role: Optional[str] = None
+    active: Optional[bool] = None
+    permissions: Optional[List[str]] = None
+
+
+class RolePayload(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+    label: str = Field(min_length=2, max_length=80)
+    description: str = ""
+    permissions: List[str] = Field(default_factory=list)
 
 
 class CustomerPayload(BaseModel):
@@ -87,14 +116,44 @@ def _count(collection: Any, query: Optional[Dict[str, Any]] = None) -> int:
     return collection.count_documents(query or {}) if mongo_client.is_connected() else 0
 
 
+def _whatsapp_status() -> Dict[str, Any]:
+    meta_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN")
+    meta_phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    twilio_ready = bool(
+        os.getenv("TWILIO_ACCOUNT_SID")
+        and os.getenv("TWILIO_AUTH_TOKEN")
+        and os.getenv("TWILIO_WHATSAPP_NUMBER")
+    )
+    meta_ready = bool(meta_token and meta_phone_id)
+    return {
+        "connected": meta_ready or twilio_ready,
+        "provider": "meta" if meta_ready else "twilio" if twilio_ready else "not_configured",
+        "meta_ready": meta_ready,
+        "meta_access_token_configured": bool(meta_token),
+        "meta_phone_number_id_configured": bool(meta_phone_id),
+    }
+
+
 def _audit(action: str, resource: str, before: Any = None, after: Any = None, actor: str = "workspace-owner") -> None:
     if mongo_client.is_connected():
         mongo_client.audit_logs.insert_one({"actor": actor, "action": action, "resource": resource, "before": before, "after": after, "created_at": datetime.utcnow()})
 
 
+def _apply_saved_shopify_config() -> None:
+    if not mongo_client.is_connected():
+        return
+    saved = mongo_client.platform_settings.find_one({"key": "shopify"})
+    values = saved.get("value", {}) if saved else {}
+    if values.get("store_domain") and values.get("access_token"):
+        shopify_service.configure(values["store_domain"], values["access_token"], values.get("api_version", "2025-10"))
+
+
+_apply_saved_shopify_config()
+
+
 @router.get("/permissions")
 async def permissions():
-    return {"success": True, "data": ROLE_PERMISSIONS}
+    return {"success": True, "data": {"available": ALL_PERMISSIONS, "roles": ROLE_PERMISSIONS}}
 
 
 @router.get("/audit")
@@ -104,10 +163,30 @@ async def audit_logs(limit: int = Query(100, ge=1, le=500)):
 
 
 @router.get("/notifications")
-async def notifications(unread_only: bool = False):
+async def notifications(unread_only: bool = False, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
-    query = {"read": False} if unread_only else {}
+    query: Dict[str, Any] = {"read": False} if unread_only else {}
+    if user.get("role") not in {"owner", "admin"}:
+        recipients = [str(user.get("name") or ""), str(user.get("email") or ""), "Human team", "team"]
+        query = {"$and": [query, {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}]} if query else {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}
     return {"success": True, "data": _serialize(list(mongo_client.notifications.find(query).sort("created_at", -1).limit(100)))}
+
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, user: Dict[str, Any] = Depends(require_user)):
+    _require_db()
+    if not ObjectId.is_valid(notification_id):
+        raise HTTPException(status_code=400, detail="Invalid notification id")
+    notification_query: Dict[str, Any] = {"_id": ObjectId(notification_id)}
+    if user.get("role") not in {"owner", "admin"}:
+        notification_query["recipient"] = {"$in": [str(user.get("name") or ""), str(user.get("email") or ""), "Human team", "team"]}
+    result = mongo_client.notifications.update_one(
+        notification_query,
+        {"$set": {"read": True, "read_at": datetime.utcnow()}},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"success": True}
 
 
 @router.get("/dashboard")
@@ -122,6 +201,32 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
     ai_success = _count(mongo_client.ai_activity, {"success": True})
     errors = _count(mongo_client.ai_activity, {"success": False})
     qualified = _count(mongo_client.leads, {"status": {"$in": ["qualified", "hot", "converted"]}})
+    workload_names = set()
+    for member in mongo_client.team_members.find({}, {"name": 1}):
+        if member.get("name"):
+            workload_names.add(str(member["name"]))
+    for member in mongo_client.users.find({}, {"name": 1}):
+        if member.get("name"):
+            workload_names.add(str(member["name"]))
+    for row in mongo_client.calls.find({"handled_by": {"$exists": True}}, {"handled_by": 1}):
+        if row.get("handled_by"):
+            workload_names.add(str(row["handled_by"]))
+    for row in mongo_client.whatsapp_conversations.find({"assigned_to": {"$exists": True}}, {"assigned_to": 1}):
+        if row.get("assigned_to"):
+            workload_names.add(str(row["assigned_to"]))
+    human_workload = []
+    for name in sorted(workload_names):
+        call_count = _count(mongo_client.calls, {"$or": [{"handled_by": name}, {"accepted_by": name}]})
+        whatsapp_count = _count(mongo_client.whatsapp_conversations, {"assigned_to": name})
+        converted_count = _count(mongo_client.leads, {"assigned_to": name, "status": "converted"})
+        human_workload.append({
+            "name": name,
+            "voice_calls": call_count,
+            "whatsapp_conversations": whatsapp_count,
+            "total_handled": call_count + whatsapp_count,
+            "converted_leads": converted_count,
+        })
+    human_workload.sort(key=lambda row: (row["total_handled"], row["converted_leads"]), reverse=True)
     recent = list(mongo_client.ai_activity.find({}).sort("created_at", -1).limit(8))
     return {"success": True, "data": {
         "metrics": {
@@ -140,17 +245,22 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
             "error_count": errors,
         },
         "channels": {
-            "whatsapp": {"connected": bool(os.getenv("TWILIO_WHATSAPP_NUMBER") or os.getenv("WHATSAPP_PHONE_NUMBER_ID")), "agent": brain_service.channel_config("whatsapp")},
+            "whatsapp": {**_whatsapp_status(), "agent": brain_service.channel_config("whatsapp")},
             "voice": {"connected": bool(os.getenv("TWILIO_ACCOUNT_SID") and (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))), "agent": brain_service.channel_config("voice")},
         },
         "shopify": shopify_service.status(),
+        "human_workload": human_workload[:50],
         "recent_activity": _serialize(recent),
     }}
 
 
 @router.get("/brain")
 async def get_brain():
-    return {"success": True, "data": brain_service.brain_config()}
+    config = brain_service.brain_config()
+    if config.get("index", {}).get("documents_count", 0) == 0 and any(config.get(key) for key in ("company_information", "business_description", "locations", "working_hours", "services", "faqs", "policies", "website_content", "custom_knowledge")):
+        config["index"] = brain_service.reindex_knowledge(config)
+        config["sources"] = brain_service.source_list()
+    return {"success": True, "data": config}
 
 
 @router.put("/brain")
@@ -169,19 +279,76 @@ async def update_brain(payload: ValuePayload):
     }
     agent_config.set_knowledge_base(knowledge)
     agent_config.set_knowledge_base_enabled(True)
+    stored["index"] = brain_service.reindex_knowledge(payload.value)
     _audit("update", "brain", after=payload.value)
     return {"success": True, "data": _serialize(stored)}
 
 
+@router.post("/brain/upload")
+async def upload_brain_source(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="A file is required")
+    content = await file.read()
+    if len(content) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Files must be 25 MB or smaller")
+    suffix = os.path.splitext(file.filename)[1].lower()
+    if suffix != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
+    try:
+        result = brain_service.ingest_pdf(content, file.filename)
+        return {"success": True, "data": result}
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/brain/scrape")
+async def scrape_brain_source(payload: BrainUrlPayload):
+    if not payload.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Use an http or https URL")
+    try:
+        return {"success": True, "data": brain_service.ingest_url(payload.url)}
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/brain/shopify")
+async def ingest_brain_shopify():
+    try:
+        return {"success": True, "data": brain_service.ingest_shopify_catalog()}
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/brain/resync")
+async def resync_brain_sources():
+    try:
+        return {"success": True, "data": brain_service.resync_static_sources()}
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/brain/resync/{source_id:path}")
+async def resync_brain_source(source_id: str):
+    try:
+        return {"success": True, "data": brain_service.resync_source(source_id)}
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/brain/sources")
+async def get_brain_sources():
+    return {"success": True, "data": brain_service.source_list()}
+
+
 @router.get("/agents/{channel}")
-async def get_channel_agent(channel: str):
+async def get_channel_agent(channel: str, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
     if channel not in {"voice", "whatsapp"}:
         raise HTTPException(status_code=404, detail="Unknown channel")
     return {"success": True, "data": brain_service.channel_config(channel)}
 
 
 @router.put("/agents/{channel}")
-async def update_channel_agent(channel: str, payload: ValuePayload):
+async def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
     if channel not in {"voice", "whatsapp"}:
         raise HTTPException(status_code=404, detail="Unknown channel")
     stored = _upsert_setting(f"{channel}_agent", payload.value)
@@ -213,7 +380,11 @@ async def get_activity(search: str = "", channel: str = "", success: Optional[bo
     if search:
         query["$or"] = [{"request": {"$regex": search, "$options": "i"}}, {"response": {"$regex": search, "$options": "i"}}, {"customer_phone": {"$regex": search, "$options": "i"}}]
     rows = list(mongo_client.ai_activity.find(query).sort("created_at", -1).limit(limit))
-    return {"success": True, "data": _serialize(rows), "total": mongo_client.ai_activity.count_documents(query)}
+    total = mongo_client.ai_activity.count_documents(query)
+    success_count = mongo_client.ai_activity.count_documents({**query, "success": True})
+    error_count = mongo_client.ai_activity.count_documents({**query, "success": False})
+    latency = list(mongo_client.ai_activity.aggregate([{"$match": query}, {"$group": {"_id": None, "average": {"$avg": "$response_time_ms"}}}]))
+    return {"success": True, "data": _serialize(rows), "total": total, "stats": {"total": total, "success": success_count, "errors": error_count, "average_latency_ms": round(latency[0].get("average", 0), 1) if latency else 0}}
 
 
 @router.get("/customers")
@@ -268,6 +439,19 @@ async def update_customer(customer_id: str, payload: ValuePayload):
 async def get_automations():
     _require_db()
     rows = list(mongo_client.automations.find({}).sort("updated_at", -1))
+    data = []
+    for row in rows:
+        item = _serialize(row)
+        latest = mongo_client.automation_runs.find_one({"automation_id": str(row["_id"])}, sort=[("created_at", -1)])
+        item["last_run"] = _serialize(latest) if latest else None
+        data.append(item)
+    return {"success": True, "data": data}
+
+
+@router.get("/automations/runs")
+async def get_automation_runs(limit: int = Query(50, ge=1, le=200)):
+    _require_db()
+    rows = list(mongo_client.automation_runs.find({}).sort("created_at", -1).limit(limit))
     return {"success": True, "data": _serialize(rows)}
 
 
@@ -290,21 +474,149 @@ async def update_automation(automation_id: str, payload: ValuePayload):
     return {"success": True, "data": _serialize(row)}
 
 
-@router.get("/team")
-async def get_team():
+@router.get("/roles")
+async def get_roles(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
-    return {"success": True, "data": _serialize(list(mongo_client.team_members.find({}).sort("name", 1)))}
+    for role in DEFAULT_ROLES:
+        mongo_client.roles.update_one({"name": role["name"]}, {"$setOnInsert": {**role, "system": True, "created_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}, upsert=True)
+    return {"success": True, "data": _serialize(list(mongo_client.roles.find({}).sort([("system", -1), ("label", 1)])))}
+
+
+@router.post("/roles")
+async def create_role(payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+    _require_db()
+    name = payload.name.strip().lower().replace(" ", "-")
+    if mongo_client.roles.find_one({"name": name}):
+        raise HTTPException(status_code=409, detail="A role with this name already exists")
+    invalid = [permission for permission in payload.permissions if permission not in ALL_PERMISSIONS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown permissions: {', '.join(invalid)}")
+    now = datetime.utcnow()
+    data = {"name": name, "label": payload.label.strip(), "description": payload.description.strip(), "permissions": list(dict.fromkeys(payload.permissions)), "system": False, "created_at": now, "updated_at": now}
+    result = mongo_client.roles.insert_one(data)
+    data["_id"] = result.inserted_id
+    _audit("create", "role", after=_serialize(data), actor=str(user.get("email", "workspace-owner")))
+    return {"success": True, "data": _serialize(data)}
+
+
+@router.put("/roles/{role_id}")
+async def update_role(role_id: str, payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+    _require_db()
+    if not ObjectId.is_valid(role_id):
+        raise HTTPException(status_code=400, detail="Invalid role id")
+    role = mongo_client.roles.find_one({"_id": ObjectId(role_id)})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if role.get("system") and payload.name.strip().lower().replace(" ", "-") != role.get("name"):
+        raise HTTPException(status_code=400, detail="System role names cannot be changed")
+    invalid = [permission for permission in payload.permissions if permission not in ALL_PERMISSIONS]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown permissions: {', '.join(invalid)}")
+    values = {"label": payload.label.strip(), "description": payload.description.strip(), "permissions": list(dict.fromkeys(payload.permissions)), "updated_at": datetime.utcnow()}
+    mongo_client.roles.update_one({"_id": role["_id"]}, {"$set": values})
+    return {"success": True, "data": _serialize(mongo_client.roles.find_one({"_id": role["_id"]}))}
+
+
+@router.delete("/roles/{role_id}")
+async def delete_role(role_id: str, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+    _require_db()
+    if not ObjectId.is_valid(role_id):
+        raise HTTPException(status_code=400, detail="Invalid role id")
+    role = mongo_client.roles.find_one({"_id": ObjectId(role_id)})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if role.get("system"):
+        raise HTTPException(status_code=400, detail="System roles cannot be deleted")
+    if mongo_client.users.count_documents({"role": role["name"]}):
+        raise HTTPException(status_code=409, detail="Reassign users before deleting this role")
+    mongo_client.roles.delete_one({"_id": role["_id"]})
+    return {"success": True, "data": {"deleted": True}}
+
+
+@router.get("/team")
+async def get_team(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    _require_db()
+    workspace_id = user.get("workspace_id", "default")
+    members = list(mongo_client.users.find({"workspace_id": workspace_id}).sort("name", 1))
+    pending = list(mongo_client.invitations.find({"workspace_id": workspace_id, "status": "pending"}).sort("created_at", -1))
+    rows = [{**member, "member_type": "user", "invitation_status": "accepted"} for member in members]
+    rows.extend({**invite, "member_type": "invitation", "active": False, "invitation_status": "pending"} for invite in pending if not any(member.get("email") == invite.get("email") for member in members))
+    return {"success": True, "data": _serialize(rows)}
 
 
 @router.post("/team")
-async def invite_team_member(payload: TeamMemberPayload):
+async def invite_team_member(payload: TeamMemberPayload, background_tasks: BackgroundTasks, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
+    email = payload.email.strip().lower()
+    role_name = payload.role.strip().lower()
+    role = role_document(role_name)
+    if not role:
+        raise HTTPException(status_code=400, detail="Choose an existing role")
+    if mongo_client.users.find_one({"email": email, "workspace_id": user.get("workspace_id", "default")}) or mongo_client.invitations.find_one({"email": email, "workspace_id": user.get("workspace_id", "default"), "status": "pending"}):
+        raise HTTPException(status_code=409, detail="This email already belongs to the workspace or has a pending invitation")
     now = datetime.utcnow()
-    data = {**payload.dict(), "invitation_status": "pending", "created_at": now, "updated_at": now}
-    result = mongo_client.team_members.insert_one(data)
-    data["_id"] = result.inserted_id
-    _audit("invite", "team_member", after=_serialize(data))
-    return {"success": True, "data": _serialize(data)}
+    token = secrets.token_urlsafe(32)
+    workspace_id = user.get("workspace_id", "default")
+    invite = {"name": payload.name.strip(), "email": email, "role": role_name, "permissions": payload.permissions, "workspace_id": workspace_id, "workspace_name": user.get("workspace_name", "My workspace"), "token_hash": invitation_hash(token), "status": "pending", "created_by": user.get("_id"), "expires_at": now + timedelta(days=7), "created_at": now, "updated_at": now}
+    result = mongo_client.invitations.insert_one(invite)
+    invite["_id"] = result.inserted_id
+    mongo_client.team_members.update_one({"email": email}, {"$set": {"name": payload.name.strip(), "email": email, "role": role_name, "permissions": payload.permissions, "active": False, "invitation_status": "pending", "updated_at": now}, "$setOnInsert": {"created_at": now}}, upsert=True)
+    _audit("invite", "team_member", after={"email": email, "role": role_name}, actor=str(user.get("email", "workspace-owner")))
+    origin = os.getenv("PUBLIC_APP_URL") or os.getenv("FRONTEND_ORIGIN_ALT") or os.getenv("FRONTEND_ORIGIN_2") or os.getenv("FRONTEND_ORIGIN") or "http://127.0.0.1:3000"
+    invite_url = f"{origin.rstrip('/')}/invite/accept?token={token}"
+    delivery = "queued" if email_service.configured else "manual_link_required"
+    if email_service.configured:
+        background_tasks.add_task(email_service.send_invitation, email, payload.name.strip(), user.get("workspace_name", "My workspace"), invite_url, role.get("label", role_name))
+    return {"success": True, "data": {**_serialize(invite), "invite_token": token, "invite_url": invite_url, "delivery": delivery}}
+
+
+@router.put("/team/{member_id}")
+async def update_team_member(member_id: str, payload: TeamMemberUpdatePayload, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    _require_db()
+    if not ObjectId.is_valid(member_id):
+        raise HTTPException(status_code=400, detail="Invalid member id")
+    member = mongo_client.users.find_one({"_id": ObjectId(member_id), "workspace_id": user.get("workspace_id", "default")})
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    if str(member["_id"]) == str(user["_id"]) and (payload.role is not None or payload.active is not None):
+        raise HTTPException(status_code=400, detail="Use another Admin account to change your own role or status")
+    if payload.role is not None and str(user.get("role", "")).lower() not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="Only an Owner or Admin can change member roles")
+    updates: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if payload.role is not None:
+        role = role_document(payload.role.strip().lower())
+        if not role:
+            raise HTTPException(status_code=400, detail="Choose an existing role")
+        updates["role"] = role["name"]
+    if payload.active is not None:
+        updates["active"] = payload.active
+    if payload.permissions is not None:
+        invalid = [permission for permission in payload.permissions if permission not in ALL_PERMISSIONS]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown permissions: {', '.join(invalid)}")
+        updates["permissions"] = list(dict.fromkeys(payload.permissions))
+    mongo_client.users.update_one({"_id": member["_id"]}, {"$set": updates})
+    return {"success": True, "data": _serialize(mongo_client.users.find_one({"_id": member["_id"]}))}
+
+
+@router.delete("/team/{member_id}")
+async def deactivate_team_member(member_id: str, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    _require_db()
+    if not ObjectId.is_valid(member_id):
+        raise HTTPException(status_code=400, detail="Invalid member id")
+    if str(member_id) == str(user.get("_id")):
+        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+    result = mongo_client.users.update_one({"_id": ObjectId(member_id), "workspace_id": user.get("workspace_id", "default"), "role": {"$ne": "owner"}}, {"$set": {"active": False, "updated_at": datetime.utcnow()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Team member not found or cannot be deactivated")
+    return {"success": True, "data": {"deactivated": True}}
+
+
+@router.get("/invitations")
+async def get_invitations(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    _require_db()
+    rows = list(mongo_client.invitations.find({"workspace_id": user.get("workspace_id", "default")}).sort("created_at", -1))
+    return {"success": True, "data": _serialize(rows)}
 
 
 @router.get("/settings")
@@ -323,6 +635,7 @@ async def update_settings(payload: ValuePayload):
 
 @router.get("/shopify/status")
 async def shopify_status():
+    _apply_saved_shopify_config()
     data = shopify_service.status()
     if shopify_service.configured:
         try:
@@ -331,6 +644,28 @@ async def shopify_status():
         except Exception as exc:
             data["api_status"] = "error"
             data["error"] = str(exc)
+    return {"success": True, "data": data}
+
+
+@router.put("/shopify/configure")
+async def configure_shopify(payload: ShopifyConfigPayload):
+    _require_db()
+    before = shopify_service.status()
+    saved = mongo_client.platform_settings.find_one({"key": "shopify"}) or {}
+    saved_values = saved.get("value", {}) if saved else {}
+    token = payload.access_token.strip() or str(saved_values.get("access_token") or shopify_service.access_token or "")
+    shopify_service.configure(payload.store_domain.strip(), token, payload.api_version.strip() or "2025-10")
+    stored = {"store_domain": shopify_service.store_domain, "access_token": token, "api_version": shopify_service.api_version}
+    _upsert_setting("shopify", stored)
+    data = shopify_service.status()
+    if payload.test_connection and shopify_service.configured:
+        try:
+            shopify_service.products(limit=1)
+            data["api_status"] = "connected"
+        except Exception as exc:
+            data["api_status"] = "error"
+            data["error"] = str(exc)
+    _audit("update", "shopify", before=before, after={"store_domain": shopify_service.store_domain, "api_version": shopify_service.api_version, "access_token_configured": bool(token)})
     return {"success": True, "data": data}
 
 

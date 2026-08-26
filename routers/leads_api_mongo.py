@@ -19,6 +19,7 @@ from env_loader import load_project_env
 from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
 from routers.twilio_api import create_outbound_call
+from automation_service import automation_service
 
 try:
     from piopiy import Action, RestClient
@@ -210,6 +211,7 @@ def add_lead(lead_data: Dict[str, Any]):
     }
     result = mongo_client.leads.insert_one(lead_doc)
     lead_doc["_id"] = str(result.inserted_id)
+    automation_service.run("new_lead", {"lead_id": lead_doc["_id"], "customer_phone": lead_doc["phone"], "customer_name": lead_doc["name"], "email": lead_doc.get("email", ""), "source": lead_doc.get("source", "manual")})
     return {"success": True, "data": lead_doc}
 
 
@@ -230,6 +232,8 @@ def update_lead(lead_id: str, lead_data: Dict[str, Any]):
         raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
     updated = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
+    if updated and updated.get("status") in {"qualified", "hot", "converted"}:
+        automation_service.run("lead_qualified", {"lead_id": lead_id, "customer_phone": updated.get("phone"), "customer_name": updated.get("name"), "status": updated.get("status"), "source": "lead", "channel": "lead"})
     return {"success": True, "data": _serialize_lead(updated)}
 
 
@@ -321,8 +325,7 @@ async def upload_leads_csv(file: UploadFile = File(...)):
                 errors.append(f"Row {row_num}: Phone number {row['phone']} already exists")
                 continue
 
-            mongo_client.leads.insert_one(
-                {
+            lead_doc = {
                     "name": row["name"].strip(),
                     "phone": row["phone"].strip(),
                     "email": row.get("email", "").strip(),
@@ -334,7 +337,8 @@ async def upload_leads_csv(file: UploadFile = File(...)):
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
                 }
-            )
+            result = mongo_client.leads.insert_one(lead_doc)
+            automation_service.run("new_lead", {"lead_id": str(result.inserted_id), "customer_phone": lead_doc["phone"], "customer_name": lead_doc["name"], "email": lead_doc.get("email", ""), "source": "csv"})
             imported_count += 1
         except Exception as exc:
             errors.append(f"Row {row_num}: {str(exc)}")
@@ -344,6 +348,16 @@ async def upload_leads_csv(file: UploadFile = File(...)):
         "imported_count": imported_count,
         "errors": errors,
         "message": f"Successfully imported {imported_count} leads",
+    }
+
+
+@router.get("/health")
+async def health_check():
+    return {
+        "success": True,
+        "message": "Leads API is running",
+        "database": mongo_client.get_connection_status(),
+        "timestamp": datetime.now().isoformat(),
     }
 
 
@@ -401,13 +415,3 @@ async def update_lead_endpoint(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{2
 @router.delete("/{lead_id}")
 async def delete_lead_endpoint(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")):
     return delete_lead(lead_id)
-
-
-@router.get("/health")
-async def health_check():
-    return {
-        "success": True,
-        "message": "Leads API is running",
-        "database": mongo_client.get_connection_status(),
-        "timestamp": datetime.now().isoformat(),
-    }

@@ -2,6 +2,7 @@ import requests
 import base64
 import numpy as np
 import time
+from typing import Optional
 from groq import Groq
 from openai import OpenAI
 from config import Config
@@ -12,7 +13,7 @@ class _CompletionAdapter:
     def __init__(self, parent):
         self.parent = parent
 
-    def create(self, messages, model=None, max_tokens=80, temperature=0.7, top_p=0.9, stream=False):
+    def create(self, messages, model=None, max_tokens=80, temperature=None, top_p=None, stream=False):
         text = self.parent.chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -55,6 +56,7 @@ class AIServices:
         print(f"LLM provider selected: {self.provider}")
         print(f"GROQ_API_KEY present: {'Yes' if self.config.GROQ_API_KEY else 'No'}")
         print(f"OPENAI_API_KEY present: {'Yes' if self.config.OPENAI_API_KEY else 'No'}")
+        print(f"OPENROUTER_API_KEY present: {'Yes' if self.config.OPENROUTER_API_KEY else 'No'}")
 
         if self.provider == "groq" and self.config.GROQ_API_KEY:
             try:
@@ -63,19 +65,24 @@ class AIServices:
             except Exception as e:
                 print(f"Failed to initialize Groq client: {e}")
 
-        if self.provider == "openai" and self.config.OPENAI_API_KEY:
+        if self.provider in {"openai", "openrouter"} and ((self.provider == "openai" and self.config.OPENAI_API_KEY) or (self.provider == "openrouter" and self.config.OPENROUTER_API_KEY)):
             try:
-                self.openai_client = OpenAI(api_key=self.config.OPENAI_API_KEY)
+                self.openai_client = OpenAI(
+                    api_key=self.config.OPENAI_API_KEY if self.provider == "openai" else self.config.OPENROUTER_API_KEY,
+                    base_url="https://openrouter.ai/api/v1" if self.provider == "openrouter" else None,
+                )
                 self.groq_client = _ClientAdapter(self)
                 if not self.config.GROQ_API_KEY:
-                    self.config.GROQ_API_KEY = "openai-proxy"
-                print("OpenAI client initialized successfully")
+                    self.config.GROQ_API_KEY = "openrouter-proxy" if self.provider == "openrouter" else "openai-proxy"
+                print(f"{self.provider.title()} client initialized successfully")
             except Exception as e:
                 print(f"Failed to initialize OpenAI client: {e}")
 
     def _resolve_provider(self) -> str:
-        if self.config.LLM_PROVIDER in {"groq", "openai"}:
+        if self.config.LLM_PROVIDER in {"groq", "openai", "openrouter"}:
             return self.config.LLM_PROVIDER
+        if self.config.OPENROUTER_API_KEY:
+            return "openrouter"
         if self.config.GROQ_API_KEY and self.config.GROQ_API_KEY != "your_groq_api_key_here":
             return "groq"
         if self.config.OPENAI_API_KEY:
@@ -83,16 +90,19 @@ class AIServices:
         return "groq"
 
     def is_llm_configured(self) -> bool:
-        if self.provider == "openai":
-            return bool(self.openai_client and self.config.OPENAI_API_KEY)
+        if self.provider in {"openai", "openrouter"}:
+            key = self.config.OPENAI_API_KEY if self.provider == "openai" else self.config.OPENROUTER_API_KEY
+            return bool(self.openai_client and key)
         return bool(self.groq_client and self.config.GROQ_API_KEY and self.config.GROQ_API_KEY != "your_groq_api_key_here")
 
-    def chat_completion(self, messages, max_tokens=80, temperature=0.7, top_p=0.9):
-        if self.provider == "openai":
+    def chat_completion(self, messages, max_tokens=80, temperature: Optional[float] = None, top_p: Optional[float] = None):
+        temperature = self.config.LLM_TEMPERATURE if temperature is None else temperature
+        top_p = self.config.LLM_TOP_P if top_p is None else top_p
+        if self.provider in {"openai", "openrouter"}:
             if not self.openai_client:
-                raise RuntimeError("OpenAI client is not initialized")
+                raise RuntimeError(f"{self.provider.title()} client is not initialized")
             response = self.openai_client.chat.completions.create(
-                model=self.config.OPENAI_MODEL,
+                model=self.config.OPENAI_MODEL if self.provider == "openai" else self.config.OPENROUTER_MODEL,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -193,8 +203,8 @@ class AIServices:
             ai_text = self.chat_completion(
                 messages=messages,
                 max_tokens=self.config.MAX_TOKENS,
-                temperature=self.config.TEMPERATURE,
-                top_p=0.9,
+                temperature=self.config.CONVERSATION_TEMPERATURE,
+                top_p=self.config.LLM_TOP_P,
             )
             conversation_history.append({"role": "assistant", "content": ai_text})
             

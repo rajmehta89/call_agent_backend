@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 from typing import Any, Dict, List, Optional
 
 
 class TransferService:
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
         self._calls: Dict[str, Dict[str, Any]] = {}
 
     def register_call(
@@ -31,8 +31,12 @@ class TransferService:
                 "transfer_mode": existing.get("transfer_mode"),
                 "transfer_confidence": existing.get("transfer_confidence"),
                 "accepted_by": existing.get("accepted_by"),
+                "handled_by": existing.get("handled_by"),
                 "accepted_at": existing.get("accepted_at"),
                 "resolved_at": existing.get("resolved_at"),
+                "transfer_status": existing.get("transfer_status"),
+                "transfer_destination": existing.get("transfer_destination"),
+                "transfer_error": existing.get("transfer_error"),
                 "notes": existing.get("notes"),
                 "messages": existing.get("messages", []),
                 "created_at": existing.get("created_at", datetime.now().isoformat()),
@@ -79,6 +83,29 @@ class TransferService:
             record["transfer_mode"] = mode
             record["transfer_confidence"] = round(confidence, 2)
             record["status"] = "awaiting_human"
+            record["transfer_status"] = "requested"
+            record["transfer_error"] = None
+            record["updated_at"] = datetime.now().isoformat()
+            return deepcopy(record)
+
+    def update_transfer(
+        self,
+        session_id: str,
+        status: str,
+        destination: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            record = self._calls.get(session_id)
+            if not record:
+                return None
+            record["transfer_status"] = status
+            record["status"] = status
+            if destination:
+                record["transfer_destination"] = destination
+                record["handled_by"] = destination
+            if error:
+                record["transfer_error"] = error
             record["updated_at"] = datetime.now().isoformat()
             return deepcopy(record)
 
@@ -89,6 +116,8 @@ class TransferService:
                 return None
             record["status"] = "accepted"
             record["accepted_by"] = agent_name
+            record["handled_by"] = agent_name
+            record["transfer_status"] = "accepted"
             record["accepted_at"] = datetime.now().isoformat()
             record["updated_at"] = datetime.now().isoformat()
             return deepcopy(record)
@@ -99,6 +128,7 @@ class TransferService:
             if not record:
                 return None
             record["status"] = "resolved"
+            record["transfer_status"] = "completed"
             record["notes"] = notes or record.get("notes")
             record["resolved_at"] = datetime.now().isoformat()
             record["updated_at"] = datetime.now().isoformat()
@@ -120,7 +150,7 @@ class TransferService:
             items = [
                 deepcopy(record)
                 for record in self._calls.values()
-                if record.get("transfer_requested") and record.get("status") in {"awaiting_human", "accepted"}
+                if record.get("transfer_requested") and record.get("status") in {"awaiting_human", "dialing", "ringing", "accepted"}
             ]
         return sorted(items, key=lambda item: item.get("updated_at", ""), reverse=True)
 

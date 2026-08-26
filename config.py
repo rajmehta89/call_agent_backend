@@ -28,6 +28,13 @@ WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", 8765))
 NGROK_API = os.getenv("NGROK_API", "http://localhost:4040")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class Config:
     """Central configuration for AI Real Estate Assistant"""
 
@@ -36,8 +43,10 @@ class Config:
     GOOGLE_STT_API_KEY = os.getenv("GOOGLE_STT_API_KEY")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     # === Audio Settings ===
@@ -54,7 +63,17 @@ class Config:
     # === AI Model Settings ===
     MAX_CONVERSATION_HISTORY = 6
     MAX_TOKENS = 50
-    TEMPERATURE = 0.5
+    # Keep generation policies separate: retrieval answers should be grounded,
+    # while ordinary conversation can remain slightly more natural.
+    LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", _env_float("TEMPERATURE", 0.2))
+    RAG_TEMPERATURE = _env_float("RAG_TEMPERATURE", 0.2)
+    CONVERSATION_TEMPERATURE = _env_float("CONVERSATION_TEMPERATURE", 0.35)
+    TOOL_TEMPERATURE = _env_float("TOOL_TEMPERATURE", 0.0)
+    CLASSIFICATION_TEMPERATURE = _env_float("CLASSIFICATION_TEMPERATURE", 0.0)
+    # OpenAI recommends changing temperature or top_p, not both. Keep top_p
+    # neutral so temperature is the only sampling control we tune.
+    LLM_TOP_P = _env_float("LLM_TOP_P", 1.0)
+    TEMPERATURE = LLM_TEMPERATURE
 
     # === Real Estate Bot Behavior Flags ===
     USE_KNOWLEDGE_BASE_ONLY = False  # Only answer from real estate data if True

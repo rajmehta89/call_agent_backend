@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from bson import ObjectId
 from mongo_client import mongo_client
+from automation_service import automation_service
 
 router = APIRouter(prefix="/api/calls", tags=["calls"])
 
@@ -17,6 +18,19 @@ class LogCallRequest(BaseModel):
     phone_number: str
     lead_id: Optional[str] = None
     call_data: Optional[Dict[str, Any]] = None
+
+
+def _run_call_automations(call_record: Dict[str, Any]) -> None:
+    call_status = str(call_record.get("status", "")).lower()
+    event = "missed_call" if call_status in {"missed", "no-answer", "no_answer"} else "voice_call"
+    automation_service.run(event, {
+        "call_id": call_record.get("_id"),
+        "lead_id": call_record.get("lead_id"),
+        "customer_phone": call_record.get("phone_number"),
+        "status": call_status,
+        "direction": call_record.get("direction", "outbound"),
+        "source": "voice",
+    })
 
 def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call_data: Dict[str, Any]) -> None:
     """
@@ -63,7 +77,7 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
                 new_status = "called"
                 print(f"📞 Lead {lead['name']} moved to 'called' (call initiated)")
 
-        elif call_status == "completed" and call_duration > 0:
+        elif call_status in {"completed", "transferred"} and call_duration > 0:
             if current_status in ["new", "called"]:
                 if has_conversation:
                     new_status = "contacted"
@@ -139,6 +153,13 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             "call_summary": call_data.get("summary", "") if call_data else "",
             "sentiment": call_data.get("sentiment", "neutral") if call_data else "neutral",
             "interest_analysis": call_data.get("interest_analysis", None) if call_data else None,
+            "transfer_requested": bool(call_data.get("transfer_requested", False)) if call_data else False,
+            "transfer_status": call_data.get("transfer_status") if call_data else None,
+            "transfer_destination": call_data.get("transfer_destination") if call_data else None,
+            "transfer_error": call_data.get("transfer_error") if call_data else None,
+            "transfer_succeeded": bool(call_data.get("transfer_succeeded", False)) if call_data else False,
+            "accepted_by": call_data.get("accepted_by") if call_data else None,
+            "handled_by": call_data.get("handled_by") or (call_data.get("accepted_by") if call_data else None),
             "created_at": datetime.now(),
             "updated_at": datetime.now()
         }
@@ -158,6 +179,13 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     "call_summary": call_record["call_summary"],
                     "sentiment": call_record["sentiment"],
                     "interest_analysis": call_record["interest_analysis"],
+                    "transfer_requested": call_record["transfer_requested"],
+                    "transfer_status": call_record["transfer_status"],
+                    "transfer_destination": call_record["transfer_destination"],
+                    "transfer_error": call_record["transfer_error"],
+                    "transfer_succeeded": call_record["transfer_succeeded"],
+                    "accepted_by": call_record["accepted_by"],
+                    "handled_by": call_record["handled_by"],
                     "updated_at": datetime.now(),
                     "call_date": call_record["call_date"]
                 }
@@ -167,6 +195,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                 )
                 updated_record = mongo_client.calls.find_one({"_id": existing["_id"]})
                 updated_record["_id"] = str(updated_record["_id"])
+                _run_call_automations(updated_record)
                 print(f"✅ Updated existing call record with session_id: {session_id}")
                 return {"success": True, "data": updated_record, "note": "updated_existing_by_session"}
             else:
@@ -192,12 +221,70 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
 
         if call_data:
             update_lead_status_from_call(phone_number, lead_id, call_data)
+        _run_call_automations(call_record)
 
         return {"success": True, "data": call_record}
 
     except Exception as e:
         print(f"❌ Error logging call: {e}")
         return {"success": False, "error": str(e)}
+
+
+def update_call_from_twilio(
+    call_sid: Optional[str],
+    call_status: Optional[str] = None,
+    transfer_status: Optional[str] = None,
+    transfer_destination: Optional[str] = None,
+    transfer_error: Optional[str] = None,
+) -> bool:
+    """Update a persisted call when Twilio reports progress for the parent or dial leg."""
+    if not call_sid or not mongo_client.is_connected():
+        return False
+    existing = mongo_client.calls.find_one({"call_session_id": call_sid})
+    if not existing:
+        return False
+
+    updates: Dict[str, Any] = {"updated_at": datetime.now()}
+    if transfer_status:
+        updates["transfer_status"] = transfer_status
+        if transfer_status in {"connected", "completed"}:
+            updates["status"] = "transferred"
+            updates["transfer_succeeded"] = True
+        elif transfer_status in {"failed", "busy", "no-answer", "canceled", "unconfigured"}:
+            updates["status"] = "failed"
+            updates["transfer_succeeded"] = False
+        else:
+            updates["status"] = "transfer_requested"
+    elif call_status:
+        normalized = str(call_status).lower().replace("_", "-")
+        status_map = {
+            "initiated": "initiated",
+            "ringing": "ringing",
+            "in-progress": "in_progress",
+            "answered": "in_progress",
+            "completed": "completed",
+            "busy": "failed",
+            "failed": "failed",
+            "no-answer": "missed",
+            "canceled": "failed",
+        }
+        if existing.get("transfer_requested"):
+            existing_transfer_status = existing.get("transfer_status")
+            if existing_transfer_status in {"connected", "completed", "accepted"}:
+                updates["status"] = "transferred"
+            elif existing_transfer_status in {"failed", "busy", "no-answer", "canceled", "disabled", "unconfigured"}:
+                updates["status"] = "failed"
+            elif existing_transfer_status in {"requested", "dialing", "ringing"}:
+                updates["status"] = "transfer_requested"
+        else:
+            updates["status"] = status_map.get(normalized, normalized)
+    if transfer_destination:
+        updates["transfer_destination"] = transfer_destination
+        updates["handled_by"] = transfer_destination
+    if transfer_error:
+        updates["transfer_error"] = transfer_error
+    mongo_client.calls.update_one({"_id": existing["_id"]}, {"$set": updates})
+    return True
 
 def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) -> Dict[str, Any]:
     """Get calls with optional filters"""
@@ -359,7 +446,7 @@ async def get_call_stats():
             "completed_calls": completed_calls,
             "failed_calls": failed_calls,
             "missed_calls": status_counts["missed"],
-            "human_transfers": mongo_client.calls.count_documents({"transfer_status": {"$in": ["requested", "accepted", "completed"]}}),
+            "human_transfers": mongo_client.calls.count_documents({"transfer_status": {"$in": ["requested", "dialing", "ringing", "connected", "accepted", "completed"]}}),
             "leads_generated": mongo_client.leads.count_documents({"source": {"$in": ["voice", "call", "inbound_call"]}}),
             "calls_today": calls_today,
             "calls_this_week": calls_this_week,

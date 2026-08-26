@@ -13,6 +13,11 @@ class ShopifyService:
         self.access_token = os.getenv("SHOPIFY_ACCESS_TOKEN") or ""
         self.api_version = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 
+    def configure(self, store_domain: str, access_token: str, api_version: str = "2025-10") -> None:
+        self.store_domain = (store_domain or "").replace("https://", "").replace("http://", "").rstrip("/")
+        self.access_token = access_token or ""
+        self.api_version = api_version or "2025-10"
+
     @property
     def configured(self) -> bool:
         return bool(self.store_domain and self.access_token)
@@ -23,6 +28,7 @@ class ShopifyService:
             "store_domain": self.store_domain,
             "api_version": self.api_version,
             "mode": "live" if self.configured else "not_configured",
+            "access_token_configured": bool(self.access_token),
         }
 
     def _get(self, resource: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

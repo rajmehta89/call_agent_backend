@@ -1,11 +1,19 @@
 from agent_config import agent_config
 from typing import Any, Dict, List
 import json
+import re
 
 class DynamicQA:
     def __init__(self, ai_services):
         self.ai_services = ai_services
         self.agent_config = agent_config
+
+    @staticmethod
+    def _needs_completion_retry(answer: str) -> bool:
+        text = " ".join(str(answer or "").split()).strip().lower()
+        if len(text) < 8:
+            return True
+        return bool(re.search(r"(?:\b(?:to|and|or|the|a|an|is|are|of|for|with)|[:\-\u2013])$", text))
 
     def get_knowledge_base(self) -> Dict[str, Any]:
         """Get knowledge base - user-defined if enabled, otherwise empty"""
@@ -180,18 +188,12 @@ class DynamicQA:
         
         return prompt
 
-    def get_response(self, user_input: str, conversation_history=None, system_context: str = "") -> str:
+    def get_response(self, user_input: str, conversation_history=None, system_context: str = "", temperature=None) -> str:
         """Calls LLM with up-to-date context. Returns the assistant's reply."""
         try:
-            # Check if Groq client is properly initialized
-            if not hasattr(self.ai_services, 'groq_client') or self.ai_services.groq_client is None:
-                print("❌ Groq client is not initialized")
+            if not self.ai_services.is_llm_configured():
+                print("ERROR: LLM client is not initialized")
                 return "I'm sorry, the AI service is not properly configured."
-            
-            # Check if API key is set
-            if not self.ai_services.config.GROQ_API_KEY or self.ai_services.config.GROQ_API_KEY == "your_groq_api_key_here":
-                print("❌ GROQ_API_KEY is not set or is using placeholder value")
-                return "I'm sorry, the AI service API key is not configured."
             
             system_prompt = self.build_system_prompt()
             if system_context:
@@ -206,21 +208,33 @@ class DynamicQA:
                 {'role': 'user', 'content': user_input}
             ]
             
-            print(f"🤖 Attempting to call Groq API...")
-            print(f"🤖 API Key present: {'Yes' if self.ai_services.config.GROQ_API_KEY else 'No'}")
-            print(f"🤖 API Key length: {len(self.ai_services.config.GROQ_API_KEY) if self.ai_services.config.GROQ_API_KEY else 0}")
-            
-            # You may need to change `.chat.completions.create` call to match your ai_services object
-            return self.ai_services.chat_completion(
+            print("Attempting to call configured LLM API...")
+            answer = self.ai_services.chat_completion(
                 messages=messages,
                 max_tokens=160,
-                temperature=0.4,
-                top_p=0.9,
+                temperature=self.ai_services.config.RAG_TEMPERATURE if temperature is None else temperature,
+                top_p=self.ai_services.config.LLM_TOP_P,
             )
+            if answer.strip() and not self._needs_completion_retry(answer):
+                return answer.strip()
+
+            # Providers can occasionally return an empty completion. Retry once
+            # with an explicit output instruction before using a safe fallback.
+            retry_messages = [
+                *messages,
+                {"role": "user", "content": "Return one concise customer-ready answer using only the supplied context. Do not return an empty response."},
+            ]
+            retry = self.ai_services.chat_completion(
+                messages=retry_messages,
+                max_tokens=220,
+                temperature=self.ai_services.config.RAG_TEMPERATURE if temperature is None else temperature,
+                top_p=self.ai_services.config.LLM_TOP_P,
+            )
+            return retry.strip() or "I do not have enough information in the available business knowledge to answer that."
         except Exception as e:
-            print(f"❌ LLM error: {e}")
-            print(f"❌ Error type: {type(e).__name__}")
-            print(f"❌ Full error details: {str(e)}")
+            print(f"LLM error: {e}")
+            print(f"Error type: {type(e).__name__}")
+            print(f"Full error details: {str(e)}")
             return self._dynamic_fallback(user_input)
 
     def _dynamic_fallback(self, user_input: str) -> str:
@@ -279,14 +293,9 @@ class DynamicQA:
             - key_indicators: List[str] of specific phrases/behaviors
         """
         try:
-            # Check if LLM service is available
-            if not hasattr(self.ai_services, 'groq_client') or self.ai_services.groq_client is None:
-                print("❌ Groq client not available for interest analysis")
-                return self._fallback_interest_analysis(transcription, ai_responses)
-            
-            # Check if API key is set
-            if not self.ai_services.config.GROQ_API_KEY or self.ai_services.config.GROQ_API_KEY == "your_groq_api_key_here":
-                print("❌ GROQ_API_KEY not configured for interest analysis")
+            # Check if the configured provider is available.
+            if not self.ai_services.is_llm_configured():
+                print("ERROR: LLM client not available for interest analysis")
                 return self._fallback_interest_analysis(transcription, ai_responses)
             
             # Build conversation text for analysis
@@ -310,27 +319,25 @@ class DynamicQA:
                 {'role': 'user', 'content': f"Please analyze this conversation:\n\n{conversation_text}"}
             ]
             
-            print("🔍 Analyzing conversation interest with LLM...")
+            print("Analyzing conversation interest with LLM...")
             
-            response = self.ai_services.groq_client.chat.completions.create(
+            analysis_text = self.ai_services.chat_completion(
                 messages=messages,
-                model="llama-3.3-70b-versatile",
                 max_tokens=300,
-                temperature=0.3,  # Lower temperature for more consistent analysis
-                top_p=0.9,
-                stream=False
+                temperature=self.ai_services.config.CLASSIFICATION_TEMPERATURE,
+                top_p=self.ai_services.config.LLM_TOP_P,
             )
-            
+
             # Parse LLM response
-            analysis_result = self._parse_interest_analysis_response(response.choices[0].message.content.strip())
+            analysis_result = self._parse_interest_analysis_response(analysis_text.strip())
             
-            print(f"🎯 Interest Analysis Result: {analysis_result['interest_status']} ({analysis_result['confidence']:.2f} confidence)")
-            print(f"📝 Reasoning: {analysis_result['reasoning']}")
+            print(f"Interest Analysis Result: {analysis_result['interest_status']} ({analysis_result['confidence']:.2f} confidence)")
+            print(f"Reasoning: {analysis_result['reasoning']}")
             
             return analysis_result
             
         except Exception as e:
-            print(f"❌ Error in interest analysis: {e}")
+            print(f"Error in interest analysis: {e}")
             return self._fallback_interest_analysis(transcription, ai_responses)
 
     def _format_conversation_for_analysis(self, transcription: List[Dict], ai_responses: List[Dict]) -> str:
@@ -429,7 +436,7 @@ Be conservative - only mark as "interested" if there are clear positive indicato
                         "key_indicators": parsed["key_indicators"][:10] if isinstance(parsed["key_indicators"], list) else []
                     }
         except Exception as e:
-            print(f"⚠️ Failed to parse LLM interest analysis response: {e}")
+            print(f"Failed to parse LLM interest analysis response: {e}")
         
         # Fallback parsing for non-JSON responses
         return self._fallback_parse_response(llm_response)
