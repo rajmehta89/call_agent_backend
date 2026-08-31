@@ -119,6 +119,7 @@ def _count(collection: Any, query: Optional[Dict[str, Any]] = None) -> int:
 def _whatsapp_status() -> Dict[str, Any]:
     meta_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN")
     meta_phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    provider_mode = (os.getenv("WHATSAPP_PROVIDER") or "auto").strip().lower()
     twilio_ready = bool(
         os.getenv("TWILIO_ACCOUNT_SID")
         and os.getenv("TWILIO_AUTH_TOKEN")
@@ -127,7 +128,8 @@ def _whatsapp_status() -> Dict[str, Any]:
     meta_ready = bool(meta_token and meta_phone_id)
     return {
         "connected": meta_ready or twilio_ready,
-        "provider": "meta" if meta_ready else "twilio" if twilio_ready else "not_configured",
+        "provider_mode": provider_mode,
+        "provider": provider_mode if provider_mode in {"meta", "twilio"} and ((provider_mode == "meta" and meta_ready) or (provider_mode == "twilio" and twilio_ready)) else "meta" if meta_ready else "twilio" if twilio_ready else "not_configured",
         "meta_ready": meta_ready,
         "meta_access_token_configured": bool(meta_token),
         "meta_phone_number_id_configured": bool(meta_phone_id),

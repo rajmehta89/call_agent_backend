@@ -268,6 +268,16 @@ class DynamicQA:
         ]
         
         return any(keyword in user_input for keyword in transfer_keywords)
+
+    def analyze_transfer_intent(self, user_input: str, conversation_history=None) -> Dict[str, Any]:
+        """Return the structured handoff decision expected by the voice channel."""
+        should_transfer = self.should_transfer_to_agent(user_input)
+        return {
+            "should_transfer": should_transfer,
+            "reason": "Caller requested human assistance" if should_transfer else "No human handoff requested",
+            "mode": "keyword_analyzer",
+            "confidence": 0.9 if should_transfer else 0.0,
+        }
     
     def get_greeting_message(self) -> str:
         """Get dynamic greeting message"""

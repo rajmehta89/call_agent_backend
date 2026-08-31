@@ -1,7 +1,9 @@
 import os
 from datetime import datetime
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter
+from pydantic import BaseModel, Field
 
 from agent_config import agent_config
 from brain_service import brain_service
@@ -9,6 +11,28 @@ from mongo_client import mongo_client
 
 
 router = APIRouter(prefix="/api/omnichannel", tags=["omnichannel"])
+
+
+class BrainTestRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    channel: str = "whatsapp"
+    customer_phone: Optional[str] = None
+    history: List[Dict[str, str]] = Field(default_factory=list)
+
+
+@router.post("/test-brain")
+async def test_shared_brain(payload: BrainTestRequest):
+    """Exercise the shared brain locally without sending a provider message or call."""
+    channel = payload.channel.strip().lower()
+    if channel not in {"voice", "whatsapp"}:
+        return {"success": False, "error": "channel must be voice or whatsapp"}
+    reply = brain_service.respond(
+        payload.message.strip(),
+        payload.history[-8:],
+        channel=channel,
+        customer_phone=payload.customer_phone,
+    )
+    return {"success": True, "data": {"channel": channel, "reply": reply}}
 
 
 def _count_documents(collection_name: str) -> int:
@@ -31,7 +55,7 @@ async def omnichannel_summary():
     twilio_ready = bool(
         os.getenv("TWILIO_ACCOUNT_SID")
         and os.getenv("TWILIO_AUTH_TOKEN")
-        and (os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))
+        and (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))
     )
     meta_access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN")
     meta_phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
@@ -42,6 +66,7 @@ async def omnichannel_summary():
         and os.getenv("TWILIO_AUTH_TOKEN")
         and os.getenv("TWILIO_WHATSAPP_NUMBER")
     )
+    whatsapp_mode = (os.getenv("WHATSAPP_PROVIDER") or "auto").strip().lower()
     whatsapp_ready = meta_ready or twilio_whatsapp_ready
     openai_ready = bool(os.getenv("OPENAI_API_KEY"))
     brain_index = brain_service.index_status()
@@ -54,11 +79,17 @@ async def omnichannel_summary():
                 "voice": {
                     "enabled": twilio_ready,
                     "provider": "twilio" if twilio_ready else "not_configured",
-                    "number": os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID") or "",
+                    "number": os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID") or "",
                 },
                 "whatsapp": {
                     "enabled": whatsapp_ready,
-                    "provider": "meta" if meta_ready else "twilio" if twilio_whatsapp_ready else "not_configured",
+                    "provider_mode": whatsapp_mode,
+                    "provider": (
+                        whatsapp_mode
+                        if whatsapp_mode in {"meta", "twilio"}
+                        and ((whatsapp_mode == "meta" and meta_ready) or (whatsapp_mode == "twilio" and twilio_whatsapp_ready))
+                        else "meta" if meta_ready else "twilio" if twilio_whatsapp_ready else "not_configured"
+                    ),
                     "meta": {
                         "ready": meta_ready,
                         "access_token_configured": bool(meta_access_token),

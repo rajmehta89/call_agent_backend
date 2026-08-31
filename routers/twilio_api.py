@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import re
@@ -35,8 +36,8 @@ TWILIO_CONVERSATION_LANG = os.getenv("TWILIO_CONVERSATION_LANG", "en-US")
 OUTBOUND_CALL_CONTEXT: Dict[str, Dict[str, Any]] = {}
 
 
-def _get_ws_base_url() -> str:
-    base = TWILIO_PUBLIC_BASE_URL.rstrip("/")
+def _get_ws_base_url(base_url: Optional[str] = None) -> str:
+    base = (base_url or TWILIO_PUBLIC_BASE_URL).rstrip("/")
     if base.startswith("https://"):
         return "wss://" + base[len("https://"):]
     if base.startswith("http://"):
@@ -44,13 +45,22 @@ def _get_ws_base_url() -> str:
     return base
 
 
-def _get_http_base_url() -> str:
-    return TWILIO_PUBLIC_BASE_URL.rstrip("/")
+def _get_http_base_url(base_url: Optional[str] = None) -> str:
+    return (base_url or TWILIO_PUBLIC_BASE_URL).rstrip("/")
 
 
-def _build_conversation_twiml() -> str:
-    ws_url = f"{_get_ws_base_url()}/api/twilio/ws"
-    greeting = agent_config.get_greeting_message().replace("&", "&amp;").replace('"', "&quot;")
+def _get_request_base_url(request: Request) -> str:
+    """Use the public proxy host for TwiML when running behind a tunnel."""
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    forwarded_proto = request.headers.get("x-forwarded-proto") or "https"
+    if forwarded_host:
+        return f"{forwarded_proto.split(',')[0].strip()}://{forwarded_host.split(',')[0].strip()}"
+    return TWILIO_PUBLIC_BASE_URL
+
+
+def _build_conversation_twiml(public_base_url: Optional[str] = None) -> str:
+    ws_url = f"{_get_ws_base_url(public_base_url)}/api/twilio/ws"
+    greeting = html.escape(agent_config.get_greeting_message(), quote=True)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
@@ -176,6 +186,29 @@ def get_outbound_call_context(call_sid: Optional[str]) -> Optional[Dict[str, Any
     return OUTBOUND_CALL_CONTEXT.get(call_sid)
 
 
+@router.get("/config")
+async def twilio_config() -> Dict[str, Any]:
+    """Safe local setup diagnostics; never return Twilio credentials."""
+    public_base_url = _get_http_base_url()
+    return {
+        "success": True,
+        "data": {
+            "provider": "twilio",
+            "account_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN),
+            "voice_number_configured": bool(TWILIO_CALLER_ID),
+            "human_transfer_configured": bool(TWILIO_HUMAN_AGENT_NUMBER),
+            "public_base_url": public_base_url,
+            "inbound_webhook": f"{public_base_url}/api/twilio/inbound",
+            "status_webhook": f"{public_base_url}/api/twilio/status",
+            "websocket_url": f"{_get_ws_base_url()}/api/twilio/ws",
+            "conversation_relay_ready": bool(
+                TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_CALLER_ID
+                and public_base_url.startswith("https://")
+            ),
+        },
+    }
+
+
 async def _send_text(websocket: WebSocket, text: str, last: bool = True):
     await websocket.send_text(json.dumps({
         "type": "text",
@@ -198,13 +231,13 @@ def _serialize_messages(messages: List[Dict[str, Any]], speaker: str) -> List[Di
 
 
 @router.post("/inbound", response_class=PlainTextResponse)
-async def inbound_call():
-    return PlainTextResponse(_build_conversation_twiml(), media_type="text/xml")
+async def inbound_call(request: Request):
+    return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
 
 
 @router.post("/outbound/connect", response_class=PlainTextResponse)
-async def outbound_connect():
-    return PlainTextResponse(_build_outbound_conversation_twiml(), media_type="text/xml")
+async def outbound_connect(request: Request):
+    return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
 
 
 @router.post("/status")

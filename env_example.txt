@@ -71,3 +71,25 @@ SMTP_USERNAME=
 SMTP_PASSWORD=
 SMTP_FROM=
 SMTP_USE_TLS=true
+
+# Twilio Voice
+TWILIO_ACCOUNT_SID=ACxxxxxxxx
+TWILIO_AUTH_TOKEN=your_twilio_auth_token
+TWILIO_PHONE_NUMBER=+1xxxxxxxxxx
+TWILIO_CALLER_ID=+1xxxxxxxxxx
+TWILIO_PUBLIC_BASE_URL=https://your-public-ngrok-domain.ngrok-free.app
+TWILIO_CONVERSATION_LANG=en-US
+TWILIO_HUMAN_AGENT_NUMBER=+1xxxxxxxxxx
+
+# WhatsApp: auto selects Meta direct Cloud API first, then Twilio WhatsApp.
+# Set WHATSAPP_PROVIDER=meta or twilio to force one path.
+WHATSAPP_PROVIDER=auto
+WHATSAPP_VERIFY_TOKEN=replace-with-a-webhook-verification-token
+WHATSAPP_ACCESS_TOKEN=your_meta_cloud_api_access_token
+WHATSAPP_PHONE_NUMBER_ID=your_meta_phone_number_id
+WHATSAPP_AUTO_REPLY_ENABLED=true
+TWILIO_WHATSAPP_NUMBER=+1xxxxxxxxxx
+LOCAL_WHATSAPP_BACKEND_URL=http://127.0.0.1:8000
+LOCAL_WHATSAPP_PORT=8787
+# Optional shared secret if the local bridge is exposed beyond localhost.
+LOCAL_WHATSAPP_SERVICE_TOKEN=

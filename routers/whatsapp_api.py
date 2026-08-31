@@ -17,6 +17,9 @@ from qa_engine import DynamicQA
 from brain_service import brain_service
 from automation_service import automation_service
 from notification_service import notify_human_assignment, notify_recipients
+from env_loader import load_project_env
+
+load_project_env()
 
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
@@ -27,6 +30,8 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+WHATSAPP_PROVIDER = os.getenv("WHATSAPP_PROVIDER", "auto").strip().lower()
+LOCAL_WHATSAPP_SERVICE_TOKEN = os.getenv("LOCAL_WHATSAPP_SERVICE_TOKEN", "").strip()
 WHATSAPP_AUTO_REPLY_ENABLED = os.getenv("WHATSAPP_AUTO_REPLY_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 
 
@@ -34,6 +39,13 @@ class SendWhatsAppRequest(BaseModel):
     to: str
     text: str
     conversation_id: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class LocalWhatsAppMessageRequest(BaseModel):
+    customer_phone: str
+    customer_name: Optional[str] = None
+    text: str = Field(min_length=1, max_length=4000)
 
 
 class ConversationControlRequest(BaseModel):
@@ -174,12 +186,13 @@ def _store_message(
         "text": text,
         "direction": direction,
         "provider": provider,
-        "provider_message_id": provider_message_id,
         "status": "received" if direction == "inbound" else "sent",
         "raw_payload": raw_payload or {},
         "created_at": _now(),
         "updated_at": _now(),
     }
+    if provider_message_id:
+        message["provider_message_id"] = provider_message_id
     result = mongo_client.whatsapp_messages.insert_one(message)
     message["_id"] = result.inserted_id
 
@@ -255,12 +268,57 @@ def _send_via_meta(to: str, text: str) -> Dict[str, Any]:
     return {"provider": "meta", "provider_message_id": message_id, "status": "sent"}
 
 
-def _send_message(to: str, text: str) -> Dict[str, Any]:
-    if WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID:
+def _provider_ready(provider: str) -> bool:
+    if provider == "meta":
+        return bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID)
+    if provider == "twilio":
+        return bool(TWILIO_WHATSAPP_NUMBER and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
+    return False
+
+
+def _send_message(to: str, text: str, provider: Optional[str] = None) -> Dict[str, Any]:
+    selected = (provider or WHATSAPP_PROVIDER or "auto").strip().lower()
+    if selected not in {"auto", "meta", "twilio"}:
+        raise RuntimeError("WHATSAPP_PROVIDER must be auto, meta, or twilio")
+    if selected == "meta":
         return _send_via_meta(to, text)
-    if TWILIO_WHATSAPP_NUMBER and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    if selected == "twilio":
         return _send_via_twilio(to, text)
-    return _send_via_meta(to, text)
+    if _provider_ready("meta"):
+        return _send_via_meta(to, text)
+    if _provider_ready("twilio"):
+        return _send_via_twilio(to, text)
+    raise RuntimeError("No WhatsApp provider is configured. Configure Meta Cloud API or Twilio WhatsApp.")
+
+
+@router.get("/config")
+async def whatsapp_config() -> Dict[str, Any]:
+    """Safe diagnostics for both direct Meta and Twilio WhatsApp paths."""
+    meta_ready = _provider_ready("meta")
+    twilio_ready = _provider_ready("twilio")
+    selected = WHATSAPP_PROVIDER if WHATSAPP_PROVIDER in {"auto", "meta", "twilio"} else "auto"
+    active_provider = selected if selected != "auto" and _provider_ready(selected) else (
+        "meta" if meta_ready else "twilio" if twilio_ready else "not_configured"
+    )
+    return {
+        "success": True,
+        "data": {
+            "provider_mode": selected,
+            "active_provider": active_provider,
+            "auto_reply_enabled": WHATSAPP_AUTO_REPLY_ENABLED,
+            "webhook": "/api/whatsapp/webhook",
+            "meta": {
+                "ready": meta_ready,
+                "access_token_configured": bool(WHATSAPP_ACCESS_TOKEN),
+                "phone_number_id_configured": bool(WHATSAPP_PHONE_NUMBER_ID),
+                "verify_token_configured": bool(WHATSAPP_VERIFY_TOKEN),
+            },
+            "twilio": {
+                "ready": twilio_ready,
+                "whatsapp_number_configured": bool(TWILIO_WHATSAPP_NUMBER),
+            },
+        },
+    }
 
 
 def _generate_ai_reply(conversation_id: str, customer_text: str) -> Optional[str]:
@@ -479,7 +537,7 @@ async def send_message(request: SendWhatsAppRequest):
         raise HTTPException(status_code=400, detail={"success": False, "error": "to and text are required"})
 
     try:
-        provider_result = _send_message(request.to.strip(), request.text.strip())
+        provider_result = _send_message(request.to.strip(), request.text.strip(), request.provider)
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"success": False, "error": str(exc)})
 
@@ -574,3 +632,60 @@ async def receive_whatsapp_webhook(request: Request):
             print(f"WhatsApp webhook store failed: {exc}")
 
     return {"success": True, "stored": stored}
+
+
+@router.post("/local/message")
+async def receive_local_whatsapp_message(request: Request, payload: LocalWhatsAppMessageRequest):
+    """Dev bridge used by the local WhatsApp Web service.
+
+    The backend stores the inbound and generated outbound messages, but does
+    not call Meta or Twilio. The local client delivers the returned reply.
+    """
+    _require_db()
+    if LOCAL_WHATSAPP_SERVICE_TOKEN and request.headers.get("x-local-whatsapp-token") != LOCAL_WHATSAPP_SERVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid local WhatsApp service token")
+    customer_phone = payload.customer_phone.strip()
+    text = payload.text.strip()
+    customer_name = (payload.customer_name or "").strip()
+    if not customer_phone or not text:
+        raise HTTPException(status_code=400, detail={"success": False, "error": "customer_phone and text are required"})
+
+    try:
+        existing_conversation = mongo_client.whatsapp_conversations.find_one({"customer_phone": customer_phone})
+        inbound_message = _store_message(
+            customer_phone=customer_phone,
+            text=text,
+            direction="inbound",
+            provider="local_whatsapp_web",
+            customer_name=customer_name,
+            raw_payload=payload.model_dump(),
+        )
+        automation_context = {
+            "customer_phone": customer_phone,
+            "customer_name": customer_name,
+            "conversation_id": inbound_message["conversation_id"],
+            "message": text,
+            "channel": "whatsapp",
+            "source": "local_whatsapp_web",
+        }
+        automation_service.run("whatsapp_message", automation_context)
+        if existing_conversation:
+            automation_service.run("customer_reply", automation_context)
+
+        ai_reply = _generate_ai_reply(inbound_message["conversation_id"], text)
+        if ai_reply:
+            _store_message(
+                customer_phone=customer_phone,
+                text=ai_reply,
+                direction="outbound",
+                provider="local_whatsapp_web",
+                conversation_id=inbound_message["conversation_id"],
+                customer_name=customer_name,
+                raw_payload={"provider": "local_whatsapp_web", "status": "queued_for_local_client"},
+            )
+        return {
+            "success": True,
+            "data": {"conversation_id": inbound_message["conversation_id"], "reply": ai_reply},
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"success": False, "error": str(exc)}) from exc

@@ -1,10 +1,6 @@
 version: "2"
-# authtoken: 30ft5SOY0ZMRqMtcJRAzFuByfOH_89U6vF2Dd89RytZCvgmdL
-authtoken: 2uX1e16hzoRpk4ScCfej5WHNjL3_4ZdubjV6ux61omWtzzczC
+# Configure locally with: ngrok config add-authtoken <token>
 tunnels:
-  webhook:
-    addr: 3001
-    proto: http
-  websocket:
-    addr: 8765
+  app:
+    addr: 8000
     proto: http

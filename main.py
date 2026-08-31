@@ -9,6 +9,13 @@ import sys
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from env_loader import load_project_env
+
+# Load environment variables before importing routers so every channel sees
+# the same local/reference .env configuration.
+load_project_env()
+
 from routers import auth_api, config_api, calls_api, omnichannel_api, platform_api, transfer_api, twilio_api, whatsapp_api
 
 if hasattr(sys.stdout, "reconfigure"):
