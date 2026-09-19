@@ -117,9 +117,19 @@ class MongoDBClient:
             self.notifications.create_index("created_at")
             self.email_outbox.create_index("status")
             self.email_outbox.create_index("created_at")
-            self.email_outbox.create_index("recipient_email", unique=True, sparse=True)
+            self.email_outbox.create_index(
+                [("recipient_email", 1)],
+                name="email_outbox_recipient_unique_v1",
+                unique=True,
+                sparse=True,
+            )
             self.campaign_prospects.create_index("dedupe_key", unique=True, sparse=True)
-            self.campaign_prospects.create_index("email_key", unique=True, sparse=True)
+            self.campaign_prospects.create_index(
+                [("email_key", 1)],
+                name="campaign_prospects_email_unique_v1",
+                unique=True,
+                sparse=True,
+            )
             self.campaign_prospects.create_index("status")
             self.campaign_prospects.create_index("created_at")
             self.discovery_runs.create_index("created_at")
