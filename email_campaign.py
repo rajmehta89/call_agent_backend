@@ -243,7 +243,11 @@ def notify_pending_approval_digest() -> Dict[str, Any]:
             "",
         ])
     lines.extend(["Raj Mehta", "AI Automation Developer", "https://buildwithraj.com/"])
-    result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
+    try:
+        result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
+    except Exception as exc:
+        print(f"Campaign approval digest failed: {exc}", flush=True)
+        return {"status": "error", "count": len(drafts), "reason": "Gmail delivery failed"}
     if result.get("status") != "sent":
         return {"status": "error", "count": len(drafts), "reason": result.get("reason", "Digest was not sent")}
     now = datetime.utcnow()
@@ -258,6 +262,6 @@ async def email_campaign_worker() -> None:
             refill_campaign_candidates()
             notify_pending_approval_digest()
             process_email_outbox()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Email campaign worker cycle failed: {exc}", flush=True)
         await asyncio.sleep(30)
