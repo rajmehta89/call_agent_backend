@@ -61,7 +61,8 @@ def _website_email(website: str) -> str:
             for candidate in sorted(candidates):
                 email = candidate.strip(" <>.,;:\"'()[]").lower()
                 host = email.rsplit("@", 1)[-1]
-                if "@" in email and host not in IGNORED_EMAIL_HOSTS:
+                ignored_host = host in IGNORED_EMAIL_HOSTS or any(host.endswith(f".{ignored}") for ignored in IGNORED_EMAIL_HOSTS)
+                if "@" in email and not ignored_host and not email.startswith(("noreply@", "no-reply@", "donotreply@")):
                     return email
         except requests.RequestException:
             continue
@@ -172,7 +173,6 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "dedupe_key": dedupe_key,
             "company_name": company_name,
             "email": email,
-            "email_key": email or None,
             "website": website,
             "address": place.get("formattedAddress", ""),
             "phone": place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber", ""),
@@ -186,9 +186,16 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "created_at": now,
             "updated_at": now,
             }
+            if email:
+                prospect["email_key"] = email
             prospect_update = dict(prospect)
             prospect_update.pop("created_at", None)
-            mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, {"$set": prospect_update, "$setOnInsert": {"created_at": now}}, upsert=True)
+            update = {"$set": prospect_update, "$setOnInsert": {"created_at": now}}
+            if not email:
+                # Sparse unique indexes ignore missing fields, but repeated
+                # explicit nulls still collide. Clean up older null values.
+                update["$unset"] = {"email_key": ""}
+            mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, update, upsert=True)
             found += 1
             if email:
                 ready += 1
