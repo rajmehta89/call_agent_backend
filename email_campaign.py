@@ -19,6 +19,23 @@ DEFAULT_EMAIL_CAMPAIGN: Dict[str, Any] = {
     "discovery_location": "United States",
 }
 
+# The configured query is always tried first. These focused fallbacks let a
+# campaign keep filling its hourly queue when one Google Places search has
+# too few businesses with a public contact email.
+DISCOVERY_FALLBACK_QUERIES = (
+    "roofing contractors",
+    "plumbing contractors",
+    "HVAC contractors",
+    "home cleaning services",
+    "dental clinics",
+    "med spas",
+    "real estate agencies",
+    "property management companies",
+    "law firms",
+    "accounting firms",
+    "auto repair shops",
+)
+
 
 def get_email_campaign() -> Dict[str, Any]:
     value = DEFAULT_EMAIL_CAMPAIGN.copy()
@@ -148,6 +165,15 @@ def _pending_campaign_candidates() -> int:
     return mongo_client.email_outbox.count_documents({"status": {"$in": ["pending_approval", "scheduled", "approved", "sending"]}})
 
 
+def _discovery_queries(configured_query: str) -> List[str]:
+    queries: List[str] = []
+    for value in (configured_query, *DISCOVERY_FALLBACK_QUERIES):
+        query = str(value or "").strip()
+        if query and query.lower() not in {item.lower() for item in queries}:
+            queries.append(query)
+    return queries
+
+
 def refill_campaign_candidates() -> Dict[str, Any]:
     """Keep enough unique prospect drafts ready for the next rate window."""
     if not mongo_client.is_connected():
@@ -163,11 +189,21 @@ def refill_campaign_candidates() -> Dict[str, Any]:
     if needed == 0:
         return {"status": "buffer_ready", "needed": 0, "queued": queued}
 
-    query = campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]
+    configured_query = campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]
     location = campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]
     recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
-    recent = mongo_client.discovery_runs.find_one({"query": query, "location": location, "created_at": {"$gte": recent_cutoff}}, sort=[("created_at", -1)])
-    if recent:
+    query = next(
+        (
+            candidate
+            for candidate in _discovery_queries(configured_query)
+            if not mongo_client.discovery_runs.find_one(
+                {"query": candidate, "location": location, "created_at": {"$gte": recent_cutoff}},
+                sort=[("created_at", -1)],
+            )
+        ),
+        None,
+    )
+    if not query:
         return {"status": "cooldown", "needed": needed, "queued": queued}
 
     from prospect_discovery import discover_prospects
