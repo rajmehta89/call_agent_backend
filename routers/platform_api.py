@@ -530,6 +530,7 @@ async def notify_email_outbox(payload: ValuePayload):
     try:
         result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
     except Exception as exc:
+        print(f"Gmail approval notification failed: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail="Gmail delivery failed; check the Gmail app password and SMTP settings") from exc
     if result.get("status") != "sent":
         raise HTTPException(status_code=409, detail=result.get("reason", "Approval digest was not sent"))
