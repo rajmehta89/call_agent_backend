@@ -18,6 +18,7 @@ from email_campaign import campaign_action, campaign_status, get_email_campaign,
 from email_service import email_service
 from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
 from email_templates import add_email_template, get_email_templates
+from prospect_discovery import discover_prospects, discovery_status
 from gmail_service import gmail_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
@@ -54,6 +55,13 @@ class EmailTemplatePayload(BaseModel):
     description: str = ""
     subject: str
     body: str
+
+
+class ProspectDiscoveryPayload(BaseModel):
+    query: str
+    location: str = "United States"
+    max_results: int = Field(default=20, ge=1, le=20)
+    create_drafts: bool = True
 
 
 class BrainUrlPayload(BaseModel):
@@ -448,6 +456,29 @@ async def create_email_template(payload: EmailTemplatePayload):
     template = add_email_template(payload.dict())
     _audit("create", "email_template", after=template)
     return {"success": True, "data": template}
+
+
+@router.get("/prospects/discovery-status")
+async def get_prospect_discovery_status():
+    return {"success": True, "data": discovery_status()}
+
+
+@router.get("/prospects")
+async def get_campaign_prospects(limit: int = Query(100, ge=1, le=500)):
+    _require_db()
+    return {"success": True, "data": _serialize(list(mongo_client.campaign_prospects.find({}).sort("created_at", -1).limit(limit)))}
+
+
+@router.post("/prospects/discover")
+async def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
+    try:
+        return {"success": True, "data": discover_prospects(payload.query, payload.location, payload.max_results, payload.create_drafts)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Prospect discovery failed: {exc}") from exc
 
 
 @router.get("/email-outbox")

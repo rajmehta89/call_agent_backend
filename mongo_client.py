@@ -55,6 +55,8 @@ class MongoDBClient:
             self.audit_logs = self.db.audit_logs
             self.notifications = self.db.notifications
             self.email_outbox = self.db.email_outbox
+            self.campaign_prospects = self.db.campaign_prospects
+            self.discovery_runs = self.db.discovery_runs
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
@@ -116,6 +118,10 @@ class MongoDBClient:
             self.email_outbox.create_index("status")
             self.email_outbox.create_index("created_at")
             self.email_outbox.create_index("recipient_email")
+            self.campaign_prospects.create_index("dedupe_key", unique=True, sparse=True)
+            self.campaign_prospects.create_index("status")
+            self.campaign_prospects.create_index("created_at")
+            self.discovery_runs.create_index("created_at")
             self.notifications.create_index("read")
             
             print("MongoDB connected successfully")

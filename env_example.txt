@@ -78,6 +78,10 @@ GMAIL_APP_PASSWORD=
 GMAIL_SMTP_HOST=smtp.gmail.com
 GMAIL_SMTP_PORT=587
 GMAIL_SMTP_SSL=false
+GMAIL_APPROVAL_EMAIL=
+
+# Prospect discovery (Google Places API New; requires Places API enabled and billing)
+GOOGLE_PLACES_API_KEY=
 
 # Twilio Voice
 TWILIO_ACCOUNT_SID=ACxxxxxxxx
