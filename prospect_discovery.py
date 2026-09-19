@@ -87,7 +87,14 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
     if existing:
         return ""
     templates = get_email_templates()
-    template = next((item for item in templates if item.get("active", True)), None)
+    combined_context = f"{prospect.get('company_name', '')} {context}".lower()
+    preferred_id = "practical-automation-intro"
+    if any(term in combined_context for term in ("appointment", "roofing", "plumb", "hvac", "cleaning", "clinic", "dental", "contractor", "home service", "call")):
+        preferred_id = "voice-ai-appointment-intro"
+    elif any(term in combined_context for term in ("lead", "sales", "follow-up", "enquir", "crm")):
+        preferred_id = "follow-up-automation-intro"
+    template = next((item for item in templates if item.get("id") == preferred_id and item.get("active", True)), None)
+    template = template or next((item for item in templates if item.get("active", True)), None)
     if not template:
         return ""
     rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "email": email})

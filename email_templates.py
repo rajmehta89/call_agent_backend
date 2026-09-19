@@ -11,27 +11,27 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
     {
         "id": "practical-automation-intro",
         "name": "Practical AI automation intro",
-        "description": "A concise first-touch email for businesses that may have repetitive customer work.",
-        "subject": "A practical AI automation idea for {{company_name}}",
-        "body": "Hi,\n\nI work with businesses like {{company_name}} to automate customer conversations, lead qualification, follow-ups, appointment booking, and CRM updates using reliable AI agents.\n\n{{company_context}}\n\nIf improving this process is relevant for your team, I would be happy to share a practical approach.\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
+        "description": "Short, specific first-touch email with one practical automation idea and a low-pressure CTA.",
+        "subject": "A practical idea for {{company_name}}'s lead follow-up",
+        "body": "Hi,\n\nI noticed {{company_name}} and had one practical idea: a lightweight AI workflow could respond to new enquiries, qualify leads, and follow up automatically without changing your current team.\n\n{{company_context}}\n\nWould a short example be useful? If it is not relevant, no worries.\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
     },
     {
         "id": "voice-ai-appointment-intro",
         "name": "Voice AI and appointment booking",
-        "description": "For service businesses that handle calls, enquiries, or bookings.",
-        "subject": "Could {{company_name}} reduce missed calls with Voice AI?",
-        "body": "Hi,\n\nI help businesses like {{company_name}} handle inbound calls, qualify enquiries, book appointments, and update their CRM with Voice AI.\n\n{{company_context}}\n\nWould it be useful if I mapped a simple call-to-booking workflow for your business?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
+        "description": "For service businesses handling calls, enquiries, estimates, or appointments.",
+        "subject": "Could {{company_name}} reduce missed enquiries with Voice AI?",
+        "body": "Hi,\n\nI noticed {{company_name}} serves customers who may call or request an appointment. I build Voice AI that answers common questions, qualifies enquiries, books appointments, and updates the CRM.\n\n{{company_context}}\n\nWould a short example be useful?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
     },
     {
         "id": "follow-up-automation-intro",
         "name": "Lead follow-up automation",
-        "description": "For companies that may lose leads because follow-up is manual or delayed.",
-        "subject": "An idea for faster lead follow-up at {{company_name}}",
-        "body": "Hi,\n\nI build AI workflows that respond to new leads, qualify them, send timely follow-ups, and keep the CRM updated automatically.\n\n{{company_context}}\n\nIf follow-up is currently handled manually, I can suggest a small workflow that your team can review before anything is automated.\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
+        "description": "For companies where new enquiries need faster, consistent follow-up.",
+        "subject": "A quick follow-up idea for {{company_name}}",
+        "body": "Hi,\n\nA quick idea for {{company_name}}: automate new-lead follow-up so every enquiry gets a timely response and your CRM stays updated.\n\n{{company_context}}\n\nWorth sending a short outline?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
     },
@@ -42,7 +42,18 @@ def get_email_templates() -> List[Dict[str, Any]]:
     if mongo_client.is_connected():
         stored = mongo_client.platform_settings.find_one({"key": "email_templates"})
         if stored and isinstance(stored.get("value"), list):
-            return stored["value"]
+            defaults = {template["id"]: template for template in DEFAULT_EMAIL_TEMPLATES}
+            merged = []
+            seen = set()
+            for template in stored["value"]:
+                template_id = str(template.get("id") or "")
+                if template.get("built_in") and template_id in defaults:
+                    merged.append({**template, **defaults[template_id]})
+                else:
+                    merged.append(template)
+                seen.add(template_id)
+            merged.extend(template for template in DEFAULT_EMAIL_TEMPLATES if template["id"] not in seen)
+            return merged
     return [dict(template) for template in DEFAULT_EMAIL_TEMPLATES]
 
 
