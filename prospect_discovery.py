@@ -2,6 +2,8 @@
 
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List
 from urllib.parse import urljoin, urlparse
@@ -9,7 +11,6 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from email_campaign import process_email_outbox
 from email_policy import approval_window_open, get_email_policy
 from email_templates import get_email_templates, render_email_template
 from mongo_client import mongo_client
@@ -44,7 +45,7 @@ def _website_email(website: str) -> str:
         urls.append(urljoin(parsed.geturl().rstrip("/") + "/", suffix.lstrip("/")))
     for url in urls[:3]:
         try:
-            response = requests.get(url, timeout=8, headers={"User-Agent": "BuildWithRaj-ProspectResearch/1.0"})
+            response = requests.get(url, timeout=(3, 5), headers={"User-Agent": "BuildWithRaj-ProspectResearch/1.0"})
             if response.status_code >= 400:
                 continue
             soup = BeautifulSoup(response.text[:2_000_000], "html.parser")
@@ -116,26 +117,34 @@ def discover_prospects(query: str, location: str = "United States", max_results:
     if not query:
         raise ValueError("Enter a business type or search query")
     max_results = max(1, min(20, int(max_results)))
-    response = requests.post(
-        PLACES_URL,
-        headers={
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": api_key,
-            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.primaryType,places.googleMapsUri,places.businessStatus",
-        },
-        json={"textQuery": f"{query} in {location}", "pageSize": max_results, "languageCode": "en"},
-        timeout=30,
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.primaryType,places.googleMapsUri,places.businessStatus",
+    }
+    body = {"textQuery": f"{query} in {location}", "pageSize": max_results, "languageCode": "en"}
+    response = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(PLACES_URL, headers=headers, json=body, timeout=(5, 15))
+            if response.status_code < 500 or attempt == 3:
+                break
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+        time.sleep(attempt)
     if response.status_code >= 400:
         raise RuntimeError(f"Google Places request failed ({response.status_code}): {response.text[:300]}")
     places = response.json().get("places", [])
     found = ready = drafts = 0
     results: List[Dict[str, Any]] = []
     now = datetime.utcnow()
-    for place in places:
+    websites = [str(place.get("websiteUri") or "").strip() for place in places]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(websites)))) as executor:
+        emails = list(executor.map(_website_email, websites))
+    for place, email in zip(places, emails):
         company_name = _place_name(place)
         website = str(place.get("websiteUri") or "").strip()
-        email = _website_email(website)
         dedupe_key = str(place.get("id") or website or company_name.lower())
         context = _make_context(place, website)
         prospect = {
@@ -155,7 +164,9 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "created_at": now,
             "updated_at": now,
         }
-        mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, {"$set": prospect, "$setOnInsert": {"created_at": now}}, upsert=True)
+        prospect_update = dict(prospect)
+        prospect_update.pop("created_at", None)
+        mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, {"$set": prospect_update, "$setOnInsert": {"created_at": now}}, upsert=True)
         found += 1
         if email:
             ready += 1
@@ -165,7 +176,5 @@ def discover_prospects(query: str, location: str = "United States", max_results:
         results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
     run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed"}
     mongo_client.discovery_runs.insert_one(run)
-    if drafts:
-        process_email_outbox(limit=drafts)
     run["results"] = results
     return run
