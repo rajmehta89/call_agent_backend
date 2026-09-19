@@ -225,6 +225,15 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
     ai_success = _count(mongo_client.ai_activity, {"success": True})
     errors = _count(mongo_client.ai_activity, {"success": False})
     qualified = _count(mongo_client.leads, {"status": {"$in": ["qualified", "hot", "converted"]}})
+    email_outbox = {
+        "total": _count(mongo_client.email_outbox),
+        "pending_approval": _count(mongo_client.email_outbox, {"status": "pending_approval"}),
+        "scheduled": _count(mongo_client.email_outbox, {"status": {"$in": ["scheduled", "approved"]}}),
+        "sending": _count(mongo_client.email_outbox, {"status": "sending"}),
+        "sent": _count(mongo_client.email_outbox, {"status": "sent"}),
+        "excluded": _count(mongo_client.email_outbox, {"status": "excluded"}),
+        "errors": _count(mongo_client.email_outbox, {"status": "error"}),
+    }
     workload_names = set()
     for member in mongo_client.team_members.find({}, {"name": 1}):
         if member.get("name"):
@@ -273,7 +282,7 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
             "voice": {"connected": bool(os.getenv("TWILIO_ACCOUNT_SID") and (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))), "agent": brain_service.channel_config("voice")},
         },
         "shopify": shopify_service.status(),
-        "email": {"gmail": gmail_service.status()},
+        "email": {"gmail": gmail_service.status(), "campaign": campaign_status(), "outbox": email_outbox},
         "human_workload": human_workload[:50],
         "recent_activity": _serialize(recent),
     }}
