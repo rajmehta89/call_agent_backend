@@ -6,7 +6,7 @@ Handles call logging, retrieval, and linking with leads
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 from mongo_client import mongo_client
 from automation_service import automation_service
@@ -411,8 +411,7 @@ async def get_call_stats():
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         calls_today = mongo_client.calls.count_documents({"call_date": {"$gte": today}})
 
-        week_ago = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        week_ago = week_ago.replace(day=week_ago.day - 7)
+        week_ago = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=7)
         calls_this_week = mongo_client.calls.count_documents({"call_date": {"$gte": week_ago}})
 
         pipeline = [

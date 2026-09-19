@@ -33,6 +33,9 @@ TWILIO_PUBLIC_BASE_URL = (
     or "http://localhost:8000"
 )
 TWILIO_CONVERSATION_LANG = os.getenv("TWILIO_CONVERSATION_LANG", "en-US")
+TWILIO_DEFAULT_COUNTRY_CODE = re.sub(
+    r"\D", "", os.getenv("TWILIO_DEFAULT_COUNTRY_CODE", "91")
+) or "91"
 OUTBOUND_CALL_CONTEXT: Dict[str, Dict[str, Any]] = {}
 
 
@@ -139,6 +142,30 @@ def _get_twilio_client() -> Client | None:
     return Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
+def _normalize_twilio_phone(phone_number: str) -> str:
+    """Return a phone number in E.164 format for Twilio."""
+    raw = str(phone_number or "").strip()
+    if not raw:
+        raise ValueError("Lead phone number is empty")
+
+    compact = re.sub(r"[^\d+]", "", raw)
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+
+    digits = re.sub(r"\D", "", compact)
+    if not compact.startswith("+"):
+        if len(digits) == 10:
+            digits = f"{TWILIO_DEFAULT_COUNTRY_CODE}{digits}"
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = f"{TWILIO_DEFAULT_COUNTRY_CODE}{digits[1:]}"
+
+    if not 8 <= len(digits) <= 15:
+        raise ValueError(
+            "Lead phone number must include a valid country code, for example +919979172234"
+        )
+    return f"+{digits}"
+
+
 def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, lead_name: Optional[str] = None) -> Dict[str, Any]:
     client = _get_twilio_client()
     if not client:
@@ -150,8 +177,9 @@ def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, le
     outbound_twiml = _build_outbound_conversation_twiml()
 
     try:
+        normalized_customer_number = _normalize_twilio_phone(customer_number)
         outbound_call = client.calls.create(
-            to=customer_number,
+            to=normalized_customer_number,
             from_=TWILIO_CALLER_ID,
             twiml=outbound_twiml,
             status_callback=status_callback,
@@ -159,11 +187,11 @@ def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, le
             status_callback_event=["initiated", "ringing", "answered", "completed"],
         )
         print(
-            f"Twilio outbound call created for {customer_number} "
+            f"Twilio outbound call created for {normalized_customer_number} "
             f"using ConversationRelay websocket {_get_ws_base_url()}/api/twilio/ws"
         )
         OUTBOUND_CALL_CONTEXT[outbound_call.sid] = {
-            "phone_number": customer_number,
+            "phone_number": normalized_customer_number,
             "lead_id": lead_id,
             "lead_name": lead_name,
             "direction": "outbound",
@@ -354,7 +382,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 handoff_text = (
                     "I am transferring you to a human agent now. They will have the context from this call."
                     if TWILIO_HUMAN_AGENT_NUMBER else
-                    "A human agent request has been created. Please hold while we arrange a callback."
+                    "I have recorded your request for a human follow-up. Our team will call you back using the number associated with this call."
                 )
                 ai_responses.append({"content": handoff_text, "timestamp": datetime.now().isoformat()})
                 transfer_service.append_message(session["session_id"], "assistant", handoff_text)
@@ -423,9 +451,9 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     session["transfer_error"] = "Twilio credentials or call SID are not available"
                     transfer_service.update_transfer(session["session_id"], "unconfigured", transfer_destination, session["transfer_error"])
                 else:
-                    session["transfer_status"] = "unconfigured"
-                    session["transfer_error"] = "No enabled human transfer number is configured"
-                    transfer_service.update_transfer(session["session_id"], "unconfigured", transfer_destination, session["transfer_error"])
+                    session["transfer_status"] = "requested"
+                    session["transfer_error"] = "No enabled human transfer number is configured; callback request recorded"
+                    transfer_service.update_transfer(session["session_id"], "requested", transfer_destination, session["transfer_error"])
                 continue
 
             if bot.is_exit_intent(caller_text):
@@ -466,13 +494,13 @@ async def twilio_conversation_ws(websocket: WebSocket):
             if transfer_requested:
                 if transfer_status in {"connected", "completed", "accepted"}:
                     call_status = "transferred"
-                elif transfer_status in {"failed", "busy", "no-answer", "canceled", "disabled", "unconfigured"}:
+                elif transfer_status in {"failed", "busy", "no-answer", "canceled", "disabled"}:
                     call_status = "failed"
                 else:
                     call_status = "transfer_requested"
                 destination = session.get("transfer_destination") or handoff.get("transfer_destination") or "Human team"
                 summary = (
-                    f"Human handoff to {destination} ({transfer_status}). "
+                    f"Human follow-up requested for {destination} ({transfer_status}). "
                     f"Twilio {session.get('direction', 'inbound')} call with {len(user_transcript)} caller turns."
                 )
             else:

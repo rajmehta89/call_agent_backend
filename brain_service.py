@@ -41,6 +41,7 @@ DEFAULT_TOOLS = {
     "create_lead": True,
     "update_lead": True,
     "send_whatsapp_message": True,
+    "send_gmail_email": False,
     "transfer_voice_call": True,
     "human_handoff": True,
     "custom_api_calls": False,
@@ -63,7 +64,35 @@ class BrainService:
         if not stored:
             legacy = agent_config.get_knowledge_base()
             if legacy:
-                stored = {"custom_knowledge": json.dumps(legacy, ensure_ascii=False, indent=2)}
+                profile = legacy.get("company_profile") or {}
+                support = legacy.get("site_visits_and_support") or {}
+                projects = legacy.get("projects") or {}
+                locations = [
+                    f"{name}: {details.get('location', '')}".strip(": ")
+                    for name, details in projects.items()
+                    if isinstance(details, dict) and details.get("location")
+                ]
+                stored = {
+                    "name": profile.get("developer", "AgentFlow Brain"),
+                    "business_description": profile.get("about", ""),
+                    "company_information": "\n".join(
+                        item for item in (
+                            f"Developer: {profile.get('developer')}" if profile.get("developer") else "",
+                            f"Headquarters: {profile.get('headquarters')}" if profile.get("headquarters") else "",
+                            f"Service area: {profile.get('service_area')}" if profile.get("service_area") else "",
+                            f"Phone: {profile.get('contact_phone')}" if profile.get("contact_phone") else "",
+                            f"Email: {profile.get('contact_email')}" if profile.get("contact_email") else "",
+                            f"Website: {profile.get('website')}" if profile.get("website") else "",
+                            f"RERA ID: {profile.get('rera_id')}" if profile.get("rera_id") else "",
+                        ) if item
+                    ),
+                    "locations": locations,
+                    "working_hours": support.get("customer_service_hours", ""),
+                    "services": legacy.get("what_we_help_with", []),
+                    "faqs": legacy.get("frequently_asked_questions", []),
+                    "policies": legacy.get("answering_policy", []),
+                    "custom_knowledge": json.dumps(legacy, ensure_ascii=False, indent=2),
+                }
         return {
             "name": stored.get("name", "AgentFlow Brain"),
             "business_description": stored.get("business_description", ""),
@@ -505,6 +534,38 @@ class BrainService:
     def _out_of_scope_response(self) -> str:
         return "I'm sorry, I can only help with the business information available in this workspace. Please ask about our properties, services, payments, or appointments."
 
+    @staticmethod
+    def _is_capability_query(user_input: str) -> bool:
+        text = re.sub(r"[^a-z0-9\s]", " ", str(user_input or "").lower())
+        text = " ".join(text.split())
+        return bool(re.search(
+            r"^(?:so )?(?:hi|hello|hey|good morning|good afternoon|good evening|"
+            r"how can you help(?: me)?|what can you help(?: me)? with|"
+            r"what can you do|what do you offer|tell me about your services|"
+            r"tell me about the company|who are you)(?: please)?$",
+            text,
+        ))
+
+    def _capability_response(self) -> str:
+        """Answer broad capability questions without requiring a RAG hit."""
+        brain = self.brain_config()
+        services = brain.get("services") or [
+            "AI agents for customer support and sales",
+            "voice AI and appointment booking",
+            "WhatsApp assistants and follow-ups",
+            "website and document chatbots",
+            "n8n workflows and CRM integrations",
+            "custom web, mobile, and backend systems",
+        ]
+        if isinstance(services, str):
+            services = [services]
+        service_text = ", ".join(str(item).strip() for item in services if str(item).strip())
+        return (
+            "I can help design AI agents, voice and WhatsApp automations, chatbots, n8n workflows, "
+            "CRM/calendar/email/API integrations, and custom web or mobile software. "
+            f"The main services available are {service_text}. What process would you like to improve?"
+        )
+
     def customer_context(self, phone: Optional[str]) -> str:
         if not phone or not mongo_client.is_connected():
             return ""
@@ -558,7 +619,7 @@ class BrainService:
         response_payload: Dict[str, Any] = {}
         try:
             if not retrieved_knowledge and not live_context:
-                response = self._out_of_scope_response()
+                response = self._capability_response() if self._is_capability_query(user_input) else self._out_of_scope_response()
                 success = True
                 return response
             services = AIServices()

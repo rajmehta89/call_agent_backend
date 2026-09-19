@@ -54,6 +54,7 @@ class MongoDBClient:
             self.shopify_sync_history = self.db.shopify_sync_history
             self.audit_logs = self.db.audit_logs
             self.notifications = self.db.notifications
+            self.email_outbox = self.db.email_outbox
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
@@ -112,6 +113,9 @@ class MongoDBClient:
             self.audit_logs.create_index("created_at")
             self.audit_logs.create_index("resource")
             self.notifications.create_index("created_at")
+            self.email_outbox.create_index("status")
+            self.email_outbox.create_index("created_at")
+            self.email_outbox.create_index("recipient_email")
             self.notifications.create_index("read")
             
             print("MongoDB connected successfully")

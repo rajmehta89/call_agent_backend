@@ -15,6 +15,9 @@ from agent_config import agent_config
 from brain_service import DEFAULT_TOOLS, brain_service
 from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitation_hash, require_permission, require_user, role_document
 from email_service import email_service
+from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
+from email_templates import add_email_template, get_email_templates
+from gmail_service import gmail_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
 
@@ -32,6 +35,24 @@ ROLE_PERMISSIONS = {
 
 class ValuePayload(BaseModel):
     value: Dict[str, Any]
+
+
+class EmailDraftPayload(BaseModel):
+    company_name: str
+    recipient_email: str
+    website: str = ""
+    context: str = ""
+    campaign_name: str = "USA AI automation outreach"
+    subject: str = ""
+    body: str = ""
+    template_id: str = ""
+
+
+class EmailTemplatePayload(BaseModel):
+    name: str
+    description: str = ""
+    subject: str
+    body: str
 
 
 class BrainUrlPayload(BaseModel):
@@ -251,6 +272,7 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
             "voice": {"connected": bool(os.getenv("TWILIO_ACCOUNT_SID") and (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))), "agent": brain_service.channel_config("voice")},
         },
         "shopify": shopify_service.status(),
+        "email": {"gmail": gmail_service.status()},
         "human_workload": human_workload[:50],
         "recent_activity": _serialize(recent),
     }}
@@ -361,6 +383,182 @@ async def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[s
 @router.get("/tools")
 async def get_tools():
     return {"success": True, "data": brain_service.tools()}
+
+
+@router.get("/gmail/status")
+async def get_gmail_status():
+    return {"success": True, "data": gmail_service.status()}
+
+
+@router.get("/email-policy")
+async def get_email_policy_route():
+    policy = get_email_policy()
+    return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
+
+
+@router.put("/email-policy")
+async def update_email_policy(payload: ValuePayload):
+    policy = save_email_policy(payload.value)
+    _audit("update", "email_policy", after=policy)
+    return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
+
+
+@router.get("/email-templates")
+async def get_email_templates_route():
+    return {"success": True, "data": get_email_templates()}
+
+
+@router.post("/email-templates")
+async def create_email_template(payload: EmailTemplatePayload):
+    if not payload.name.strip() or not payload.subject.strip() or not payload.body.strip():
+        raise HTTPException(status_code=400, detail="Template name, subject, and body are required")
+    template = add_email_template(payload.dict())
+    _audit("create", "email_template", after=template)
+    return {"success": True, "data": template}
+
+
+@router.get("/email-outbox")
+async def get_email_outbox(status: str = ""):
+    _require_db()
+    query = {"status": status} if status.strip() else {}
+    rows = list(mongo_client.email_outbox.find(query).sort("created_at", -1).limit(200))
+    return {"success": True, "data": _serialize(rows)}
+
+
+@router.post("/email-outbox/notify")
+async def notify_email_outbox(payload: ValuePayload):
+    """Send the owner a review digest; it never approves or sends prospect emails."""
+    _require_db()
+    requested_ids = [str(item) for item in (payload.value.get("draft_ids") or [])]
+    query: Dict[str, Any] = {"status": "pending_approval"}
+    if requested_ids:
+        valid_ids = [ObjectId(item) for item in requested_ids if ObjectId.is_valid(item)]
+        query = {"_id": {"$in": valid_ids}, "status": "pending_approval"}
+    drafts = list(mongo_client.email_outbox.find(query).sort("created_at", 1).limit(50))
+    if not drafts:
+        return {"success": True, "data": {"status": "skipped", "reason": "No pending approval drafts"}}
+    if not gmail_service.configured:
+        raise HTTPException(status_code=409, detail="Gmail is not configured")
+    owner_email = (os.getenv("GMAIL_APPROVAL_EMAIL") or gmail_service.address).strip()
+    app_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
+    lines = [
+        "Hi Raj,",
+        "",
+        f"The AI outreach campaign prepared {len(drafts)} prospect email(s) for your review.",
+        "Open the Campaigns workspace to approve or exclude each one:",
+        f"{app_url}/campaigns",
+        "",
+        "For each item: click Approve & send if you accept it, or click Exclude if you do not want it mailed.",
+        "Nothing is sent by this notification. Only your approval inside the Campaigns workspace can send an email.",
+        "",
+    ]
+    for index, draft in enumerate(drafts, 1):
+        lines.extend([
+            f"{index}. {draft.get('company_name', 'Unknown company')} <{draft.get('recipient_email', '')}>",
+            f"Subject: {draft.get('subject', '')}",
+            f"Context: {draft.get('company_context', '') or 'No company context supplied'}",
+            f"Accept: Approve & send | Do not accept: Exclude",
+            f"Review item: {app_url}/campaigns?draft_id={draft.get('_id')}",
+            "",
+        ])
+    lines.extend(["Raj Mehta", "AI Automation Developer", "https://buildwithraj.com/"])
+    result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
+    if result.get("status") != "sent":
+        raise HTTPException(status_code=409, detail=result.get("reason", "Approval digest was not sent"))
+    now = datetime.utcnow()
+    mongo_client.email_outbox.update_many({"_id": {"$in": [draft["_id"] for draft in drafts]}}, {"$set": {"approval_notified_at": now, "updated_at": now}})
+    return {"success": True, "data": {"status": "sent", "recipient": owner_email, "count": len(drafts)}}
+
+
+@router.post("/email-outbox")
+async def create_email_draft(payload: EmailDraftPayload):
+    _require_db()
+    company = payload.company_name.strip()
+    recipient = payload.recipient_email.strip()
+    if not company or "@" not in recipient:
+        raise HTTPException(status_code=400, detail="Company name and a valid recipient email are required")
+    available_templates = get_email_templates()
+    template = next((item for item in available_templates if item.get("active", True)), None)
+    if payload.template_id.strip():
+        template = next((item for item in available_templates if str(item.get("id")) == payload.template_id.strip()), None)
+        if not template:
+            raise HTTPException(status_code=404, detail="Email template not found")
+    replacements = {
+        "company_name": company,
+        "company_context": payload.context.strip() or "I noticed there may be an opportunity to make this process faster and easier for your team.",
+        "website": payload.website.strip(),
+        "recipient_email": recipient,
+    }
+
+    def render(value: str) -> str:
+        rendered = value
+        for key, replacement in replacements.items():
+            rendered = rendered.replace("{{" + key + "}}", replacement)
+        return rendered.strip()
+
+    subject = payload.subject.strip() or render(str(template.get("subject")) if template else f"A practical AI automation idea for {company}")
+    body = payload.body.strip() or render(str(template.get("body")) if template else (
+        f"Hi,\n\nI work with businesses like {company} to automate customer conversations, lead qualification, follow-ups, "
+        "appointment booking, and CRM updates using AI agents, voice AI, WhatsApp, and integrations.\n\n"
+        f"{payload.context.strip()}\n\nIf improving this process is relevant for {company}, I would be happy to share a practical approach.\n\n"
+        "Best,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/"
+    )).replace("\n\n\n", "\n\n")
+    now = datetime.utcnow()
+    data = {
+        "company_name": company,
+        "recipient_email": recipient,
+        "website": payload.website.strip(),
+        "company_context": payload.context.strip(),
+        "campaign_name": payload.campaign_name.strip() or "USA AI automation outreach",
+        "template_id": str(template.get("id")) if template else "",
+        "template_name": str(template.get("name")) if template else "Default automation outreach",
+        "subject": subject,
+        "body": body,
+        "status": "pending_approval",
+        "source": "manual_campaign_draft",
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = mongo_client.email_outbox.insert_one(data)
+    data["_id"] = result.inserted_id
+    _audit("create", "email_draft", after=_serialize(data))
+    return {"success": True, "data": _serialize(data)}
+
+
+@router.put("/email-outbox/{draft_id}/decision")
+async def decide_email_draft(draft_id: str, payload: ValuePayload):
+    _require_db()
+    if not ObjectId.is_valid(draft_id):
+        raise HTTPException(status_code=400, detail="Invalid draft id")
+    draft = mongo_client.email_outbox.find_one({"_id": ObjectId(draft_id)})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Email draft not found")
+    decision = str(payload.value.get("decision", "")).strip().lower()
+    if decision in {"exclude", "reject", "skip"}:
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "excluded", "updated_at": datetime.utcnow()}})
+        return {"success": True, "data": {"status": "excluded", "id": draft_id}}
+    if decision != "approve":
+        raise HTTPException(status_code=400, detail="Decision must be approve or exclude")
+    policy = get_email_policy()
+    if not approval_window_open(policy):
+        raise HTTPException(status_code=409, detail="Approval window is closed in IST. The draft remains queued.")
+    if not gmail_service.configured:
+        raise HTTPException(status_code=409, detail="Gmail is not configured")
+    if not brain_service.tools().get("send_gmail_email", False):
+        raise HTTPException(status_code=409, detail="The Gmail tool is disabled")
+    try:
+        result = gmail_service.send([draft.get("recipient_email", "")], draft.get("subject", ""), draft.get("body", ""))
+        status = result.get("status")
+        if status != "sent":
+            raise HTTPException(status_code=409, detail=result.get("reason", "Email was not sent"))
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": datetime.utcnow(), "updated_at": datetime.utcnow(), "delivery": result}})
+        _audit("send", "email_draft", after={"id": draft_id, "status": "sent"})
+        return {"success": True, "data": {"status": "sent", "id": draft_id}}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": str(exc), "updated_at": datetime.utcnow()}})
+        raise HTTPException(status_code=502, detail="Gmail delivery failed") from exc
 
 
 @router.put("/tools")

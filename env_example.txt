@@ -72,6 +72,13 @@ SMTP_PASSWORD=
 SMTP_FROM=
 SMTP_USE_TLS=true
 
+# Gmail email automations (use a Google App Password, never your normal password)
+GMAIL_ADDRESS=
+GMAIL_APP_PASSWORD=
+GMAIL_SMTP_HOST=smtp.gmail.com
+GMAIL_SMTP_PORT=587
+GMAIL_SMTP_SSL=false
+
 # Twilio Voice
 TWILIO_ACCOUNT_SID=ACxxxxxxxx
 TWILIO_AUTH_TOKEN=your_twilio_auth_token

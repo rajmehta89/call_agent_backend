@@ -258,16 +258,22 @@ class DynamicQA:
 
     def should_transfer_to_agent(self, user_input: str) -> bool:
         """Check if user wants to talk to an agent"""
-        user_input = user_input.lower()
-        
-        transfer_keywords = [
-            "agent", "human", "person", "representative", 
-            "talk to someone", "speak to agent", "connect agent",
-            "real person", "customer service", "help me",
-            "not satisfied", "complaint", "issue"
-        ]
-        
-        return any(keyword in user_input for keyword in transfer_keywords)
+        text = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+        if not text:
+            return False
+
+        # Only transfer when the caller explicitly asks for a person/team.
+        # Generic requests such as "how can you help me?" must stay with the AI.
+        direct_request = re.search(
+            r"\b(?:human|real person|live person|representative|supervisor|manager)\b",
+            text,
+        )
+        directed_request = re.search(
+            r"\b(?:speak|talk|connect|transfer|put me|let me speak|want|need|would like)\b"
+            r"[^?.!]{0,40}\b(?:agent|human|person|representative|someone|supervisor|manager|sales team|support team)\b",
+            text,
+        )
+        return bool(direct_request or directed_request)
 
     def analyze_transfer_intent(self, user_input: str, conversation_history=None) -> Dict[str, Any]:
         """Return the structured handoff decision expected by the voice channel."""

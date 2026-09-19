@@ -83,7 +83,9 @@ def render_response(raw: Any, channel: str = "whatsapp") -> RenderedResponse:
         if actions:
             labels = ", ".join(item["label"] for item in actions)
             parts.append(f"You can say {labels} if you would like to continue")
-        text = ". ".join(part.strip(" .") for part in parts if part.strip()).strip() + "."
+        text = ". ".join(part.strip(" .") for part in parts if part.strip()).strip()
+        if text and text[-1] not in ".!?":
+            text += "."
         text = re.sub(r"\s+", " ", text)
     else:
         blocks = [part for part in (title, message) if part]

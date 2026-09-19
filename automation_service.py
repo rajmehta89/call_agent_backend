@@ -90,6 +90,8 @@ class AutomationService:
             return self._update_lead(context, step)
         if normalized in {"send whatsapp", "send whatsapp message", "send_whatsapp_message"}:
             return self._send_whatsapp(context, step, event)
+        if normalized in {"send gmail email", "send email", "send_gmail_email"}:
+            return self._send_gmail_email(context, step, event)
         if normalized in {"human handoff", "human_handoff"}:
             return self._handoff(context)
         raise ValueError(f"Unsupported automation action: {action}")
@@ -145,6 +147,60 @@ class AutomationService:
         if event == "new_lead":
             return "Thanks for reaching out. Our team will follow up shortly."
         return "Thanks for your message. Our team will get back to you shortly."
+
+    @staticmethod
+    def _template(value: Any, context: Dict[str, Any]) -> str:
+        text = str(value or "")
+        for key in ("name", "customer_name", "email", "company", "message", "status"):
+            replacement = context.get(key) or context.get("customer_" + key) or ""
+            text = text.replace("{{" + key + "}}", str(replacement))
+        return text
+
+    def _send_gmail_email(self, context: Dict[str, Any], step: Dict[str, Any], event: str) -> Dict[str, Any]:
+        from brain_service import brain_service
+        from email_policy import approval_window_open, get_email_policy, send_window_open
+        from email_templates import get_email_templates, render_email_template
+        from gmail_service import gmail_service
+
+        if not brain_service.tools().get("send_gmail_email", False):
+            return {"action": "send_gmail_email", "status": "skipped", "reason": "Gmail tool is disabled"}
+        recipient = self._template(step.get("to") or context.get("email"), context).strip()
+        selected_template = None
+        requested_template_id = str(step.get("template_id") or "").strip()
+        if requested_template_id:
+            selected_template = next((item for item in get_email_templates() if str(item.get("id")) == requested_template_id), None)
+        if not selected_template:
+            selected_template = next((item for item in get_email_templates() if item.get("active", True)), None)
+        rendered_template = render_email_template(selected_template, context) if selected_template else {}
+        subject = self._template(step.get("subject") or rendered_template.get("subject") or "Follow-up from Raj's team", context)
+        body = self._template(step.get("body") or step.get("message") or rendered_template.get("body") or self._default_email(event), context)
+        policy = get_email_policy()
+        if policy.get("approval_required") or not send_window_open(policy):
+            status = "pending_approval" if policy.get("approval_required") else "scheduled"
+            now = datetime.utcnow()
+            row = {
+                "company_name": context.get("company") or context.get("customer_name") or "Unknown company",
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": body,
+                "template_id": str(selected_template.get("id")) if selected_template else "",
+                "template_name": str(selected_template.get("name")) if selected_template else "Automatic outreach template",
+                "status": status,
+                "source": "automation",
+                "event": event,
+                "approval_window_open": approval_window_open(policy),
+                "created_at": now,
+                "updated_at": now,
+            }
+            result = mongo_client.email_outbox.insert_one(row)
+            return {"action": "send_gmail_email", "status": "queued", "queue_status": status, "outbox_id": str(result.inserted_id)}
+        result = gmail_service.send([recipient], subject, body)
+        return {"action": "send_gmail_email", **result}
+
+    def _default_email(self, event: str) -> str:
+        if event == "new_lead":
+            return "Hi {{name}},\n\nThanks for reaching out. I would be happy to learn about your current process and suggest an AI automation approach.\n\nBest,\nRaj's team"
+        return "Hi {{name}},\n\nThanks for the conversation. Raj's team will follow up shortly with the next step.\n\nBest,\nRaj's team"
 
     def _handoff(self, context: Dict[str, Any]) -> Dict[str, Any]:
         phone = str(context.get("customer_phone") or context.get("phone") or "").strip()

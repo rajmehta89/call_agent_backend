@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from agent_config import agent_config
 from brain_service import brain_service
 from mongo_client import mongo_client
+from gmail_service import gmail_service
 
 
 router = APIRouter(prefix="/api/omnichannel", tags=["omnichannel"])
@@ -106,6 +107,10 @@ async def omnichannel_summary():
                 "openai_ready": openai_ready,
                 "enabled": openai_ready,
                 "brain_index": brain_index,
+            },
+            "email": {
+                "gmail_connected": gmail_service.configured,
+                "gmail_address": gmail_service.address,
             },
             "operations": {
                 "human_handoff_enabled": bool(human_transfer.get("enabled", True)),
