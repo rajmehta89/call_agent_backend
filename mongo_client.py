@@ -123,6 +123,12 @@ class MongoDBClient:
                 unique=True,
                 sparse=True,
             )
+            self.email_outbox.create_index(
+                [("company_key", 1)],
+                name="email_outbox_company_unique_v1",
+                unique=True,
+                sparse=True,
+            )
             self.campaign_prospects.create_index("dedupe_key", unique=True, sparse=True)
             self.campaign_prospects.create_index(
                 [("email_key", 1)],

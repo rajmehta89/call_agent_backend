@@ -573,6 +573,7 @@ async def create_email_draft(payload: EmailDraftPayload):
     now = datetime.utcnow()
     data = {
         "company_name": company,
+        "company_key": f"manual:{company.lower()}|{payload.website.strip().lower()}",
         "recipient_email": recipient,
         "website": payload.website.strip(),
         "company_context": payload.context.strip(),

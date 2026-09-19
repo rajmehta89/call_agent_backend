@@ -19,7 +19,7 @@ from mongo_client import mongo_client
 
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-IGNORED_EMAIL_HOSTS = {"example.com", "sentry.io", "wixpress.com", "wordpress.com"}
+IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "domain.com", "sentry.io", "wixpress.com", "wordpress.com"}
 
 
 def discovery_status() -> Dict[str, Any]:
@@ -84,7 +84,8 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
     email = str(prospect.get("email", "")).strip().lower()
     if not email:
         return ""
-    existing = mongo_client.email_outbox.find_one({"recipient_email": email})
+    company_key = str(prospect.get("dedupe_key") or prospect.get("website") or prospect.get("company_name", "")).strip().lower()
+    existing = mongo_client.email_outbox.find_one({"$or": [{"recipient_email": email}, {"company_key": company_key}]})
     if existing:
         return ""
     templates = get_email_templates()
@@ -104,6 +105,7 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
     now = datetime.utcnow()
     row = {
         "company_name": prospect["company_name"],
+        "company_key": company_key,
         "recipient_email": email,
         "website": prospect.get("website", ""),
         "company_context": context,
