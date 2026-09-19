@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, Field
 
 from agent_config import agent_config
@@ -538,7 +539,7 @@ async def notify_email_outbox(payload: ValuePayload):
 async def create_email_draft(payload: EmailDraftPayload):
     _require_db()
     company = payload.company_name.strip()
-    recipient = payload.recipient_email.strip()
+    recipient = payload.recipient_email.strip().lower()
     if not company or "@" not in recipient:
         raise HTTPException(status_code=400, detail="Company name and a valid recipient email are required")
     available_templates = get_email_templates()
@@ -585,7 +586,10 @@ async def create_email_draft(payload: EmailDraftPayload):
         "created_at": now,
         "updated_at": now,
     }
-    result = mongo_client.email_outbox.insert_one(data)
+    try:
+        result = mongo_client.email_outbox.insert_one(data)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="This recipient already has an outreach record and will not be mailed again") from exc
     data["_id"] = result.inserted_id
     if not approval_needed:
         process_email_outbox([str(result.inserted_id)], limit=1)

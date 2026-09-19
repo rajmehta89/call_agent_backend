@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pymongo.errors import DuplicateKeyError
 
 from email_policy import approval_window_open, get_email_policy
 from email_templates import get_email_templates, render_email_template
@@ -79,12 +80,12 @@ def _make_context(place: Dict[str, Any], website: str) -> str:
 
 
 def _create_draft(prospect: Dict[str, Any], context: str) -> str:
-    email = prospect.get("email", "")
+    email = str(prospect.get("email", "")).strip().lower()
     if not email:
         return ""
-    existing = mongo_client.email_outbox.find_one({"recipient_email": email, "status": {"$nin": ["excluded", "error"]}})
+    existing = mongo_client.email_outbox.find_one({"recipient_email": email})
     if existing:
-        return str(existing.get("_id"))
+        return ""
     templates = get_email_templates()
     template = next((item for item in templates if item.get("active", True)), None)
     if not template:
@@ -108,11 +109,14 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
         "created_at": now,
         "updated_at": now,
     }
-    result = mongo_client.email_outbox.insert_one(row)
-    return str(result.inserted_id)
+    try:
+        result = mongo_client.email_outbox.insert_one(row)
+        return str(result.inserted_id)
+    except DuplicateKeyError:
+        return ""
 
 
-def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True) -> Dict[str, Any]:
+def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True, target_drafts: int | None = None) -> Dict[str, Any]:
     api_key = (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("Google Places is not configured. Add GOOGLE_PLACES_API_KEY to the backend environment.")
@@ -123,40 +127,45 @@ def discover_prospects(query: str, location: str = "United States", max_results:
     if not query:
         raise ValueError("Enter a business type or search query")
     max_results = max(1, min(20, int(max_results)))
+    target_drafts = max_results if target_drafts is None else max(1, min(60, int(target_drafts)))
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.primaryType,places.googleMapsUri,places.businessStatus",
     }
     body = {"textQuery": f"{query} in {location}", "pageSize": max_results, "languageCode": "en"}
-    response = None
-    for attempt in range(1, 4):
-        try:
-            response = requests.post(PLACES_URL, headers=headers, json=body, timeout=(5, 15))
-            if response.status_code < 500 or attempt == 3:
-                break
-        except requests.RequestException:
-            if attempt == 3:
-                raise
-        time.sleep(attempt)
-    if response.status_code >= 400:
-        raise RuntimeError(f"Google Places request failed ({response.status_code}): {response.text[:300]}")
-    places = response.json().get("places", [])
     found = ready = drafts = 0
     results: List[Dict[str, Any]] = []
     now = datetime.utcnow()
-    websites = [str(place.get("websiteUri") or "").strip() for place in places]
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(websites)))) as executor:
-        emails = list(executor.map(_website_email, websites))
-    for place, email in zip(places, emails):
-        company_name = _place_name(place)
-        website = str(place.get("websiteUri") or "").strip()
-        dedupe_key = str(place.get("id") or website or company_name.lower())
-        context = _make_context(place, website)
-        prospect = {
+    next_page_token = ""
+    for page_number in range(1, 4):
+        request_body = {**body, **({"pageToken": next_page_token} if next_page_token else {})}
+        response = None
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(PLACES_URL, headers=headers, json=request_body, timeout=(5, 15))
+                if response.status_code < 500 or attempt == 3:
+                    break
+            except requests.RequestException:
+                if attempt == 3:
+                    raise
+            time.sleep(attempt)
+        if response.status_code >= 400:
+            raise RuntimeError(f"Google Places request failed ({response.status_code}): {response.text[:300]}")
+        places = response.json().get("places", [])
+        websites = [str(place.get("websiteUri") or "").strip() for place in places]
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(websites)))) as executor:
+            emails = list(executor.map(_website_email, websites))
+        for place, email in zip(places, emails):
+            company_name = _place_name(place)
+            website = str(place.get("websiteUri") or "").strip()
+            dedupe_key = str(place.get("id") or website or company_name.lower())
+            context = _make_context(place, website)
+            prospect = {
             "dedupe_key": dedupe_key,
             "company_name": company_name,
             "email": email,
+            "email_key": email or None,
             "website": website,
             "address": place.get("formattedAddress", ""),
             "phone": place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber", ""),
@@ -169,17 +178,25 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "status": "ready" if email else "missing_email",
             "created_at": now,
             "updated_at": now,
-        }
-        prospect_update = dict(prospect)
-        prospect_update.pop("created_at", None)
-        mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, {"$set": prospect_update, "$setOnInsert": {"created_at": now}}, upsert=True)
-        found += 1
-        if email:
-            ready += 1
-        draft_id = _create_draft(prospect, context) if create_drafts and email else ""
-        if draft_id:
-            drafts += 1
-        results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
+            }
+            prospect_update = dict(prospect)
+            prospect_update.pop("created_at", None)
+            mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, {"$set": prospect_update, "$setOnInsert": {"created_at": now}}, upsert=True)
+            found += 1
+            if email:
+                ready += 1
+            draft_id = _create_draft(prospect, context) if create_drafts and email else ""
+            if draft_id:
+                drafts += 1
+            results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
+            if not create_drafts or drafts >= target_drafts:
+                break
+        if not create_drafts or drafts >= target_drafts:
+            break
+        next_page_token = response.json().get("nextPageToken") or ""
+        if not next_page_token or not places:
+            break
+        time.sleep(1)
     run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed"}
     mongo_client.discovery_runs.insert_one(dict(run))
     run["results"] = results

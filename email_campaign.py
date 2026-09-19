@@ -1,5 +1,6 @@
 """Campaign controls, queue processing, approval behavior, and rate limiting."""
 
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,9 @@ DEFAULT_EMAIL_CAMPAIGN: Dict[str, Any] = {
     "status": "stopped",
     "max_emails": 20,
     "interval_minutes": 60,
+    "discovery_enabled": True,
+    "discovery_query": "AI automation for home services",
+    "discovery_location": "United States",
 }
 
 
@@ -27,6 +31,9 @@ def get_email_campaign() -> Dict[str, Any]:
         value["status"] = "stopped"
     value["max_emails"] = max(1, min(10000, int(value.get("max_emails", 20))))
     value["interval_minutes"] = max(1, min(10080, int(value.get("interval_minutes", 60))))
+    value["discovery_enabled"] = bool(value.get("discovery_enabled", True))
+    value["discovery_query"] = str(value.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]).strip()
+    value["discovery_location"] = str(value.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]).strip()
     return value
 
 
@@ -37,6 +44,9 @@ def save_email_campaign(value: Dict[str, Any]) -> Dict[str, Any]:
         campaign["status"] = "stopped"
     campaign["max_emails"] = max(1, min(10000, int(campaign.get("max_emails", 20))))
     campaign["interval_minutes"] = max(1, min(10080, int(campaign.get("interval_minutes", 60))))
+    campaign["discovery_enabled"] = bool(campaign.get("discovery_enabled", True))
+    campaign["discovery_query"] = str(campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]).strip()
+    campaign["discovery_location"] = str(campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]).strip()
     if mongo_client.is_connected():
         mongo_client.platform_settings.update_one(
             {"key": "email_campaign"},
@@ -134,10 +144,83 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
     return {"processed": len(drafts), "sent": sent, "skipped_for_approval": skipped_for_approval, "status": "processed"}
 
 
+def _pending_campaign_candidates() -> int:
+    return mongo_client.email_outbox.count_documents({"status": {"$in": ["pending_approval", "scheduled", "approved", "sending"]}})
+
+
+def refill_campaign_candidates() -> Dict[str, Any]:
+    """Keep enough unique prospect drafts ready for the next rate window."""
+    if not mongo_client.is_connected():
+        return {"status": "database_unavailable", "needed": 0}
+    campaign = get_email_campaign()
+    if campaign["status"] != "running" or not campaign.get("discovery_enabled"):
+        return {"status": "disabled", "needed": 0}
+    if not (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+        return {"status": "provider_unconfigured", "needed": 0}
+    rate_remaining = max(0, int(campaign["max_emails"]) - _rate_count(campaign))
+    queued = _pending_campaign_candidates()
+    needed = max(0, rate_remaining - queued)
+    if needed == 0:
+        return {"status": "buffer_ready", "needed": 0, "queued": queued}
+
+    query = campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]
+    location = campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]
+    recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
+    recent = mongo_client.discovery_runs.find_one({"query": query, "location": location, "created_at": {"$gte": recent_cutoff}}, sort=[("created_at", -1)])
+    if recent:
+        return {"status": "cooldown", "needed": needed, "queued": queued}
+
+    from prospect_discovery import discover_prospects
+    result = discover_prospects(query, location, min(20, max(1, needed)), True, target_drafts=needed)
+    return {"status": "refilled", "needed": needed, "queued": queued, "result": result}
+
+
+def notify_pending_approval_digest() -> Dict[str, Any]:
+    """Automatically email Raj when new drafts need review; never sends to prospects."""
+    if not mongo_client.is_connected():
+        return {"status": "database_unavailable", "count": 0}
+    from gmail_service import gmail_service
+    if not gmail_service.configured:
+        return {"status": "gmail_unconfigured", "count": 0}
+    drafts = list(mongo_client.email_outbox.find({"status": "pending_approval"}).sort("created_at", 1).limit(50))
+    drafts = [draft for draft in drafts if not draft.get("approval_notified_at") or draft.get("approval_notified_at") < draft.get("updated_at", draft.get("created_at"))]
+    if not drafts:
+        return {"status": "no_new_approvals", "count": 0}
+    owner_email = (os.getenv("GMAIL_APPROVAL_EMAIL") or gmail_service.address).strip()
+    app_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
+    lines = [
+        "Hi Raj,",
+        "",
+        f"The AI outreach campaign prepared {len(drafts)} new prospect email(s) for your review.",
+        f"Open the Campaigns workspace: {app_url}/campaigns",
+        "",
+        "Approve & send only the messages you want. Exclude anything you do not want mailed.",
+        "Nothing in this review email contacts a prospect.",
+        "",
+    ]
+    for index, draft in enumerate(drafts, 1):
+        lines.extend([
+            f"{index}. {draft.get('company_name', 'Unknown company')} <{draft.get('recipient_email', '')}>",
+            f"Subject: {draft.get('subject', '')}",
+            f"Context: {draft.get('company_context', '') or 'No company context supplied'}",
+            f"Review: {app_url}/campaigns?draft_id={draft.get('_id')}",
+            "",
+        ])
+    lines.extend(["Raj Mehta", "AI Automation Developer", "https://buildwithraj.com/"])
+    result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
+    if result.get("status") != "sent":
+        return {"status": "error", "count": len(drafts), "reason": result.get("reason", "Digest was not sent")}
+    now = datetime.utcnow()
+    mongo_client.email_outbox.update_many({"_id": {"$in": [draft["_id"] for draft in drafts]}}, {"$set": {"approval_notified_at": now, "updated_at": now}})
+    return {"status": "sent", "count": len(drafts), "recipient": owner_email}
+
+
 async def email_campaign_worker() -> None:
     import asyncio
     while True:
         try:
+            refill_campaign_candidates()
+            notify_pending_approval_digest()
             process_email_outbox()
         except Exception:
             pass
