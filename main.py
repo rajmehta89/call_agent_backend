@@ -6,6 +6,7 @@ Combines all backend services into one FastAPI application
 
 import os
 import sys
+import asyncio
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,19 @@ app = FastAPI(
     description="Combined backend services for AI Agent application",
     version="1.0.0"
 )
+
+
+@app.on_event("startup")
+async def start_email_campaign_worker() -> None:
+    from email_campaign import email_campaign_worker
+    app.state.email_campaign_task = asyncio.create_task(email_campaign_worker())
+
+
+@app.on_event("shutdown")
+async def stop_email_campaign_worker() -> None:
+    task = getattr(app.state, "email_campaign_task", None)
+    if task:
+        task.cancel()
 
 # Add CORS middleware
 app.add_middleware(

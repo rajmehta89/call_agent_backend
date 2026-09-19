@@ -158,9 +158,9 @@ class AutomationService:
 
     def _send_gmail_email(self, context: Dict[str, Any], step: Dict[str, Any], event: str) -> Dict[str, Any]:
         from brain_service import brain_service
-        from email_policy import approval_window_open, get_email_policy, send_window_open
+        from email_campaign import process_email_outbox
+        from email_policy import approval_window_open, get_email_policy
         from email_templates import get_email_templates, render_email_template
-        from gmail_service import gmail_service
 
         if not brain_service.tools().get("send_gmail_email", False):
             return {"action": "send_gmail_email", "status": "skipped", "reason": "Gmail tool is disabled"}
@@ -175,27 +175,31 @@ class AutomationService:
         subject = self._template(step.get("subject") or rendered_template.get("subject") or "Follow-up from Raj's team", context)
         body = self._template(step.get("body") or step.get("message") or rendered_template.get("body") or self._default_email(event), context)
         policy = get_email_policy()
-        if policy.get("approval_required") or not send_window_open(policy):
-            status = "pending_approval" if policy.get("approval_required") else "scheduled"
-            now = datetime.utcnow()
-            row = {
-                "company_name": context.get("company") or context.get("customer_name") or "Unknown company",
-                "recipient_email": recipient,
-                "subject": subject,
-                "body": body,
-                "template_id": str(selected_template.get("id")) if selected_template else "",
-                "template_name": str(selected_template.get("name")) if selected_template else "Automatic outreach template",
-                "status": status,
-                "source": "automation",
-                "event": event,
-                "approval_window_open": approval_window_open(policy),
-                "created_at": now,
-                "updated_at": now,
-            }
-            result = mongo_client.email_outbox.insert_one(row)
-            return {"action": "send_gmail_email", "status": "queued", "queue_status": status, "outbox_id": str(result.inserted_id)}
-        result = gmail_service.send([recipient], subject, body)
-        return {"action": "send_gmail_email", **result}
+        approval_needed = bool(policy.get("approval_required")) and approval_window_open(policy)
+        status = "pending_approval" if approval_needed else "scheduled"
+        now = datetime.utcnow()
+        row = {
+            "company_name": context.get("company") or context.get("customer_name") or "Unknown company",
+            "company_context": context.get("company_context") or context.get("message", ""),
+            "website": context.get("website", ""),
+            "recipient_email": recipient,
+            "subject": subject,
+            "body": body,
+            "template_id": str(selected_template.get("id")) if selected_template else "",
+            "template_name": str(selected_template.get("name")) if selected_template else "Automatic outreach template",
+            "status": status,
+            "source": "automation",
+            "event": event,
+            "approval_window_open": approval_window_open(policy),
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = mongo_client.email_outbox.insert_one(row)
+        if not approval_needed:
+            process_result = process_email_outbox([str(result.inserted_id)], limit=1)
+            if process_result.get("sent"):
+                return {"action": "send_gmail_email", "status": "sent", "outbox_id": str(result.inserted_id)}
+        return {"action": "send_gmail_email", "status": "queued", "queue_status": status, "outbox_id": str(result.inserted_id)}
 
     def _default_email(self, event: str) -> str:
         if event == "new_lead":

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from agent_config import agent_config
 from brain_service import DEFAULT_TOOLS, brain_service
 from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitation_hash, require_permission, require_user, role_document
+from email_campaign import campaign_action, campaign_status, get_email_campaign, process_email_outbox, save_email_campaign
 from email_service import email_service
 from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
 from email_templates import add_email_template, get_email_templates
@@ -403,6 +404,29 @@ async def update_email_policy(payload: ValuePayload):
     return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
 
 
+@router.get("/email-campaign")
+async def get_email_campaign_route():
+    return {"success": True, "data": campaign_status()}
+
+
+@router.put("/email-campaign")
+async def update_email_campaign(payload: ValuePayload):
+    campaign = save_email_campaign(payload.value)
+    _audit("update", "email_campaign", after=campaign)
+    return {"success": True, "data": campaign_status()}
+
+
+@router.post("/email-campaign/action")
+async def email_campaign_action(payload: ValuePayload):
+    try:
+        campaign = campaign_action(str(payload.value.get("action", "")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    processed = process_email_outbox()
+    _audit("update", "email_campaign", after=campaign)
+    return {"success": True, "data": {**campaign_status(), "processed": processed}}
+
+
 @router.get("/email-templates")
 async def get_email_templates_route():
     return {"success": True, "data": get_email_templates()}
@@ -503,6 +527,8 @@ async def create_email_draft(payload: EmailDraftPayload):
         f"{payload.context.strip()}\n\nIf improving this process is relevant for {company}, I would be happy to share a practical approach.\n\n"
         "Best,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/"
     )).replace("\n\n\n", "\n\n")
+    policy = get_email_policy()
+    approval_needed = bool(policy.get("approval_required")) and approval_window_open(policy)
     now = datetime.utcnow()
     data = {
         "company_name": company,
@@ -514,13 +540,16 @@ async def create_email_draft(payload: EmailDraftPayload):
         "template_name": str(template.get("name")) if template else "Default automation outreach",
         "subject": subject,
         "body": body,
-        "status": "pending_approval",
+        "status": "pending_approval" if approval_needed else "scheduled",
         "source": "manual_campaign_draft",
         "created_at": now,
         "updated_at": now,
     }
     result = mongo_client.email_outbox.insert_one(data)
     data["_id"] = result.inserted_id
+    if not approval_needed:
+        process_email_outbox([str(result.inserted_id)], limit=1)
+        data = mongo_client.email_outbox.find_one({"_id": result.inserted_id}) or data
     _audit("create", "email_draft", after=_serialize(data))
     return {"success": True, "data": _serialize(data)}
 
@@ -539,26 +568,15 @@ async def decide_email_draft(draft_id: str, payload: ValuePayload):
         return {"success": True, "data": {"status": "excluded", "id": draft_id}}
     if decision != "approve":
         raise HTTPException(status_code=400, detail="Decision must be approve or exclude")
-    policy = get_email_policy()
-    if not approval_window_open(policy):
-        raise HTTPException(status_code=409, detail="Approval window is closed in IST. The draft remains queued.")
-    if not gmail_service.configured:
-        raise HTTPException(status_code=409, detail="Gmail is not configured")
-    if not brain_service.tools().get("send_gmail_email", False):
-        raise HTTPException(status_code=409, detail="The Gmail tool is disabled")
-    try:
-        result = gmail_service.send([draft.get("recipient_email", "")], draft.get("subject", ""), draft.get("body", ""))
-        status = result.get("status")
-        if status != "sent":
-            raise HTTPException(status_code=409, detail=result.get("reason", "Email was not sent"))
-        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": datetime.utcnow(), "updated_at": datetime.utcnow(), "delivery": result}})
+    if draft.get("status") in {"sent", "excluded"}:
+        raise HTTPException(status_code=409, detail="This draft has already been completed")
+    mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "approved", "approved_at": datetime.utcnow(), "updated_at": datetime.utcnow()}})
+    process_result = process_email_outbox([draft_id], limit=1)
+    updated = mongo_client.email_outbox.find_one({"_id": draft["_id"]}) or {}
+    status = updated.get("status", "approved")
+    if status == "sent":
         _audit("send", "email_draft", after={"id": draft_id, "status": "sent"})
-        return {"success": True, "data": {"status": "sent", "id": draft_id}}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": str(exc), "updated_at": datetime.utcnow()}})
-        raise HTTPException(status_code=502, detail="Gmail delivery failed") from exc
+    return {"success": True, "data": {"status": status, "id": draft_id, "processed": process_result}}
 
 
 @router.put("/tools")
