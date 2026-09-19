@@ -26,6 +26,12 @@ def discovery_status() -> Dict[str, Any]:
     last_run = None
     if mongo_client.is_connected():
         last_run = mongo_client.discovery_runs.find_one({}, sort=[("created_at", -1)])
+    if last_run:
+        last_run = {
+            key: value.isoformat() if isinstance(value, datetime) else str(value) if key == "_id" else value
+            for key, value in last_run.items()
+            if key != "_id"
+        }
     return {
         "provider": "google_places",
         "configured": bool(key),
@@ -175,6 +181,6 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             drafts += 1
         results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
     run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed"}
-    mongo_client.discovery_runs.insert_one(run)
+    mongo_client.discovery_runs.insert_one(dict(run))
     run["results"] = results
     return run
