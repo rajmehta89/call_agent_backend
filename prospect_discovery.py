@@ -123,7 +123,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "X-Goog-Api-Key": api_key,
             "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.primaryType,places.googleMapsUri,places.businessStatus",
         },
-        json={"textQuery": f"{query} in {location}", "maxResultCount": max_results, "languageCode": "en"},
+        json={"textQuery": f"{query} in {location}", "pageSize": max_results, "languageCode": "en"},
         timeout=30,
     )
     if response.status_code >= 400:
