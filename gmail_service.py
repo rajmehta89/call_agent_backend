@@ -19,7 +19,7 @@ class GmailService:
     @property
     def configured(self) -> bool:
         host = (os.getenv("GMAIL_SMTP_HOST") or os.getenv("SMTP_HOST") or "").strip().lower()
-        password = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("SMTP_PASSWORD")
+        password = (os.getenv("GMAIL_APP_PASSWORD") or os.getenv("SMTP_PASSWORD") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         return bool(self.address and password and host in {"smtp.gmail.com", "smtp.googlemail.com"})
 
     def status(self) -> dict:
@@ -56,7 +56,7 @@ class GmailService:
 
         host = (os.getenv("GMAIL_SMTP_HOST") or os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
         port = int(os.getenv("GMAIL_SMTP_PORT") or os.getenv("SMTP_PORT", "587"))
-        password = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("SMTP_PASSWORD")
+        password = (os.getenv("GMAIL_APP_PASSWORD") or os.getenv("SMTP_PASSWORD") or "").replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
         use_ssl = (os.getenv("GMAIL_SMTP_SSL") or "false").lower() in {"1", "true", "yes", "on"}
         if use_ssl or port == 465:
             with smtplib.SMTP_SSL(host, port, timeout=15) as server:
