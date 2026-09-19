@@ -1,8 +1,9 @@
 """Campaign controls, queue processing, approval behavior, and rate limiting."""
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 
@@ -14,6 +15,9 @@ DEFAULT_EMAIL_CAMPAIGN: Dict[str, Any] = {
     "status": "stopped",
     "max_emails": 20,
     "interval_minutes": 60,
+    # Keep headroom below the personal Gmail daily limit for owner notifications
+    # and normal mailbox use. The campaign stays running and resumes next day.
+    "daily_limit": 450,
     "discovery_enabled": True,
     "discovery_query": "AI automation for home services",
     "discovery_location": "United States",
@@ -48,6 +52,7 @@ def get_email_campaign() -> Dict[str, Any]:
         value["status"] = "stopped"
     value["max_emails"] = max(1, min(10000, int(value.get("max_emails", 20))))
     value["interval_minutes"] = max(1, min(10080, int(value.get("interval_minutes", 60))))
+    value["daily_limit"] = max(1, min(500, int(value.get("daily_limit", 450))))
     value["discovery_enabled"] = bool(value.get("discovery_enabled", True))
     value["discovery_query"] = str(value.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]).strip()
     value["discovery_location"] = str(value.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]).strip()
@@ -61,6 +66,7 @@ def save_email_campaign(value: Dict[str, Any]) -> Dict[str, Any]:
         campaign["status"] = "stopped"
     campaign["max_emails"] = max(1, min(10000, int(campaign.get("max_emails", 20))))
     campaign["interval_minutes"] = max(1, min(10080, int(campaign.get("interval_minutes", 60))))
+    campaign["daily_limit"] = max(1, min(500, int(campaign.get("daily_limit", 450))))
     campaign["discovery_enabled"] = bool(campaign.get("discovery_enabled", True))
     campaign["discovery_query"] = str(campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]).strip()
     campaign["discovery_location"] = str(campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]).strip()
@@ -91,17 +97,49 @@ def _rate_count(campaign: Dict[str, Any]) -> int:
     return mongo_client.email_outbox.count_documents({"status": "sent", "sent_at": {"$gte": cutoff}})
 
 
+def _campaign_timezone(policy: Dict[str, Any]):
+    timezone_name = str(policy.get("timezone") or "Asia/Kolkata")
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        if timezone_name in {"Asia/Kolkata", "Asia/Calcutta", "IST"}:
+            return timezone(timedelta(hours=5, minutes=30))
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _daily_window_start(policy: Dict[str, Any]) -> datetime:
+    """Return today's midnight in the configured campaign timezone as UTC-naive."""
+    campaign_timezone = _campaign_timezone(policy)
+    local_now = datetime.now(campaign_timezone)
+    local_midnight = datetime.combine(local_now.date(), time.min, tzinfo=campaign_timezone)
+    return local_midnight.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _next_daily_reset(policy: Dict[str, Any]) -> datetime:
+    return _daily_window_start(policy) + timedelta(days=1)
+
+
+def _daily_count(policy: Dict[str, Any]) -> int:
+    return mongo_client.email_outbox.count_documents({"status": "sent", "sent_at": {"$gte": _daily_window_start(policy)}})
+
+
 def campaign_status() -> Dict[str, Any]:
     campaign = get_email_campaign()
     policy = get_email_policy()
     used = _rate_count(campaign) if mongo_client.is_connected() else 0
+    daily_used = _daily_count(policy) if mongo_client.is_connected() else 0
+    daily_remaining = max(0, int(campaign["daily_limit"]) - daily_used)
     return {
         **campaign,
         "rate_used": used,
         "rate_remaining": max(0, int(campaign["max_emails"]) - used),
+        "daily_used": daily_used,
+        "daily_remaining": daily_remaining,
+        "daily_limit_reached": daily_remaining == 0,
+        "daily_reset_at": _next_daily_reset(policy).isoformat() + "Z",
         "approval_window_open": approval_window_open(policy),
         "send_window_open": send_window_open(policy),
-        "can_process": campaign["status"] == "running" and send_window_open(policy) and used < int(campaign["max_emails"]),
+        "can_process": campaign["status"] == "running" and send_window_open(policy) and used < int(campaign["max_emails"]) and daily_remaining > 0,
     }
 
 
@@ -139,6 +177,8 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
     policy = get_email_policy()
     if campaign["status"] != "running" or not send_window_open(policy):
         return {"processed": 0, "sent": 0, "status": "waiting", "campaign_status": campaign["status"]}
+    if _daily_count(policy) >= int(campaign["daily_limit"]):
+        return {"processed": 0, "sent": 0, "status": "daily_limit_reached", "daily_limit": campaign["daily_limit"]}
     query: Dict[str, Any] = {"status": {"$in": ["pending_approval", "scheduled", "approved"]}}
     if draft_ids:
         valid_ids = [ObjectId(item) for item in draft_ids if ObjectId.is_valid(str(item))]
@@ -151,6 +191,8 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
         if current_campaign["status"] != "running" or not send_window_open(policy):
             break
         if _rate_count(current_campaign) >= int(current_campaign["max_emails"]):
+            break
+        if _daily_count(policy) >= int(current_campaign["daily_limit"]):
             break
         if draft.get("status") == "pending_approval" and current_campaign and policy.get("approval_required") and approval_window_open(policy):
             skipped_for_approval += 1
@@ -184,8 +226,11 @@ def refill_campaign_candidates() -> Dict[str, Any]:
     if not (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY")):
         return {"status": "provider_unconfigured", "needed": 0}
     rate_remaining = max(0, int(campaign["max_emails"]) - _rate_count(campaign))
+    daily_remaining = max(0, int(campaign["daily_limit"]) - _daily_count(get_email_policy()))
+    if daily_remaining == 0:
+        return {"status": "daily_limit_reached", "needed": 0, "queued": _pending_campaign_candidates(), "daily_limit": campaign["daily_limit"]}
     queued = _pending_campaign_candidates()
-    needed = max(0, rate_remaining - queued)
+    needed = max(0, min(rate_remaining, daily_remaining) - queued)
     if needed == 0:
         return {"status": "buffer_ready", "needed": 0, "queued": queued}
 
