@@ -40,7 +40,10 @@ def save_email_policy(value: Dict[str, Any]) -> Dict[str, Any]:
             raw_time = f"{int(policy.get(f'{prefix}_hour', 9)):02d}:00"
         try:
             hour, minute = [int(part) for part in raw_time.split(":")]
-            if hour not in range(24) or minute not in range(60):
+            # 24:00 is a valid end-of-day sentinel for an always-open window.
+            # Start times remain limited to 00:00-23:59.
+            end_of_day = prefix.endswith("_end") and hour == 24 and minute == 0
+            if (hour not in range(24) and not end_of_day) or minute not in range(60):
                 raise ValueError
             policy[f"{prefix}_time"] = f"{hour:02d}:{minute:02d}"
             policy[f"{prefix}_hour"] = hour

@@ -225,12 +225,15 @@ def refill_campaign_candidates() -> Dict[str, Any]:
         return {"status": "disabled", "needed": 0}
     if not (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY")):
         return {"status": "provider_unconfigured", "needed": 0}
-    rate_remaining = max(0, int(campaign["max_emails"]) - _rate_count(campaign))
     daily_remaining = max(0, int(campaign["daily_limit"]) - _daily_count(get_email_policy()))
     if daily_remaining == 0:
         return {"status": "daily_limit_reached", "needed": 0, "queued": _pending_campaign_candidates(), "daily_limit": campaign["daily_limit"]}
     queued = _pending_campaign_candidates()
-    needed = max(0, min(rate_remaining, daily_remaining) - queued)
+    # Keep a complete next-batch buffer ready even when the current hourly
+    # sending window has already used some of its allowance. Sending itself
+    # remains protected by max_emails; discovery can prepare the next batch.
+    target_buffer = min(int(campaign["max_emails"]), daily_remaining)
+    needed = max(0, target_buffer - queued)
     if needed == 0:
         return {"status": "buffer_ready", "needed": 0, "queued": queued}
 

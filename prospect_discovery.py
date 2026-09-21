@@ -20,6 +20,15 @@ from mongo_client import mongo_client
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "domain.com", "sentry.io", "wixpress.com", "wordpress.com"}
+ASSET_EMAIL_EXTENSIONS = {"webp", "png", "jpg", "jpeg", "gif", "svg", "ico", "css", "js", "woff", "woff2"}
+
+
+def _valid_contact_email(email: str) -> bool:
+    if not email or "@" not in email:
+        return False
+    local, host = email.rsplit("@", 1)
+    labels = host.lower().split(".")
+    return bool(local and len(labels) >= 2 and all(labels) and len(labels[-1]) >= 2 and labels[-1] not in ASSET_EMAIL_EXTENSIONS)
 
 
 def discovery_status() -> Dict[str, Any]:
@@ -62,7 +71,7 @@ def _website_email(website: str) -> str:
                 email = candidate.strip(" <>.,;:\"'()[]").lower()
                 host = email.rsplit("@", 1)[-1]
                 ignored_host = host in IGNORED_EMAIL_HOSTS or any(host.endswith(f".{ignored}") for ignored in IGNORED_EMAIL_HOSTS)
-                if "@" in email and not ignored_host and not email.startswith(("noreply@", "no-reply@", "donotreply@")):
+                if _valid_contact_email(email) and not ignored_host and not email.startswith(("noreply@", "no-reply@", "donotreply@")):
                     return email
         except requests.RequestException:
             continue
@@ -82,7 +91,7 @@ def _make_context(place: Dict[str, Any], website: str) -> str:
 
 def _create_draft(prospect: Dict[str, Any], context: str) -> str:
     email = str(prospect.get("email", "")).strip().lower()
-    if not email:
+    if not _valid_contact_email(email):
         return ""
     company_key = str(prospect.get("dedupe_key") or prospect.get("website") or prospect.get("company_name", "")).strip().lower()
     existing = mongo_client.email_outbox.find_one({"$or": [{"recipient_email": email}, {"company_key": company_key}]})

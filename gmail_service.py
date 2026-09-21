@@ -7,6 +7,7 @@ connecting the integration; an enabled automation must explicitly invoke it.
 import os
 import smtplib
 import base64
+import socket
 import requests
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -14,6 +15,8 @@ from typing import Iterable
 
 
 class GmailService:
+    ASSET_EXTENSIONS = {"webp", "png", "jpg", "jpeg", "gif", "svg", "ico", "css", "js", "woff", "woff2"}
+
     @property
     def address(self) -> str:
         return (os.getenv("GMAIL_ADDRESS") or os.getenv("SMTP_USERNAME") or os.getenv("SMTP_FROM") or "").strip()
@@ -48,9 +51,41 @@ class GmailService:
         values = []
         for value in recipients:
             address = parseaddr(str(value or ""))[1].strip()
-            if address and "@" in address and address not in values:
+            if not address or "@" not in address:
+                continue
+            local, domain = address.rsplit("@", 1)
+            labels = domain.lower().split(".")
+            tld = labels[-1] if labels else ""
+            if not local or len(labels) < 2 or not all(labels) or len(tld) < 2 or tld in GmailService.ASSET_EXTENSIONS:
+                continue
+            if address not in values:
                 values.append(address)
         return values
+
+    @staticmethod
+    def _smtp_ipv4(host: str, port: int, timeout: int = 15) -> smtplib.SMTP:
+        """Connect over IPv4 and retain the hostname for STARTTLS SNI/cert checks."""
+        addresses = []
+        for item in socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM):
+            address = item[4][0]
+            if address not in addresses:
+                addresses.append(address)
+        last_error = None
+        for address in addresses:
+            server = smtplib.SMTP(timeout=timeout)
+            try:
+                server.connect(address, port)
+                server._host = host
+                return server
+            except OSError as exc:
+                last_error = exc
+                try:
+                    server.close()
+                except Exception:
+                    pass
+        if last_error:
+            raise last_error
+        raise OSError(f"Unable to resolve an IPv4 address for {host}")
 
     def send(self, recipients: Iterable[str], subject: str, body: str) -> dict:
         to = self._clean_recipients(recipients)
@@ -77,7 +112,7 @@ class GmailService:
                 server.login(self.address, password)
                 server.send_message(message)
         else:
-            with smtplib.SMTP(host, port, timeout=15) as server:
+            with self._smtp_ipv4(host, port) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
