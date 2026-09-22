@@ -1,6 +1,7 @@
 import csv
 import io
 import os
+import re
 import secrets
 from fastapi import BackgroundTasks
 from datetime import datetime, timedelta
@@ -23,6 +24,8 @@ from prospect_discovery import discover_prospects, discovery_status
 from gmail_service import gmail_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
+from ai_services import AIServices
+from campaign_registry import CAMPAIGN_TYPES, create_campaign, delete_campaign, get_campaigns, update_campaign
 
 
 router = APIRouter(prefix="/api/platform", tags=["platform"])
@@ -56,6 +59,8 @@ class EmailTemplatePayload(BaseModel):
     description: str = ""
     subject: str
     body: str
+    variables: List[str] = []
+    variable_descriptions: Dict[str, str] = {}
 
 
 class ProspectDiscoveryPayload(BaseModel):
@@ -427,6 +432,59 @@ async def get_email_campaign_route():
     return {"success": True, "data": campaign_status()}
 
 
+@router.get("/campaigns")
+async def get_campaign_registry_route():
+    return {"success": True, "data": {"campaigns": get_campaigns(), "types": CAMPAIGN_TYPES}}
+
+
+@router.post("/campaigns")
+async def create_campaign_route(payload: ValuePayload):
+    campaign = create_campaign(payload.value)
+    _audit("create", "campaign", after=campaign)
+    return {"success": True, "data": campaign}
+
+
+@router.put("/campaigns/{campaign_id}")
+async def update_campaign_route(campaign_id: str, payload: ValuePayload):
+    try:
+        campaign = update_campaign(campaign_id, payload.value)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit("update", "campaign", after=campaign)
+    return {"success": True, "data": campaign}
+
+
+@router.post("/campaigns/{campaign_id}/scrape")
+async def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
+    campaigns = get_campaigns()
+    campaign = next((item for item in campaigns if item["id"] == campaign_id), None)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    params = {**campaign.get("scrape", {}), **payload.value}
+    try:
+        result = discover_prospects(
+            str(params.get("query") or ""),
+            str(params.get("location") or "United States"),
+            int(params.get("max_results", 20)),
+            bool(params.get("create_drafts", True)),
+            campaign_name=campaign["name"],
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    updated = update_campaign(campaign_id, {"scrape": {"query": params.get("query", ""), "location": params.get("location", "United States"), "max_results": params.get("max_results", 20), "create_drafts": params.get("create_drafts", True)}, "last_scrape": result})
+    return {"success": True, "data": {"campaign": updated, "result": result}}
+
+
+@router.delete("/campaigns/{campaign_id}")
+async def delete_campaign_route(campaign_id: str):
+    try:
+        delete_campaign(campaign_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit("delete", "campaign", after={"id": campaign_id})
+    return {"success": True, "data": {"id": campaign_id}}
+
+
 @router.put("/email-campaign")
 async def update_email_campaign(payload: ValuePayload):
     campaign = save_email_campaign(payload.value)
@@ -457,6 +515,49 @@ async def create_email_template(payload: EmailTemplatePayload):
     template = add_email_template(payload.dict())
     _audit("create", "email_template", after=template)
     return {"success": True, "data": template}
+
+
+@router.post("/email-templates/review")
+async def review_email_template(payload: ValuePayload):
+    name = str(payload.value.get("name") or "Custom outreach template").strip()
+    subject = str(payload.value.get("subject") or "").strip()
+    body = str(payload.value.get("body") or "").strip()
+    if not subject or not body:
+        raise HTTPException(status_code=400, detail="Add a subject and body before reviewing")
+    prompt = (
+        "Review this user-created B2B outreach email template. Keep the user's intent and voice, "
+        "but make it concise, grounded, respectful, and ready for business-specific personalization. "
+        "Preserve or add these variables where useful: {{company_name}}, {{company_context}}, {{website}}. "
+        "Use the variable meanings supplied by the user to judge where each variable belongs. Do not invent company facts, results, services, or claims. Return JSON with keys subject, body, "
+        "and suggestions (an array of short strings).\n\n"
+        f"Template name: {name}\nVariable meanings: {payload.value.get('variable_descriptions') or {}}\nSubject: {subject}\nBody:\n{body}"
+    )
+    try:
+        services = AIServices()
+        if services.is_llm_configured():
+            result = services.chat_completion(
+                [{"role": "system", "content": "You review outreach templates and return valid JSON only."}, {"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.2,
+            )
+            import json
+            parsed = json.loads(str(result).strip().replace("```json", "").replace("```", ""))
+            return {"success": True, "data": {"subject": str(parsed.get("subject") or subject), "body": str(parsed.get("body") or body), "suggestions": parsed.get("suggestions") or []}}
+    except Exception:
+        pass
+    suggestions = []
+    import re
+    known_variables = {"company_name", "company_context", "website", "recipient_email", "name", "customer_name", "message", "status"}
+    custom_variables = sorted(set(re.findall(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", f"{subject}\n{body}")) - known_variables)
+    if custom_variables:
+        suggestions.append("Confirm values for custom variables before sending: " + ", ".join("{{" + item + "}}" for item in custom_variables) + ".")
+    if "{{company_name}}" not in subject and "{{company_name}}" not in body:
+        suggestions.append("Add {{company_name}} so every business receives a personalized message.")
+    if "{{company_context}}" not in body:
+        suggestions.append("Add {{company_context}} so the AI-generated business context can vary per prospect.")
+    if "{{website}}" not in body:
+        suggestions.append("Add {{website}} only when the prospect website is relevant to the message.")
+    return {"success": True, "data": {"subject": subject, "body": body, "suggestions": suggestions or ["The template is ready; review the personalized draft before sending."]}}
 
 
 @router.get("/prospects/discovery-status")
@@ -505,7 +606,7 @@ async def notify_email_outbox(payload: ValuePayload):
     if not gmail_service.configured:
         raise HTTPException(status_code=409, detail="Gmail is not configured")
     owner_email = (os.getenv("GMAIL_APPROVAL_EMAIL") or gmail_service.address).strip()
-    app_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
+    app_url = (os.getenv("PUBLIC_APP_URL") or "https://bussinessautomate.vercel.app").rstrip("/")
     lines = [
         "Hi Raj,",
         "",
@@ -563,6 +664,7 @@ async def create_email_draft(payload: EmailDraftPayload):
         rendered = value
         for key, replacement in replacements.items():
             rendered = rendered.replace("{{" + key + "}}", replacement)
+        rendered = re.sub(r"{{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*}}", "", rendered)
         return rendered.strip()
 
     subject = payload.subject.strip() or render(str(template.get("subject")) if template else f"A practical AI automation idea for {company}")
@@ -601,6 +703,35 @@ async def create_email_draft(payload: EmailDraftPayload):
         data = mongo_client.email_outbox.find_one({"_id": result.inserted_id}) or data
     _audit("create", "email_draft", after=_serialize(data))
     return {"success": True, "data": _serialize(data)}
+
+
+@router.post("/email-outbox/context-preview")
+async def generate_email_context(payload: ValuePayload):
+    company = str(payload.value.get("company_name") or "").strip()
+    website = str(payload.value.get("website") or "").strip()
+    notes = str(payload.value.get("context") or "").strip()
+    if not company:
+        raise HTTPException(status_code=400, detail="Add a company name before generating context")
+    prompt = (
+        "Create one concise, factual outreach context for a B2B AI automation email. "
+        "Use only the supplied company name, website, and notes. Do not invent facts, services, "
+        "results, or pain points. If evidence is limited, use cautious wording such as 'may'. "
+        "Return 1-2 natural sentences with one relevant automation angle, without a greeting or signature.\n\n"
+        f"Company: {company}\nWebsite: {website or 'not supplied'}\nNotes: {notes or 'not supplied'}"
+    )
+    try:
+        services = AIServices()
+        if services.is_llm_configured():
+            context = services.chat_completion(
+                [{"role": "system", "content": "You write grounded, concise B2B outreach context."}, {"role": "user", "content": prompt}],
+                max_tokens=120,
+                temperature=0.2,
+            )
+        else:
+            context = f"{company} may have an opportunity to make customer enquiries, lead qualification, or follow-up more consistent with a practical AI workflow."
+    except Exception:
+        context = f"{company} may have an opportunity to make customer enquiries, lead qualification, or follow-up more consistent with a practical AI workflow."
+    return {"success": True, "data": {"context": str(context).strip()}}
 
 
 @router.put("/email-outbox/{draft_id}/decision")

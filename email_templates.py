@@ -16,6 +16,7 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
         "body": "Hi,\n\nI noticed {{company_name}} and had one practical idea: a lightweight AI workflow could respond to new enquiries, qualify leads, and follow up automatically without changing your current team.\n\n{{company_context}}\n\nWould a short example be useful? If it is not relevant, no worries.\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
+        "variables": ["company_name", "company_context", "website"],
     },
     {
         "id": "voice-ai-appointment-intro",
@@ -25,6 +26,7 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
         "body": "Hi,\n\nI noticed {{company_name}} serves customers who may call or request an appointment. I build Voice AI that answers common questions, qualifies enquiries, books appointments, and updates the CRM.\n\n{{company_context}}\n\nWould a short example be useful?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
+        "variables": ["company_name", "company_context", "website"],
     },
     {
         "id": "follow-up-automation-intro",
@@ -34,6 +36,7 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
         "body": "Hi,\n\nA quick idea for {{company_name}}: automate new-lead follow-up so every enquiry gets a timely response and your CRM stays updated.\n\n{{company_context}}\n\nWorth sending a short outline?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/",
         "built_in": True,
         "active": True,
+        "variables": ["company_name", "company_context", "website"],
     },
 ]
 
@@ -77,6 +80,8 @@ def add_email_template(value: Dict[str, Any]) -> Dict[str, Any]:
         "body": str(value.get("body") or "Hi,\n\nI would like to share a practical automation idea for {{company_name}}.\n\nBest,\nRaj").strip(),
         "built_in": False,
         "active": True,
+        "variables": [str(item).strip().lower().replace(" ", "_") for item in (value.get("variables") or []) if str(item).strip()],
+        "variable_descriptions": {str(key): str(val).strip() for key, val in (value.get("variable_descriptions") or {}).items() if str(key).strip() and str(val).strip()},
     }
     templates = get_email_templates()
     templates.append(template)

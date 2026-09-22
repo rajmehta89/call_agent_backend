@@ -223,7 +223,7 @@ def refill_campaign_candidates() -> Dict[str, Any]:
     campaign = get_email_campaign()
     if campaign["status"] != "running" or not campaign.get("discovery_enabled"):
         return {"status": "disabled", "needed": 0}
-    if not (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+    if not (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY")):
         return {"status": "provider_unconfigured", "needed": 0}
     daily_remaining = max(0, int(campaign["daily_limit"]) - _daily_count(get_email_policy()))
     if daily_remaining == 0:
@@ -271,7 +271,7 @@ def notify_pending_approval_digest() -> Dict[str, Any]:
     if not drafts:
         return {"status": "no_new_approvals", "count": 0}
     owner_email = (os.getenv("GMAIL_APPROVAL_EMAIL") or gmail_service.address).strip()
-    app_url = (os.getenv("PUBLIC_APP_URL") or "http://localhost:3000").rstrip("/")
+    app_url = (os.getenv("PUBLIC_APP_URL") or "https://bussinessautomate.vercel.app").rstrip("/")
     lines = [
         "Hi Raj,",
         "",

@@ -23,6 +23,19 @@ IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "domain.co
 ASSET_EMAIL_EXTENSIONS = {"webp", "png", "jpg", "jpeg", "gif", "svg", "ico", "css", "js", "woff", "woff2"}
 
 
+def _google_places_key() -> str:
+    return (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
+
+def _clean_website(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(value if value.startswith("http") else f"https://{value}")
+    if not parsed.netloc:
+        return value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+
+
 def _valid_contact_email(email: str) -> bool:
     if not email or "@" not in email:
         return False
@@ -32,7 +45,7 @@ def _valid_contact_email(email: str) -> bool:
 
 
 def discovery_status() -> Dict[str, Any]:
-    key = (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    key = _google_places_key()
     last_run = None
     if mongo_client.is_connected():
         last_run = mongo_client.discovery_runs.find_one({}, sort=[("created_at", -1)])
@@ -45,6 +58,7 @@ def discovery_status() -> Dict[str, Any]:
     return {
         "provider": "google_places",
         "configured": bool(key),
+        "environment": "production" if (os.getenv("RENDER") or os.getenv("APP_ENV", "").lower() in {"prod", "production"}) else "local",
         "last_run": last_run or None,
         "description": "Find USA businesses with Google Places, then inspect their public websites for contact emails.",
     }
@@ -89,7 +103,7 @@ def _make_context(place: Dict[str, Any], website: str) -> str:
     return f"{_place_name(place)} appears to be a {type_name} based at {address}. Their public website is {website or 'not listed'}, so the first outreach should be validated before sending."
 
 
-def _create_draft(prospect: Dict[str, Any], context: str) -> str:
+def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "USA AI automation outreach") -> str:
     email = str(prospect.get("email", "")).strip().lower()
     if not _valid_contact_email(email):
         return ""
@@ -118,7 +132,7 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
         "recipient_email": email,
         "website": prospect.get("website", ""),
         "company_context": context,
-        "campaign_name": "USA AI automation outreach",
+        "campaign_name": campaign_name,
         "template_id": str(template.get("id", "")),
         "template_name": str(template.get("name", "Automatic outreach template")),
         "subject": rendered["subject"],
@@ -135,10 +149,10 @@ def _create_draft(prospect: Dict[str, Any], context: str) -> str:
         return ""
 
 
-def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True, target_drafts: int | None = None) -> Dict[str, Any]:
-    api_key = (os.getenv("GOOGLE_PLACES_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True, target_drafts: int | None = None, campaign_name: str = "USA AI automation outreach") -> Dict[str, Any]:
+    api_key = _google_places_key()
     if not api_key:
-        raise RuntimeError("Google Places is not configured. Add GOOGLE_PLACES_API_KEY to the backend environment.")
+        raise RuntimeError("Google Places discovery is unavailable in the current backend environment.")
     if not mongo_client.is_connected():
         raise RuntimeError("Database is not connected")
     query = query.strip()
@@ -177,7 +191,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             emails = list(executor.map(_website_email, websites))
         for place, email in zip(places, emails):
             company_name = _place_name(place)
-            website = str(place.get("websiteUri") or "").strip()
+            website = _clean_website(str(place.get("websiteUri") or "").strip())
             dedupe_key = str(place.get("id") or website or company_name.lower())
             context = _make_context(place, website)
             prospect = {
@@ -210,7 +224,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             found += 1
             if email:
                 ready += 1
-            draft_id = _create_draft(prospect, context) if create_drafts and email else ""
+            draft_id = _create_draft(prospect, context, campaign_name) if create_drafts and email else ""
             if draft_id:
                 drafts += 1
             results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
@@ -222,7 +236,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
         if not next_page_token or not places:
             break
         time.sleep(1)
-    run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed"}
+    run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed", "campaign_name": campaign_name}
     mongo_client.discovery_runs.insert_one(dict(run))
     run["results"] = results
     return run
