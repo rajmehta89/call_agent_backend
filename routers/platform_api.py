@@ -558,10 +558,12 @@ async def review_email_template(payload: ValuePayload):
     prompt = (
         "Rewrite this user-created B2B outreach email into a polished, ready-to-send template. "
         "Keep the user's offer and intent, but remove random wording, repetition, hype, vague claims, and awkward transitions. "
-        "Use a clear structure: natural greeting, brief sender introduction based on the approved AI Brain, one relevant business-specific observation, one practical offer, a low-pressure question, and a consistent Raj Mehta signature. "
+        "Use a clear structure: natural greeting, brief sender introduction based on the approved AI Brain, one specific relevance sentence, one practical offer, a natural next step, and a consistent Raj Mehta signature. "
+        "The relevance sentence must use only verified campaign or prospect signals and explain why the offer fits; do not repeat the prospect's address, website, category label, or research notes. "
+        "Do not use filler such as 'I thought this may be relevant', 'I noticed', 'Would a short example be useful?', 'if relevant', or 'may be useful'. Use direct, confident, human wording instead. "
         "Keep the subject specific and under 60 characters when possible. Keep the body concise (normally 90-160 words). "
-        "Preserve or add only useful variables: {{company_name}}, {{company_context}}, {{campaign_goal}}, {{website}}. "
-        "{{company_context}} must be the only prospect-fact area; never invent company facts, results, services, pricing, or credentials. "
+        "Preserve or add only useful variables: {{company_name}}, {{campaign_goal}}, {{website}}. Do not place {{company_context}} in the final email body; it is internal research used to write the relevance sentence. "
+        "Never invent company facts, results, services, pricing, availability, or credentials, and never expose AI Brain context, campaign instructions, or internal research. "
         "Use the variable meanings supplied by the user. Do not leave unresolved custom variables in the final result. "
         "Return JSON only with keys subject, body, and suggestions (an array of short strings).\n\n"
         "When campaign information is supplied, generate the template around that goal instead of writing a generic automation email. "
@@ -589,6 +591,12 @@ async def review_email_template(payload: ValuePayload):
         body = (f"Hi {{{{company_name}}}},\n\nI’m Raj Mehta, an AI Automation Developer. "
                 f"I’m reaching out because this campaign focuses on {campaign_goal or campaign_audience or 'a practical business improvement'}.\n\n"
                 "{{company_context}}\n\nWould a short example be useful?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/")
+    if not payload.value.get("body"):
+        body = ("Hi,\n\nI'm Raj Mehta, an AI Automation Developer. "
+                f"I help teams improve {campaign_goal or campaign_audience or 'customer and lead operations'} with practical AI automation.\n\n"
+                "For {{company_name}}, that could mean responding to enquiries faster, qualifying opportunities, and keeping follow-up consistent.\n\n"
+                "If this is a current priority, I can send a concise example of how it could work.\n\n"
+                "Best,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/")
     suggestions = []
     import re
     known_variables = {"company_name", "company_context", "campaign_goal", "shared_context", "website", "recipient_email", "name", "customer_name", "message", "status"}
@@ -597,8 +605,8 @@ async def review_email_template(payload: ValuePayload):
         suggestions.append("Confirm values for custom variables before sending: " + ", ".join("{{" + item + "}}" for item in custom_variables) + ".")
     if "{{company_name}}" not in subject and "{{company_name}}" not in body:
         suggestions.append("Add {{company_name}} so every business receives a personalized message.")
-    if "{{company_context}}" not in body:
-        suggestions.append("Add {{company_context}} so the AI-generated business context can vary per prospect.")
+    if "{{company_context}}" in body:
+        suggestions.append("Remove {{company_context}} from the email body; use it only as internal research for the relevance sentence.")
     if "{{campaign_goal}}" not in body:
         suggestions.append("Add {{campaign_goal}} only when the campaign objective should shape the message.")
     if "{{website}}" not in body:
