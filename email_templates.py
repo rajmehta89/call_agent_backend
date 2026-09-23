@@ -73,7 +73,14 @@ def _clean_template_text(template: Dict[str, Any]) -> Dict[str, Any]:
     cleaned = dict(template)
     for field in ("name", "description", "subject", "body"):
         if field in cleaned:
-            cleaned[field] = str(cleaned[field]).replace("â€™", "'").replace("�", "'").replace("â€“", "-").replace("â€”", "-")
+            cleaned[field] = (
+                str(cleaned[field])
+                .replace("â€™", "'")
+                .replace("â", "'")
+                .replace("�", "'")
+                .replace("â€“", "-")
+                .replace("â€”", "-")
+            )
     return cleaned
 
 
