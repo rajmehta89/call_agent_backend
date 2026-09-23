@@ -146,12 +146,25 @@ def campaign_status() -> Dict[str, Any]:
 
 def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     from brain_service import brain_service
+    from email_templates import normalize_draft_copy
     from gmail_service import gmail_service
 
     if not brain_service.tools().get("send_gmail_email", False):
         return {"status": "error", "reason": "The Gmail tool is disabled"}
     if not gmail_service.configured:
         return {"status": "error", "reason": "Gmail is not configured"}
+    safe_copy = normalize_draft_copy(draft)
+    if safe_copy["body"] != draft.get("body") or safe_copy["company_context"] != draft.get("company_context"):
+        mongo_client.email_outbox.update_one(
+            {"_id": draft["_id"]},
+            {"$set": {
+                "subject": safe_copy["subject"],
+                "body": safe_copy["body"],
+                "company_context": safe_copy["company_context"],
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        draft = {**draft, **safe_copy}
     claimed = mongo_client.email_outbox.find_one_and_update(
         {"_id": draft["_id"], "status": {"$in": ["pending_approval", "scheduled", "approved"]}},
         {"$set": {"status": "sending", "updated_at": datetime.utcnow()}},

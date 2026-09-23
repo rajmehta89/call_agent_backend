@@ -41,6 +41,13 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
     },
 ]
 
+INTERNAL_CONTEXT_MARKERS = (
+    "Campaign goal:",
+    "Why this lead was targeted:",
+    "Sender context:",
+    "Additional approved knowledge:",
+)
+
 
 def get_email_templates() -> List[Dict[str, Any]]:
     if mongo_client.is_connected():
@@ -121,6 +128,37 @@ def render_email_template(template: Dict[str, Any], context: Dict[str, Any]) -> 
         return re.sub(r"{{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*}}", "", result).strip()
 
     return {"subject": render(template.get("subject")), "body": render(template.get("body"))}
+
+
+def compact_prospect_context(value: Any) -> str:
+    """Keep verified prospect facts while removing internal generation context."""
+    text = str(value or "").strip()
+    positions = [text.find(marker) for marker in INTERNAL_CONTEXT_MARKERS if text.find(marker) >= 0]
+    if positions:
+        text = text[:min(positions)].rstrip()
+    return text or "I noticed there may be an opportunity to make this process faster and easier for your team."
+
+
+def normalize_draft_copy(draft: Dict[str, Any]) -> Dict[str, str]:
+    """Return safe copy for old drafts created before internal context was separated."""
+    context = compact_prospect_context(draft.get("company_context"))
+    body = str(draft.get("body") or "")
+    subject = str(draft.get("subject") or "")
+    contaminated = any(marker in body for marker in INTERNAL_CONTEXT_MARKERS)
+    if not contaminated:
+        return {"subject": subject, "body": body, "company_context": context}
+
+    template_id = str(draft.get("template_id") or "")
+    template = next((item for item in get_email_templates() if str(item.get("id")) == template_id and item.get("active", True)), None)
+    if not template:
+        return {"subject": subject, "body": body, "company_context": context}
+    rendered = render_email_template(template, {
+        "company_name": draft.get("company_name"),
+        "company_context": context,
+        "website": draft.get("website"),
+        "email": draft.get("recipient_email"),
+    })
+    return {"subject": rendered["subject"], "body": rendered["body"], "company_context": context}
 
 
 def unsupported_template_variables(template: Dict[str, Any], context: Dict[str, Any]) -> List[str]:

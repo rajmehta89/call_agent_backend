@@ -19,7 +19,7 @@ from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitat
 from email_campaign import campaign_action, campaign_status, get_email_campaign, process_email_outbox, save_email_campaign
 from email_service import email_service
 from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
-from email_templates import add_email_template, get_email_templates, unsupported_template_variables
+from email_templates import add_email_template, get_email_templates, normalize_draft_copy, unsupported_template_variables
 from prospect_discovery import discover_prospects, discovery_status, search_locations
 from gmail_service import gmail_service
 from mongo_client import mongo_client
@@ -642,6 +642,11 @@ async def get_email_outbox(status: str = ""):
     _require_db()
     query = {"status": status} if status.strip() else {}
     rows = list(mongo_client.email_outbox.find(query).sort("created_at", -1).limit(200))
+    for row in rows:
+        safe_copy = normalize_draft_copy(row)
+        row["subject"] = safe_copy["subject"]
+        row["body"] = safe_copy["body"]
+        row["company_context"] = safe_copy["company_context"]
     return {"success": True, "data": _serialize(rows)}
 
 
