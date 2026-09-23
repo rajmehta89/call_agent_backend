@@ -13,7 +13,8 @@ from bs4 import BeautifulSoup
 from pymongo.errors import DuplicateKeyError
 
 from email_policy import approval_window_open, get_email_policy
-from email_templates import get_email_templates, render_email_template
+from email_templates import get_email_templates, render_email_template, unsupported_template_variables
+from brain_service import brain_service
 from mongo_client import mongo_client
 
 
@@ -64,6 +65,30 @@ def discovery_status() -> Dict[str, Any]:
     }
 
 
+def search_locations(query: str, limit: int = 8) -> List[Dict[str, str]]:
+    """Return dynamic location suggestions from Google Places for campaign filters."""
+    api_key = _google_places_key()
+    query = str(query or "").strip()
+    if not api_key or not query:
+        return []
+    response = requests.post(
+        PLACES_URL,
+        headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key, "X-Goog-FieldMask": "places.displayName,places.formattedAddress"},
+        json={"textQuery": query, "pageSize": max(1, min(10, int(limit))), "languageCode": "en"},
+        timeout=(5, 10),
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Google Places location search failed ({response.status_code})")
+    suggestions = []
+    for place in response.json().get("places", []):
+        name = str((place.get("displayName") or {}).get("text") or "").strip()
+        address = str(place.get("formattedAddress") or "").strip()
+        value = address or name
+        if value and value not in {item["value"] for item in suggestions}:
+            suggestions.append({"value": value, "label": f"{name} — {address}" if name and address and name not in address else value})
+    return suggestions
+
+
 def _website_email(website: str) -> str:
     if not website:
         return ""
@@ -97,13 +122,47 @@ def _place_name(place: Dict[str, Any]) -> str:
     return str(display.get("text") or place.get("name") or "Unknown business").strip()
 
 
-def _make_context(place: Dict[str, Any], website: str) -> str:
+def _make_context(place: Dict[str, Any], website: str, campaign_goal: str = "", shared_context: str = "", scrape_intent: str = "") -> str:
     type_name = str(place.get("primaryType") or "local business").replace("_", " ")
     address = str(place.get("formattedAddress") or "a US market").strip()
-    return f"{_place_name(place)} appears to be a {type_name} based at {address}. Their public website is {website or 'not listed'}, so the first outreach should be validated before sending."
+    factual = f"{_place_name(place)} appears to be a {type_name} based at {address}. Their public website is {website or 'not listed'}, so the first outreach should be validated before sending."
+    parts = [factual]
+    if campaign_goal.strip():
+        parts.append(f"Campaign goal: {campaign_goal.strip()}")
+    if scrape_intent.strip():
+        parts.append(f"Why this lead was targeted: {scrape_intent.strip()}")
+    if shared_context.strip():
+        parts.append(f"Sender context: {shared_context.strip()}")
+    return "\n\n".join(parts)
 
 
-def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "USA AI automation outreach") -> str:
+def _brain_shared_context() -> str:
+    """Use the canonical AI Brain workspace context for every outreach draft."""
+    brain = brain_service.brain_config()
+    labels = {
+        "company_information": "Company information",
+        "business_description": "What we do",
+        "services": "Services",
+        "locations": "Locations",
+        "working_hours": "Working hours",
+        "website_content": "Website positioning",
+        "policies": "Communication policies",
+        "custom_knowledge": "Additional approved knowledge",
+    }
+    sections = []
+    for key, label in labels.items():
+        value = brain.get(key)
+        if isinstance(value, (list, tuple)):
+            value = "\n".join(str(item) for item in value if item)
+        elif isinstance(value, dict):
+            value = "\n".join(f"{name}: {content}" for name, content in value.items())
+        value = str(value or "").strip()
+        if value:
+            sections.append(f"{label}:\n{value}")
+    return "\n\n".join(sections)[:6000]
+
+
+def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "USA AI automation outreach", campaign_goal: str = "", shared_context: str = "", template_id: str = "") -> str:
     email = str(prospect.get("email", "")).strip().lower()
     if not _valid_contact_email(email):
         return ""
@@ -113,16 +172,19 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
         return ""
     templates = get_email_templates()
     combined_context = f"{prospect.get('company_name', '')} {context}".lower()
-    preferred_id = "practical-automation-intro"
-    if any(term in combined_context for term in ("appointment", "roofing", "plumb", "hvac", "cleaning", "clinic", "dental", "contractor", "home service", "call")):
-        preferred_id = "voice-ai-appointment-intro"
-    elif any(term in combined_context for term in ("lead", "sales", "follow-up", "enquir", "crm")):
-        preferred_id = "follow-up-automation-intro"
+    preferred_id = template_id.strip() or "practical-automation-intro"
+    if not template_id.strip():
+        if any(term in combined_context for term in ("appointment", "roofing", "plumb", "hvac", "cleaning", "clinic", "dental", "contractor", "home service", "call")):
+            preferred_id = "voice-ai-appointment-intro"
+        elif any(term in combined_context for term in ("lead", "sales", "follow-up", "enquir", "crm")):
+            preferred_id = "follow-up-automation-intro"
     template = next((item for item in templates if item.get("id") == preferred_id and item.get("active", True)), None)
+    if template_id.strip() and not template:
+        return ""
     template = template or next((item for item in templates if item.get("active", True)), None)
     if not template:
         return ""
-    rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "email": email})
+    rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "email": email, "campaign_goal": campaign_goal, "shared_context": shared_context})
     policy = get_email_policy()
     approval_needed = bool(policy.get("approval_required")) and approval_window_open(policy)
     now = datetime.utcnow()
@@ -132,6 +194,8 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
         "recipient_email": email,
         "website": prospect.get("website", ""),
         "company_context": context,
+        "campaign_goal": campaign_goal,
+        "shared_context": shared_context,
         "campaign_name": campaign_name,
         "template_id": str(template.get("id", "")),
         "template_name": str(template.get("name", "Automatic outreach template")),
@@ -149,7 +213,7 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
         return ""
 
 
-def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True, target_drafts: int | None = None, campaign_name: str = "USA AI automation outreach") -> Dict[str, Any]:
+def discover_prospects(query: str, location: str = "United States", max_results: int = 20, create_drafts: bool = True, target_drafts: int | None = None, campaign_name: str = "USA AI automation outreach", campaign_goal: str = "", shared_context: str = "", template_id: str = "", context_mode: str = "brain", scrape_intent: str = "") -> Dict[str, Any]:
     api_key = _google_places_key()
     if not api_key:
         raise RuntimeError("Google Places discovery is unavailable in the current backend environment.")
@@ -159,6 +223,16 @@ def discover_prospects(query: str, location: str = "United States", max_results:
     location = location.strip() or "United States"
     if not query:
         raise ValueError("Enter a business type or search query")
+    if template_id.strip():
+        selected_template = next((item for item in get_email_templates() if str(item.get("id")) == template_id.strip() and item.get("active", True)), None)
+        if not selected_template:
+            raise ValueError("The selected email template is not available or active")
+        unsupported = unsupported_template_variables(selected_template, {"campaign_goal": campaign_goal, "shared_context": shared_context})
+        if unsupported:
+            raise ValueError(f"The selected template has unsupported variables: {', '.join(unsupported)}")
+    shared_context = shared_context.strip() if context_mode == "campaign" else _brain_shared_context()
+    if context_mode == "campaign" and not shared_context:
+        raise ValueError("Add campaign-specific context or choose AI Brain context")
     max_results = max(1, min(20, int(max_results)))
     target_drafts = max_results if target_drafts is None else max(1, min(60, int(target_drafts)))
     headers = {
@@ -193,7 +267,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             company_name = _place_name(place)
             website = _clean_website(str(place.get("websiteUri") or "").strip())
             dedupe_key = str(place.get("id") or website or company_name.lower())
-            context = _make_context(place, website)
+            context = _make_context(place, website, campaign_goal, shared_context, scrape_intent)
             prospect = {
             "dedupe_key": dedupe_key,
             "company_name": company_name,
@@ -224,7 +298,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             found += 1
             if email:
                 ready += 1
-            draft_id = _create_draft(prospect, context, campaign_name) if create_drafts and email else ""
+            draft_id = _create_draft(prospect, context, campaign_name, campaign_goal, shared_context, template_id) if create_drafts and email else ""
             if draft_id:
                 drafts += 1
             results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
@@ -236,7 +310,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
         if not next_page_token or not places:
             break
         time.sleep(1)
-    run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed", "campaign_name": campaign_name}
+    run = {"provider": "google_places", "query": query, "location": location, "requested": max_results, "found": found, "ready": ready, "drafts_created": drafts, "created_at": now, "status": "completed", "campaign_name": campaign_name, "campaign_goal": campaign_goal, "scrape_intent": scrape_intent, "template_id": template_id}
     mongo_client.discovery_runs.insert_one(dict(run))
     run["results"] = results
     return run

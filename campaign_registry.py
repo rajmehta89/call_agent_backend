@@ -27,7 +27,9 @@ DEFAULT_CAMPAIGNS = [
         "status": "draft",
         "audience": "USA home-service businesses",
         "steps": ["Find prospects", "Personalise email", "Review and send"],
-        "description": "The existing review-first Gmail outreach campaign.",
+        "description": "Reach US home-service businesses that may miss calls or enquiries. Introduce Raj's practical Voice AI and automation work, explain how it can qualify leads, book appointments, and follow up consistently, then invite the business to review a short example.",
+        "goal": "Start relevant conversations with businesses that could benefit from practical AI automation or Voice AI.",
+        "scrape_intent": "Find US home-service businesses that receive calls, enquiries, estimates, or appointment requests and may benefit from faster qualification and follow-up.",
         "scrape": {"query": "AI automation for home services", "location": "United States", "max_results": 20, "create_drafts": True},
     }
 ]
@@ -45,6 +47,15 @@ def _normalise(item: Dict[str, Any]) -> Dict[str, Any]:
         campaign["status"] = "draft"
     campaign["audience"] = str(campaign.get("audience") or "").strip()[:200]
     campaign["description"] = str(campaign.get("description") or "").strip()[:500]
+    if campaign["id"] == "usa-ai-automation-outreach" and campaign["description"] in {"", "The existing review-first Gmail outreach campaign."}:
+        campaign["description"] = "Reach US home-service businesses that may miss calls or enquiries. Introduce Raj's practical Voice AI and automation work, explain how it can qualify leads, book appointments, and follow up consistently, then invite the business to review a short example."
+    campaign["goal"] = str(campaign.get("goal") or campaign["description"] or "").strip()[:500]
+    campaign["scrape_intent"] = str(campaign.get("scrape_intent") or campaign["audience"] or "").strip()[:500]
+    campaign["context_mode"] = str(campaign.get("context_mode") or "brain").strip().lower()
+    if campaign["context_mode"] not in {"brain", "campaign"}:
+        campaign["context_mode"] = "brain"
+    campaign["campaign_context"] = str(campaign.get("campaign_context") or "").strip()[:4000]
+    campaign["template_id"] = str(campaign.get("template_id") or "").strip()[:120]
     campaign["steps"] = [str(step).strip() for step in (campaign.get("steps") or []) if str(step).strip()][:12]
     scrape = campaign.get("scrape") if isinstance(campaign.get("scrape"), dict) else {}
     campaign["scrape"] = {
@@ -52,7 +63,10 @@ def _normalise(item: Dict[str, Any]) -> Dict[str, Any]:
         "location": str(scrape.get("location") or "United States").strip()[:120],
         "max_results": max(1, min(20, int(scrape.get("max_results", 20)))),
         "create_drafts": bool(scrape.get("create_drafts", True)),
+        "template_id": str(scrape.get("template_id") or campaign.get("template_id") or "").strip()[:120],
     }
+    if campaign["id"] == "usa-ai-automation-outreach" and not campaign["scrape"]["query"]:
+        campaign["scrape"]["query"] = "AI automation for home services"
     campaign["last_scrape"] = campaign.get("last_scrape") or None
     campaign["updated_at"] = campaign.get("updated_at") or datetime.utcnow().isoformat() + "Z"
     return campaign

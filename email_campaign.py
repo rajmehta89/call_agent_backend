@@ -39,6 +39,7 @@ DISCOVERY_FALLBACK_QUERIES = (
     "accounting firms",
     "auto repair shops",
 )
+WORKER_INTERVAL_SECONDS = 30
 
 
 def get_email_campaign() -> Dict[str, Any]:
@@ -179,6 +180,14 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
         return {"processed": 0, "sent": 0, "status": "waiting", "campaign_status": campaign["status"]}
     if _daily_count(policy) >= int(campaign["daily_limit"]):
         return {"processed": 0, "sent": 0, "status": "daily_limit_reached", "daily_limit": campaign["daily_limit"]}
+    # A process/network failure can leave a draft claimed as "sending". Requeue
+    # only claims older than 15 minutes so active deliveries are not duplicated.
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=15)
+    if hasattr(mongo_client.email_outbox, "update_many"):
+        mongo_client.email_outbox.update_many(
+            {"status": "sending", "updated_at": {"$lt": stale_cutoff}},
+            {"$set": {"status": "scheduled", "error": "Previous delivery attempt timed out; queued for retry", "updated_at": datetime.utcnow()}},
+        )
     query: Dict[str, Any] = {"status": {"$in": ["pending_approval", "scheduled", "approved"]}}
     if draft_ids:
         valid_ids = [ObjectId(item) for item in draft_ids if ObjectId.is_valid(str(item))]
@@ -239,6 +248,16 @@ def refill_campaign_candidates() -> Dict[str, Any]:
 
     configured_query = campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]
     location = campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]
+    campaign_definition = None
+    try:
+        from campaign_registry import get_campaigns
+        campaign_definition = next((item for item in get_campaigns() if item.get("type") == "email_outreach"), None)
+    except Exception:
+        campaign_definition = None
+    if campaign_definition:
+        scrape = campaign_definition.get("scrape") or {}
+        configured_query = str(scrape.get("query") or configured_query)
+        location = str(scrape.get("location") or location)
     recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
     query = next(
         (
@@ -255,7 +274,19 @@ def refill_campaign_candidates() -> Dict[str, Any]:
         return {"status": "cooldown", "needed": needed, "queued": queued}
 
     from prospect_discovery import discover_prospects
-    result = discover_prospects(query, location, min(20, max(1, needed)), True, target_drafts=needed)
+    result = discover_prospects(
+        query,
+        location,
+        min(20, max(1, needed)),
+        True,
+        target_drafts=needed,
+        campaign_name=str(campaign_definition.get("name") if campaign_definition else "USA AI automation outreach"),
+        campaign_goal=str((campaign_definition or {}).get("goal") or (campaign_definition or {}).get("description") or (campaign_definition or {}).get("audience") or ""),
+        scrape_intent=str((campaign_definition or {}).get("scrape_intent") or ""),
+        shared_context=str((campaign_definition or {}).get("campaign_context") or "") if (campaign_definition or {}).get("context_mode") == "campaign" else "",
+        context_mode=str((campaign_definition or {}).get("context_mode") or "brain"),
+        template_id=str(((campaign_definition or {}).get("scrape") or {}).get("template_id") or (campaign_definition or {}).get("template_id") or ""),
+    )
     return {"status": "refilled", "needed": needed, "queued": queued, "result": result}
 
 
@@ -312,4 +343,4 @@ async def email_campaign_worker() -> None:
             process_email_outbox()
         except Exception as exc:
             print(f"Email campaign worker cycle failed: {exc}", flush=True)
-        await asyncio.sleep(30)
+        await asyncio.sleep(WORKER_INTERVAL_SECONDS)

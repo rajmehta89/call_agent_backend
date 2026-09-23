@@ -19,8 +19,8 @@ from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitat
 from email_campaign import campaign_action, campaign_status, get_email_campaign, process_email_outbox, save_email_campaign
 from email_service import email_service
 from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
-from email_templates import add_email_template, get_email_templates
-from prospect_discovery import discover_prospects, discovery_status
+from email_templates import add_email_template, get_email_templates, unsupported_template_variables
+from prospect_discovery import discover_prospects, discovery_status, search_locations
 from gmail_service import gmail_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
@@ -68,6 +68,10 @@ class ProspectDiscoveryPayload(BaseModel):
     location: str = "United States"
     max_results: int = Field(default=20, ge=1, le=20)
     create_drafts: bool = True
+    campaign_id: str = ""
+    campaign_goal: str = ""
+    shared_context: str = ""
+    template_id: str = ""
 
 
 class BrainUrlPayload(BaseModel):
@@ -461,17 +465,34 @@ async def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     params = {**campaign.get("scrape", {}), **payload.value}
+    locations = [item.strip() for item in re.split(r"[\n,;]+", str(params.get("location") or "United States")) if item.strip()]
+    if not locations:
+        locations = ["United States"]
     try:
-        result = discover_prospects(
-            str(params.get("query") or ""),
-            str(params.get("location") or "United States"),
-            int(params.get("max_results", 20)),
-            bool(params.get("create_drafts", True)),
-            campaign_name=campaign["name"],
-        )
+        runs = []
+        for location in locations:
+            runs.append(discover_prospects(
+                str(params.get("query") or ""), location,
+                int(params.get("max_results", 20)),
+                bool(params.get("create_drafts", True)),
+                campaign_name=campaign["name"],
+                campaign_goal=str(campaign.get("goal") or campaign.get("description") or campaign.get("audience") or ""),
+                scrape_intent=str(campaign.get("scrape_intent") or ""),
+                shared_context=str(campaign.get("campaign_context") or "") if campaign.get("context_mode") == "campaign" else "",
+                context_mode=str(campaign.get("context_mode") or "brain"),
+                template_id=str(params.get("template_id") or campaign.get("template_id") or ""),
+            ))
+        result = runs[0] if len(runs) == 1 else {
+            "provider": "google_places", "query": str(params.get("query") or ""), "location": locations,
+            "locations": locations, "requested": int(params.get("max_results", 20)),
+            "found": sum(int(run.get("found", 0)) for run in runs),
+            "ready": sum(int(run.get("ready", 0)) for run in runs),
+            "drafts_created": sum(int(run.get("drafts_created", 0)) for run in runs),
+            "status": "completed", "campaign_name": campaign["name"], "runs": runs,
+        }
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    updated = update_campaign(campaign_id, {"scrape": {"query": params.get("query", ""), "location": params.get("location", "United States"), "max_results": params.get("max_results", 20), "create_drafts": params.get("create_drafts", True)}, "last_scrape": result})
+    updated = update_campaign(campaign_id, {"scrape": {"query": params.get("query", ""), "location": params.get("location", "United States"), "max_results": params.get("max_results", 20), "create_drafts": params.get("create_drafts", True), "template_id": params.get("template_id", "")}, "last_scrape": result})
     return {"success": True, "data": {"campaign": updated, "result": result}}
 
 
@@ -522,21 +543,38 @@ async def review_email_template(payload: ValuePayload):
     name = str(payload.value.get("name") or "Custom outreach template").strip()
     subject = str(payload.value.get("subject") or "").strip()
     body = str(payload.value.get("body") or "").strip()
-    if not subject or not body:
-        raise HTTPException(status_code=400, detail="Add a subject and body before reviewing")
+    campaign_goal = str(payload.value.get("campaign_goal") or "").strip()
+    campaign_audience = str(payload.value.get("campaign_audience") or "").strip()
+    scrape_intent = str(payload.value.get("scrape_intent") or "").strip()
+    campaign_context_mode = str(payload.value.get("campaign_context_mode") or "brain").strip()
+    if (not subject or not body) and not campaign_goal and not campaign_audience:
+        raise HTTPException(status_code=400, detail="Add a subject and body, or select a campaign goal to generate the template")
+    brain = brain_service.brain_config()
+    brain_context = "\n".join(
+        f"{label}: {str(brain.get(key) or '')[:1200]}"
+        for key, label in (("company_information", "Company"), ("business_description", "What we do"), ("services", "Services"), ("website_content", "Positioning"))
+        if brain.get(key)
+    )[:4000]
     prompt = (
-        "Review this user-created B2B outreach email template. Keep the user's intent and voice, "
-        "but make it concise, grounded, respectful, and ready for business-specific personalization. "
-        "Preserve or add these variables where useful: {{company_name}}, {{company_context}}, {{website}}. "
-        "Use the variable meanings supplied by the user to judge where each variable belongs. Do not invent company facts, results, services, or claims. Return JSON with keys subject, body, "
-        "and suggestions (an array of short strings).\n\n"
-        f"Template name: {name}\nVariable meanings: {payload.value.get('variable_descriptions') or {}}\nSubject: {subject}\nBody:\n{body}"
+        "Rewrite this user-created B2B outreach email into a polished, ready-to-send template. "
+        "Keep the user's offer and intent, but remove random wording, repetition, hype, vague claims, and awkward transitions. "
+        "Use a clear structure: natural greeting, brief sender introduction based on the approved AI Brain, one relevant business-specific observation, one practical offer, a low-pressure question, and a consistent Raj Mehta signature. "
+        "Keep the subject specific and under 60 characters when possible. Keep the body concise (normally 90-160 words). "
+        "Preserve or add only useful variables: {{company_name}}, {{company_context}}, {{campaign_goal}}, {{website}}. "
+        "{{company_context}} must be the only prospect-fact area; never invent company facts, results, services, pricing, or credentials. "
+        "Use the variable meanings supplied by the user. Do not leave unresolved custom variables in the final result. "
+        "Return JSON only with keys subject, body, and suggestions (an array of short strings).\n\n"
+        "When campaign information is supplied, generate the template around that goal instead of writing a generic automation email. "
+        "The campaign context source is " + campaign_context_mode + "; use the approved Brain context when it is brain, and do not invent campaign-specific facts.\n\n"
+        f"Approved AI Brain context:\n{brain_context}\n\n"
+        f"Campaign goal: {campaign_goal or 'not supplied'}\nCampaign audience: {campaign_audience or 'not supplied'}\nLead-finding intent: {scrape_intent or 'not supplied'}\n"
+        f"Template name: {name}\nVariable meanings: {payload.value.get('variable_descriptions') or {}}\nSubject: {subject or '[generate a clear subject]'}\nBody:\n{body or '[generate the complete email]'}"
     )
     try:
         services = AIServices()
         if services.is_llm_configured():
             result = services.chat_completion(
-                [{"role": "system", "content": "You review outreach templates and return valid JSON only."}, {"role": "user", "content": prompt}],
+                [{"role": "system", "content": "You are a meticulous B2B email editor. Return valid JSON only and make the final email sound human, specific, calm, and professional."}, {"role": "user", "content": prompt}],
                 max_tokens=500,
                 temperature=0.2,
             )
@@ -545,9 +583,15 @@ async def review_email_template(payload: ValuePayload):
             return {"success": True, "data": {"subject": str(parsed.get("subject") or subject), "body": str(parsed.get("body") or body), "suggestions": parsed.get("suggestions") or []}}
     except Exception:
         pass
+    if not subject:
+        subject = f"A practical idea for {{{{company_name}}}}"
+    if not body:
+        body = (f"Hi {{{{company_name}}}},\n\nI’m Raj Mehta, an AI Automation Developer. "
+                f"I’m reaching out because this campaign focuses on {campaign_goal or campaign_audience or 'a practical business improvement'}.\n\n"
+                "{{company_context}}\n\nWould a short example be useful?\n\nBest,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/")
     suggestions = []
     import re
-    known_variables = {"company_name", "company_context", "website", "recipient_email", "name", "customer_name", "message", "status"}
+    known_variables = {"company_name", "company_context", "campaign_goal", "shared_context", "website", "recipient_email", "name", "customer_name", "message", "status"}
     custom_variables = sorted(set(re.findall(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", f"{subject}\n{body}")) - known_variables)
     if custom_variables:
         suggestions.append("Confirm values for custom variables before sending: " + ", ".join("{{" + item + "}}" for item in custom_variables) + ".")
@@ -555,6 +599,8 @@ async def review_email_template(payload: ValuePayload):
         suggestions.append("Add {{company_name}} so every business receives a personalized message.")
     if "{{company_context}}" not in body:
         suggestions.append("Add {{company_context}} so the AI-generated business context can vary per prospect.")
+    if "{{campaign_goal}}" not in body:
+        suggestions.append("Add {{campaign_goal}} only when the campaign objective should shape the message.")
     if "{{website}}" not in body:
         suggestions.append("Add {{website}} only when the prospect website is relevant to the message.")
     return {"success": True, "data": {"subject": subject, "body": body, "suggestions": suggestions or ["The template is ready; review the personalized draft before sending."]}}
@@ -563,6 +609,14 @@ async def review_email_template(payload: ValuePayload):
 @router.get("/prospects/discovery-status")
 async def get_prospect_discovery_status():
     return {"success": True, "data": discovery_status()}
+
+
+@router.get("/campaign-locations")
+async def search_campaign_locations(query: str = Query("", min_length=0, max_length=120)):
+    try:
+        return {"success": True, "data": search_locations(query)}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/prospects")
@@ -574,7 +628,7 @@ async def get_campaign_prospects(limit: int = Query(100, ge=1, le=500)):
 @router.post("/prospects/discover")
 async def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
     try:
-        return {"success": True, "data": discover_prospects(payload.query, payload.location, payload.max_results, payload.create_drafts)}
+        return {"success": True, "data": discover_prospects(payload.query, payload.location, payload.max_results, payload.create_drafts, campaign_goal=payload.campaign_goal, shared_context=payload.shared_context, template_id=payload.template_id)}
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -659,6 +713,9 @@ async def create_email_draft(payload: EmailDraftPayload):
         "website": payload.website.strip(),
         "recipient_email": recipient,
     }
+    unsupported = unsupported_template_variables(template, replacements) if template else []
+    if unsupported:
+        raise HTTPException(status_code=400, detail=f"The selected template has unsupported variables: {', '.join(unsupported)}")
 
     def render(value: str) -> str:
         rendered = value
