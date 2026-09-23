@@ -81,6 +81,21 @@ def _clean_template_text(template: Dict[str, Any]) -> Dict[str, Any]:
                 .replace("â€“", "-")
                 .replace("â€”", "-")
             )
+    # Built-in templates use prospect context for internal personalization,
+    # but must never print raw addresses, websites, or research notes to the
+    # recipient.
+    if cleaned.get("built_in") and isinstance(cleaned.get("body"), str):
+        cleaned["body"] = cleaned["body"].replace("\n\n{{company_context}}", "")
+        if cleaned.get("id") == "voice-ai-appointment-intro":
+            cleaned["body"] = cleaned["body"].replace(
+                "I noticed {{company_name}} serves customers who may call or request an appointment, so this may be relevant to your team.",
+                "I thought this may be relevant to {{company_name}} if your team handles calls, enquiries, estimates, or appointments.",
+            )
+        elif cleaned.get("id") == "practical-automation-intro":
+            cleaned["body"] = cleaned["body"].replace(
+                "I noticed {{company_name}} and had one practical idea: a lightweight AI workflow could respond to new enquiries without changing your current team.",
+                "I had one practical idea for {{company_name}}: a lightweight AI workflow could respond to new enquiries and follow up consistently without changing your current team.",
+            )
     return cleaned
 
 
