@@ -293,7 +293,14 @@ def discover_prospects(query: str, location: str = "United States", max_results:
                 # Sparse unique indexes ignore missing fields, but repeated
                 # explicit nulls still collide. Clean up older null values.
                 update["$unset"] = {"email_key": ""}
-            mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, update, upsert=True)
+            try:
+                mongo_client.campaign_prospects.update_one({"dedupe_key": dedupe_key}, update, upsert=True)
+            except DuplicateKeyError:
+                # A different business may already own this email. The email
+                # index is intentionally global, so skip this prospect and
+                # continue the remaining locations instead of aborting a run.
+                results.append({"company_name": company_name, "email": email, "website": website, "status": "duplicate_email", "draft_id": ""})
+                continue
             found += 1
             if email:
                 ready += 1
