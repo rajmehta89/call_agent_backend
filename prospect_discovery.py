@@ -123,17 +123,16 @@ def _place_name(place: Dict[str, Any]) -> str:
 
 
 def _make_context(place: Dict[str, Any], website: str, campaign_goal: str = "", shared_context: str = "", scrape_intent: str = "") -> str:
+    """Build the prospect-facing facts only.
+
+    Campaign goals, scrape intent, and Brain context are generation inputs, not
+    email copy. Keeping them out of ``company_context`` prevents the full
+    sender profile from being rendered into every prospect email.
+    """
     type_name = str(place.get("primaryType") or "local business").replace("_", " ")
     address = str(place.get("formattedAddress") or "a US market").strip()
-    factual = f"{_place_name(place)} appears to be a {type_name} based at {address}. Their public website is {website or 'not listed'}, so the first outreach should be validated before sending."
-    parts = [factual]
-    if campaign_goal.strip():
-        parts.append(f"Campaign goal: {campaign_goal.strip()}")
-    if scrape_intent.strip():
-        parts.append(f"Why this lead was targeted: {scrape_intent.strip()}")
-    if shared_context.strip():
-        parts.append(f"Sender context: {shared_context.strip()}")
-    return "\n\n".join(parts)
+    website_text = website or "not listed"
+    return f"{_place_name(place)} is a {type_name} based at {address}. Their public website is {website_text}."
 
 
 def _brain_shared_context() -> str:
