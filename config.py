@@ -1,5 +1,4 @@
 import os
-from real_estate_data import REAL_ESTATE_INFO
 from env_loader import load_project_env
 import logging
 
@@ -84,12 +83,6 @@ class Config:
     USE_CONSTRAINED_LLM = True  # Keep Groq responses restricted to given data
 
     # === AI System Prompt ===
-    SYSTEM_PROMPT = (
-        f"You are a real estate assistant for {REAL_ESTATE_INFO['developer']}. "
-        f"You must only answer questions using the following data: {REAL_ESTATE_INFO}. "
-        f"If a question is not related to {REAL_ESTATE_INFO['developer']}'s projects, amenities, or payment plans, "
-        f"politely reply: 'Sorry, I can only answer questions about {REAL_ESTATE_INFO['developer']} and their projects.'"
-    )
 
     # === API Endpoints ===
     @property

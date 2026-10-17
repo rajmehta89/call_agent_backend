@@ -470,20 +470,13 @@ class BrainService:
         collection = getattr(mongo_client, "brain_documents", None)
         if not mongo_client.is_connected() or collection is None or not user_input.strip():
             return []
-        stop_words = {"the", "and", "for", "with", "what", "how", "are", "can", "you", "our", "this", "that", "from", "about", "mumbai", "city", "company", "business", "project", "projects"}
+        stop_words = {"the", "and", "for", "with", "what", "how", "are", "can", "you", "our", "this", "that", "from", "about", "city", "company", "business", "project", "projects"}
         query_tokens = {token for token in re.findall(r"[a-z0-9]{3,}", user_input.lower()) if token not in stop_words}
         query_aliases = {
             "office": {"address", "contact"},
             "located": {"location", "address"},
             "phone": {"contact"},
             "email": {"contact"},
-            "loan": {"financing"},
-            "finance": {"financing"},
-            "visit": {"site"},
-            "move": {"possession", "ready"},
-            "bedroom": {"units", "bhk"},
-            "amenity": {"amenities"},
-            "amenities": {"facilities"},
         }
         for token in tuple(query_tokens):
             query_tokens.update(query_aliases.get(token, set()))

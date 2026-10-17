@@ -5,6 +5,7 @@ Values set here win over .env because env_loader never overrides existing variab
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.update({
@@ -15,6 +16,7 @@ os.environ.update({
     "RETELL_API_KEY": "test-retell-key",
     "RETELL_AGENT_ID": "agent_test",
     "LOG_LEVEL": "WARNING",
+    "LOG_DIR": tempfile.mkdtemp(prefix="relaydesk-test-logs-"),  # never write into the real logs/app.log
 })
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

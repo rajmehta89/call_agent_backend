@@ -22,7 +22,7 @@ from auth_service import require_permission, require_user
 from logging_setup import bind_call
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
-from qa_engine import RealEstateQA
+from qa_engine import DynamicQA
 from routers.calls_api import log_call, update_call_from_twilio
 from brain_service import brain_service
 from transfer_service import transfer_service
@@ -356,7 +356,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
     await websocket.accept()
 
     ai_services = AIServices()
-    bot = RealEstateQA(ai_services)
+    bot = DynamicQA(ai_services)
     memory = ConversationMemory()
     # ConversationRelay plays this greeting itself; record it so "yes"/"okay" replies have context.
     memory.add_assistant(agent_config.get_greeting_message())

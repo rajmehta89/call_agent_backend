@@ -4,7 +4,7 @@ Every line looks like:
     2026-10-17 21:08:19 INFO  [CA1f2e3d] routers.custom_twilio_voice_api: custom voice turn ...
 The bracketed id is the call (or request) the line belongs to, so one call can be followed with
     tail_logs.ps1 -Filter CA1f2e3d
-Logs go to the console and to logs/app.log (UTF-8, rotated at 10 MB, 5 files kept).
+Logs go to the console and to logs/app.log (UTF-8, rotated at 10 MB, 5 files kept; LOG_DIR overrides the folder).
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 _call_id: contextvars.ContextVar[str] = contextvars.ContextVar("call_id", default="-")
-LOG_DIR = Path(__file__).resolve().parent / "logs"
-LOG_FILE = LOG_DIR / "app.log"
 FORMAT = "%(asctime)s %(levelname)-5s [%(call_id)s] %(name)s: %(message)s"
 NOISY_LIBRARIES = ("pymongo", "httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "asyncio", "websockets",
                    "multipart", "watchfiles", "hpack", "openai", "twilio.http_client", "python_multipart")
@@ -59,8 +57,9 @@ def setup_logging() -> None:
     formatter = logging.Formatter(FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
     call_filter = _CallIdFilter()
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    log_dir = Path(os.getenv("LOG_DIR") or Path(__file__).resolve().parent / "logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(log_dir / "app.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
     console = logging.StreamHandler(sys.stdout)
     handlers = [console, file_handler]
     for handler in handlers:
