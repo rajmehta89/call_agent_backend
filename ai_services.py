@@ -2,6 +2,7 @@ import requests
 import base64
 import numpy as np
 import time
+import os
 from typing import Optional
 from groq import Groq
 from openai import OpenAI
@@ -95,6 +96,31 @@ class AIServices:
             return bool(self.openai_client and key)
         return bool(self.groq_client and self.config.GROQ_API_KEY and self.config.GROQ_API_KEY != "your_groq_api_key_here")
 
+    def _openrouter_extra_body(self):
+        """Return low-latency routing preferences for OpenRouter requests only."""
+        if self.provider != "openrouter":
+            return None
+
+        provider_order = [
+            provider.strip().lower()
+            for provider in os.getenv(
+                "RETELL_OPENROUTER_PROVIDER_ORDER",
+                "coreweave,deepinfra,groq",
+            ).split(",")
+            if provider.strip()
+        ]
+        preferences = {"allow_fallbacks": True}
+        if provider_order:
+            preferences["order"] = provider_order
+
+        # GPT-OSS is a reasoning model. Low effort is appropriate for a
+        # real-time voice turn, where first spoken token matters most.
+        reasoning_effort = os.getenv("RETELL_OPENROUTER_REASONING_EFFORT", "low").strip().lower()
+        extra_body = {"provider": preferences}
+        if reasoning_effort in {"low", "medium", "high"}:
+            extra_body["reasoning"] = {"effort": reasoning_effort}
+        return extra_body
+
     def chat_completion(self, messages, max_tokens=80, temperature: Optional[float] = None, top_p: Optional[float] = None):
         temperature = self.config.LLM_TEMPERATURE if temperature is None else temperature
         top_p = self.config.LLM_TOP_P if top_p is None else top_p
@@ -107,6 +133,7 @@ class AIServices:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                extra_body=self._openrouter_extra_body(),
             )
             return (response.choices[0].message.content or "").strip()
 
@@ -121,6 +148,29 @@ class AIServices:
             stream=False
         )
         return (response.choices[0].message.content or "").strip()
+
+    def stream_chat_completion(self, messages, max_tokens=80, temperature: Optional[float] = None, top_p: Optional[float] = None):
+        """Yield text deltas for low-latency voice responses."""
+        temperature = self.config.LLM_TEMPERATURE if temperature is None else temperature
+        top_p = self.config.LLM_TOP_P if top_p is None else top_p
+        if self.provider not in {"openai", "openrouter"} or not self.openai_client:
+            raise RuntimeError("Streaming is currently available for OpenAI-compatible providers only")
+
+        stream = self.openai_client.chat.completions.create(
+            model=self.config.OPENAI_MODEL if self.provider == "openai" else self.config.OPENROUTER_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+            extra_body=self._openrouter_extra_body(),
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
     
     def transcribe_audio(self, audio_data, attempt=1):
         """Transcribe audio using Google STT with retry logic"""

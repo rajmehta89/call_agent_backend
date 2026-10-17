@@ -9,8 +9,15 @@ from typing import Dict, Any, Optional
 import json
 from datetime import datetime
 from mongo_client import mongo_client
+from voice_provider_settings import provider_enabled
 
-WS_URL = os.getenv("WEBSOCKET_URL")  # e.g. "ws://your_host:8765"
+
+def _custom_voice_enabled() -> bool:
+    return provider_enabled("custom")
+
+
+def _websocket_url() -> str:
+    return os.getenv("WEBSOCKET_URL", "").strip()
 
 try:
     from piopiy import Action
@@ -128,9 +135,12 @@ def update_lead_call_status(phone_number, status, call_data=None):
 async def inbound_call(request: Request):
     """Handle inbound calls from Piopiy"""
     global pending_hangup
+    if not _custom_voice_enabled():
+        raise HTTPException(status_code=503, detail="Custom voice provider is disabled")
+    ws_url = _websocket_url()
 
     print(f"📞 Incoming call received")
-    print(f"   WS_URL: {WS_URL}")
+    print(f"   WS_URL: {ws_url}")
     print(f"   Pending hangup: {pending_hangup}")
 
     # Check if hangup is pending
@@ -139,11 +149,11 @@ async def inbound_call(request: Request):
         print("🛑 Hanging up call due to exit intent")
         return {"hangup": True}
 
-    if not WS_URL:
+    if not ws_url:
         print("❌ WEBSOCKET_URL is undefined")
         raise HTTPException(status_code=500, detail="WEBSOCKET_URL undefined")
 
-    print(f"📞 Incoming call → {WS_URL}")
+    print(f"📞 Incoming call → {ws_url}")
     try:
         act = Action()
 
@@ -156,7 +166,7 @@ async def inbound_call(request: Request):
             extra_params["lead_id"] = str(req_json["lead_id"])
 
         act.stream(
-            ws_url=WS_URL,
+            ws_url=ws_url,
             options={
                 "listen_mode": "both",
                 "stream_on_answer": True,
@@ -308,10 +318,13 @@ async def hangup_call(request: Request):
 async def start_call_session(request: Request):
     """Start a call session with current configuration"""
     try:
-        if not WS_URL:
+        if not _custom_voice_enabled():
+            raise HTTPException(status_code=503, detail="Custom voice provider is disabled")
+        ws_url = _websocket_url()
+        if not ws_url:
             raise HTTPException(status_code=500, detail="WEBSOCKET_URL undefined")
 
-        print(f"📞 Starting call session → {WS_URL}")
+        print(f"📞 Starting call session → {ws_url}")
 
         # You can extend this to accept phone numbers from frontend
         data = await request.json() if request.headers.get("content-type") == "application/json" else {}
@@ -323,13 +336,13 @@ async def start_call_session(request: Request):
             return {
                 "success": True,
                 "message": f"Call session initiated to {phone_number}",
-                "websocket_url": WS_URL
+                "websocket_url": ws_url
             }
         else:
             return {
                 "success": True,
                 "message": "WebSocket ready for incoming calls",
-                "websocket_url": WS_URL
+                "websocket_url": ws_url
             }
 
     except Exception as e:

@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""
-MongoDB-based FastAPI for leads management.
-Preserves the existing routes while preferring Twilio for outbound calling.
-"""
+"""MongoDB-backed lead CRM API."""
 
 from datetime import datetime
 import csv
 import io
-import os
-import time
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
@@ -18,16 +13,6 @@ from pydantic import BaseModel
 from env_loader import load_project_env
 from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
-from routers.twilio_api import create_outbound_call
-from automation_service import automation_service
-
-try:
-    from piopiy import Action, RestClient
-except Exception:
-    Action = None
-    RestClient = None
-
-
 load_project_env()
 
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"])
@@ -64,90 +49,6 @@ def clean_phone_number(phone_str):
     if isinstance(phone_str, str):
         return int(phone_str.replace("+", "").replace("-", "").replace(" ", ""))
     return phone_str
-
-
-APP_ID = os.getenv("APP_ID")
-APP_SECRET = os.getenv("APP_SECRET")
-CALLER_ID = os.getenv("CALLER_ID")
-WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_CALLER_ID = os.getenv("TWILIO_CALLER_ID") or CALLER_ID
-
-
-class OutboundCaller:
-    def __init__(self):
-        self.mode = "simulated"
-        self.client = None
-
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_CALLER_ID:
-            self.mode = "twilio"
-            print("Twilio outbound caller initialized.")
-            print(f"   - Caller ID: {TWILIO_CALLER_ID}")
-            return
-
-        if RestClient and Action and all([APP_ID, APP_SECRET, CALLER_ID, WEBSOCKET_URL]):
-            self.mode = "piopiy"
-            self.client = RestClient(int(APP_ID), APP_SECRET)
-            print("Piopiy outbound caller initialized.")
-            print(f"   - Caller ID: {CALLER_ID}")
-            print(f"   - WebSocket URL: {WEBSOCKET_URL}")
-            return
-
-        print("Warning: No outbound provider configured. Calls will be simulated.")
-
-    def make_call(self, customer_number_str, lead_id: str | None = None, lead_name: str | None = None):
-        session_id = f"lead-{lead_id or 'unknown'}-{int(time.time()*1000)}"
-
-        if self.mode == "twilio":
-            return create_outbound_call(customer_number_str, lead_id=lead_id, lead_name=lead_name)
-
-        if self.mode != "piopiy" or not self.client or not Action:
-            print(f"[SIMULATED] Would call {customer_number_str}")
-            return {
-                "status": "simulated",
-                "message": "Outbound provider not configured",
-                "session_id": session_id,
-            }
-
-        try:
-            customer_number = clean_phone_number(customer_number_str)
-            piopiy_number = clean_phone_number(CALLER_ID)
-
-            action = Action()
-            extra_params = {
-                "phone_number": str(customer_number_str),
-                "lead_id": str(lead_id) if lead_id else None,
-            }
-            extra_params = {k: v for k, v in extra_params.items() if v is not None}
-
-            action.stream(
-                WEBSOCKET_URL,
-                {
-                    "listen_mode": "callee",
-                    "stream_on_answer": True,
-                    "extra_params": {**extra_params, "session": session_id},
-                },
-            )
-
-            response = self.client.voice.call(
-                to=customer_number,
-                piopiy_no=piopiy_number,
-                to_or_array_pcmo=action.PCMO(),
-                options={"record": True},
-            )
-
-            return {
-                "status": "initiated",
-                "provider": "piopiy",
-                "piopiy_response": response,
-                "session_id": session_id,
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
-
-
-outbound_caller = OutboundCaller()
 
 
 def _require_db():
@@ -211,7 +112,6 @@ def add_lead(lead_data: Dict[str, Any]):
     }
     result = mongo_client.leads.insert_one(lead_doc)
     lead_doc["_id"] = str(result.inserted_id)
-    automation_service.run("new_lead", {"lead_id": lead_doc["_id"], "customer_phone": lead_doc["phone"], "customer_name": lead_doc["name"], "email": lead_doc.get("email", ""), "source": lead_doc.get("source", "manual")})
     return {"success": True, "data": lead_doc}
 
 
@@ -232,8 +132,6 @@ def update_lead(lead_id: str, lead_data: Dict[str, Any]):
         raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
 
     updated = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
-    if updated and updated.get("status") in {"qualified", "hot", "converted"}:
-        automation_service.run("lead_qualified", {"lead_id": lead_id, "customer_phone": updated.get("phone"), "customer_name": updated.get("name"), "status": updated.get("status"), "source": "lead", "channel": "lead"})
     return {"success": True, "data": _serialize_lead(updated)}
 
 
@@ -338,7 +236,6 @@ async def upload_leads_csv(file: UploadFile = File(...)):
                     "updated_at": datetime.now(),
                 }
             result = mongo_client.leads.insert_one(lead_doc)
-            automation_service.run("new_lead", {"lead_id": str(result.inserted_id), "customer_phone": lead_doc["phone"], "customer_name": lead_doc["name"], "email": lead_doc.get("email", ""), "source": "csv"})
             imported_count += 1
         except Exception as exc:
             errors.append(f"Row {row_num}: {str(exc)}")
@@ -363,42 +260,7 @@ async def health_check():
 
 @router.post("/{lead_id}/call")
 async def call_lead_endpoint(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")):
-    lead_result = get_lead_by_id(lead_id)
-    lead = lead_result["data"]
-    call_result = outbound_caller.make_call(lead["phone"], lead_id, lead.get("name"))
-
-    if call_result.get("error"):
-        raise HTTPException(status_code=500, detail={"success": False, "error": call_result["error"]})
-
-    call_data = {
-        "direction": "outbound",
-        "status": "initiated",
-        "duration": 0,
-        "summary": f"Outbound call initiated to {lead['name']}",
-        "provider_response": call_result,
-        "call_session_id": call_result.get("session_id") or call_result.get("call_sid"),
-    }
-
-    log_result = log_call(lead["phone"], lead_id, call_data)
-    mongo_client.leads.update_one(
-        {"_id": ObjectId(lead_id)},
-        {
-            "$inc": {"call_attempts": 1},
-            "$set": {"last_call": datetime.now(), "updated_at": datetime.now()},
-        },
-    )
-    update_lead_status_from_call(lead["phone"], lead_id, call_data)
-
-    updated_lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)})
-    return {
-        "success": True,
-        "message": f"Call initiated to {lead['name']}",
-        "data": {
-            "lead": _serialize_lead(updated_lead),
-            "call": call_result,
-            "call_log": log_result.get("data"),
-        },
-    }
+    raise HTTPException(status_code=410, detail="Outbound calling is disabled in this inbound-only project")
 
 
 @router.get("/{lead_id}")

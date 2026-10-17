@@ -36,6 +36,7 @@ except ImportError:
 # Import project dependencies
 from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
+from voice_provider_settings import provider_enabled
 from qa_engine import RealEstateQA
 from ai_services import AIServices
 from brain_service import brain_service
@@ -261,6 +262,16 @@ async def end_call_tracking():
                 }
 
         call_data = {
+            # Keep custom-provider calls first-class in the shared call
+            # history. The CRM can then render Retell and Piopiy calls with
+            # the same API instead of needing a separate history screen.
+            "provider": "piopiy",
+            "provider_call_id": current_call_data.get("call_session_id"),
+            "channel_type": "phone_call",
+            "provider_call_status": "ended",
+            "provider_started_at": current_call_data.get("start_time"),
+            "provider_ended_at": current_call_data.get("end_time"),
+            "direction": "inbound",
             "duration": duration,
             "transcription": current_call_data["transcription"],
             "ai_responses": current_call_data["ai_responses"],
@@ -658,6 +669,9 @@ def get_websocket_url():
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket client handler with improved question-answer sync"""
     global piopiy_ws, audio_buffer
+    if not provider_enabled("custom"):
+        await websocket.close(code=1008, reason="Custom voice provider is disabled")
+        return
     piopiy_ws = websocket
 
     await websocket.accept()

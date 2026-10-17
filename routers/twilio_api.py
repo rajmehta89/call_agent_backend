@@ -1,22 +1,31 @@
 import html
 import json
+import logging
 import os
 import re
+import secrets
+import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
+from twilio.jwt.access_token import AccessToken
+from twilio.jwt.access_token.grants import VoiceGrant
 from twilio.rest import Client
 
 from ai_services import AIServices
 from agent_config import agent_config
+from auth_service import require_permission
 from env_loader import load_project_env
 from qa_engine import RealEstateQA
 from routers.calls_api import log_call, update_call_from_twilio
 from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
+from conversation_memory import ConversationMemory
 
 load_project_env()
 
@@ -33,6 +42,9 @@ TWILIO_PUBLIC_BASE_URL = (
     or "http://localhost:8000"
 )
 TWILIO_CONVERSATION_LANG = os.getenv("TWILIO_CONVERSATION_LANG", "en-US")
+TWILIO_BROWSER_API_KEY_SID = os.getenv("TWILIO_BROWSER_API_KEY_SID")
+TWILIO_BROWSER_API_KEY_SECRET = os.getenv("TWILIO_BROWSER_API_KEY_SECRET")
+TWILIO_BROWSER_TWIML_APP_SID = os.getenv("TWILIO_BROWSER_TWIML_APP_SID")
 TWILIO_DEFAULT_COUNTRY_CODE = re.sub(
     r"\D", "", os.getenv("TWILIO_DEFAULT_COUNTRY_CODE", "91")
 ) or "91"
@@ -167,45 +179,7 @@ def _normalize_twilio_phone(phone_number: str) -> str:
 
 
 def create_outbound_call(customer_number: str, lead_id: Optional[str] = None, lead_name: Optional[str] = None) -> Dict[str, Any]:
-    client = _get_twilio_client()
-    if not client:
-        return {"error": "Twilio credentials are not configured"}
-    if not TWILIO_CALLER_ID:
-        return {"error": "TWILIO_CALLER_ID is not configured"}
-
-    status_callback = f"{_get_http_base_url()}/api/twilio/status"
-    outbound_twiml = _build_outbound_conversation_twiml()
-
-    try:
-        normalized_customer_number = _normalize_twilio_phone(customer_number)
-        outbound_call = client.calls.create(
-            to=normalized_customer_number,
-            from_=TWILIO_CALLER_ID,
-            twiml=outbound_twiml,
-            status_callback=status_callback,
-            status_callback_method="POST",
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-        )
-        print(
-            f"Twilio outbound call created for {normalized_customer_number} "
-            f"using ConversationRelay websocket {_get_ws_base_url()}/api/twilio/ws"
-        )
-        OUTBOUND_CALL_CONTEXT[outbound_call.sid] = {
-            "phone_number": normalized_customer_number,
-            "lead_id": lead_id,
-            "lead_name": lead_name,
-            "direction": "outbound",
-            "created_at": datetime.now().isoformat(),
-        }
-        transfer_service.register_call(outbound_call.sid, customer_number, lead_id, direction="outbound")
-        return {
-            "status": "initiated",
-            "provider": "twilio",
-            "call_sid": outbound_call.sid,
-            "session_id": outbound_call.sid,
-        }
-    except Exception as exc:
-        return {"error": str(exc)}
+    return {"error": "Outbound calling is disabled in this inbound-only project"}
 
 
 def get_outbound_call_context(call_sid: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -258,14 +232,82 @@ def _serialize_messages(messages: List[Dict[str, Any]], speaker: str) -> List[Di
     ]
 
 
+async def _routed_twiml(request: Request) -> PlainTextResponse:
+    """Follow the voice provider switch: custom stack when it is on, otherwise this default agent."""
+    # Imported here because the custom voice router imports this module.
+    from routers.custom_twilio_voice_api import custom_inbound
+    return await custom_inbound(request)
+
+
 @router.post("/inbound", response_class=PlainTextResponse)
 async def inbound_call(request: Request):
-    return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
+    return await _routed_twiml(request)
+
+
+@router.post("/browser-connect", response_class=PlainTextResponse)
+async def browser_connect(request: Request):
+    """Voice SDK TwiML entry point for a browser-only inbound-call test."""
+    return await _routed_twiml(request)
+
+
+logger = logging.getLogger(__name__)
+BROWSER_TOKEN_TTL_SECONDS = 3600
+_clock_offset = {"seconds": 0.0, "checked_at": 0.0}
+
+
+async def _twilio_clock_offset() -> float:
+    """Seconds to add to this machine's clock to match Twilio's.
+
+    Access tokens carry absolute timestamps, so a PC clock that is a few minutes off makes Twilio
+    reject them (error 20104). Twilio's Date header gives the true time; re-check every 30 minutes."""
+    if time.time() - _clock_offset["checked_at"] < 1800:
+        return _clock_offset["seconds"]
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            sent = time.time()
+            response = await client.head("https://api.twilio.com")
+            local_mid = (sent + time.time()) / 2
+        offset = parsedate_to_datetime(response.headers["date"]).timestamp() - local_mid
+        _clock_offset.update(seconds=offset, checked_at=time.time())
+        if abs(offset) > 30:
+            logger.warning("this computer's clock is off by %.0fs from Twilio; correcting browser tokens. Sync the Windows clock to fix it permanently.", -offset)
+    except Exception as error:
+        logger.warning("could not read Twilio time, using the local clock: %s", error)
+    return _clock_offset["seconds"]
+
+
+@router.get("/browser-token")
+async def browser_token(user: Dict[str, Any] = Depends(require_permission("handle_calls"))):
+    """Issue a short-lived Voice SDK token without exposing Twilio credentials."""
+    missing = [
+        name for name, value in {
+            "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+            "TWILIO_BROWSER_API_KEY_SID": TWILIO_BROWSER_API_KEY_SID,
+            "TWILIO_BROWSER_API_KEY_SECRET": TWILIO_BROWSER_API_KEY_SECRET,
+            "TWILIO_BROWSER_TWIML_APP_SID": TWILIO_BROWSER_TWIML_APP_SID,
+        }.items() if not value
+    ]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Browser calling is not configured: {', '.join(missing)}")
+
+    user_id = str(user.get("_id", "user"))[-12:]
+    identity = f"browser_{user_id}_{secrets.token_hex(4)}"
+    twilio_now = int(time.time() + await _twilio_clock_offset())
+    token = AccessToken(
+        TWILIO_ACCOUNT_SID,
+        TWILIO_BROWSER_API_KEY_SID,
+        TWILIO_BROWSER_API_KEY_SECRET,
+        identity=identity,
+        nbf=twilio_now - 30,
+        valid_until=twilio_now + BROWSER_TOKEN_TTL_SECONDS,
+    )
+    token.add_grant(VoiceGrant(outgoing_application_sid=TWILIO_BROWSER_TWIML_APP_SID))
+    return {"success": True, "data": {"token": token.to_jwt(), "expires_in": BROWSER_TOKEN_TTL_SECONDS}}
 
 
 @router.post("/outbound/connect", response_class=PlainTextResponse)
 async def outbound_connect(request: Request):
-    return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
+    return PlainTextResponse("Outbound calling is disabled", status_code=410)
 
 
 @router.post("/status")
@@ -307,6 +349,9 @@ async def twilio_conversation_ws(websocket: WebSocket):
 
     ai_services = AIServices()
     bot = RealEstateQA(ai_services)
+    memory = ConversationMemory()
+    # ConversationRelay plays this greeting itself; record it so "yes"/"okay" replies have context.
+    memory.add_assistant(agent_config.get_greeting_message())
     history: List[Dict[str, str]] = []
     user_transcript: List[Dict[str, str]] = []
     ai_responses: List[Dict[str, str]] = []
@@ -465,15 +510,13 @@ async def twilio_conversation_ws(websocket: WebSocket):
 
             reply = brain_service.respond(
                 caller_text,
-                history,
+                memory.history(),
                 channel="voice",
                 customer_phone=session.get("phone_number"),
+                summary=memory.summary,
             ) or "I'm sorry, the AI service is not available right now."
-            history.extend([
-                {"role": "user", "content": caller_text},
-                {"role": "assistant", "content": reply},
-            ])
-            history = history[-8:]
+            memory.add(caller_text, reply)
+            history = memory.history()
             ai_responses.append({"content": reply, "timestamp": datetime.now().isoformat()})
             transfer_service.append_message(session["session_id"], "assistant", reply)
             await _send_text(websocket, reply)

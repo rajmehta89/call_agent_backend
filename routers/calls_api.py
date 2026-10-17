@@ -9,9 +9,40 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from bson import ObjectId
 from mongo_client import mongo_client
-from automation_service import automation_service
 
 router = APIRouter(prefix="/api/calls", tags=["calls"])
+
+# Provider-neutral operational fields.  Keeping these on the call document
+# means the existing history and detail endpoints expose them without a second
+# Retell-only API or duplicate call records.
+EXTRA_CALL_FIELDS = (
+    "provider",
+    "provider_call_id",
+    "channel_type",
+    "agent_id",
+    "agent_name",
+    "agent_version",
+    "agent_tag",
+    "to_number",
+    "provider_call_status",
+    "disconnection_reason",
+    "recording_url",
+    "recording_multi_channel_url",
+    "public_log_url",
+    "call_cost",
+    "latency",
+    "end_to_end_latency_ms",
+    "provider_metadata",
+    "dynamic_variables",
+    "custom_analysis_data",
+    "call_successful",
+    "in_voicemail",
+    "human_callback_requested",
+    "analysis_status",
+    "transcript_with_tool_calls",
+    "provider_started_at",
+    "provider_ended_at",
+)
 
 # Pydantic Models
 class LogCallRequest(BaseModel):
@@ -19,18 +50,6 @@ class LogCallRequest(BaseModel):
     lead_id: Optional[str] = None
     call_data: Optional[Dict[str, Any]] = None
 
-
-def _run_call_automations(call_record: Dict[str, Any]) -> None:
-    call_status = str(call_record.get("status", "")).lower()
-    event = "missed_call" if call_status in {"missed", "no-answer", "no_answer"} else "voice_call"
-    automation_service.run(event, {
-        "call_id": call_record.get("_id"),
-        "lead_id": call_record.get("lead_id"),
-        "customer_phone": call_record.get("phone_number"),
-        "status": call_status,
-        "direction": call_record.get("direction", "outbound"),
-        "source": "voice",
-    })
 
 def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call_data: Dict[str, Any]) -> None:
     """
@@ -113,6 +132,55 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
     except Exception as e:
         print(f"❌ Error updating lead status: {e}")
 
+def _ensure_inbound_lead(
+    phone_number: str,
+    lead_id: Optional[str],
+    call_data: Optional[Dict[str, Any]],
+    now: datetime,
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Attach inbound calls to a lead, creating a clearly-labelled one when needed."""
+    data = call_data or {}
+    if str(data.get("direction") or "outbound").lower() != "inbound":
+        existing = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id and ObjectId.is_valid(lead_id) else None
+        return lead_id, existing
+
+    existing = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id and ObjectId.is_valid(lead_id) else None
+    if existing:
+        return str(existing["_id"]), existing
+
+    raw_identifier = str(phone_number or "").strip()
+    if not raw_identifier or raw_identifier.lower() in {"unknown", "anonymous"}:
+        return None, None
+
+    session_id = str(data.get("call_session_id") or "").strip()
+    is_web_call = raw_identifier.lower() == "web caller" or raw_identifier.startswith("client:")
+    lead_phone = f"web:{session_id}" if raw_identifier.lower() == "web caller" and session_id else raw_identifier
+    existing = mongo_client.leads.find_one({"phone": lead_phone})
+    if existing:
+        return str(existing["_id"]), existing
+
+    label = "Web caller" if raw_identifier.lower() == "web caller" else "Browser caller" if raw_identifier.startswith("client:") else "Inbound caller"
+    if session_id and is_web_call:
+        label = f"{label} {session_id[-6:]}"
+    lead = {
+        "name": label,
+        "phone": lead_phone,
+        "email": "",
+        "company": "",
+        "notes": "Automatically captured from an inbound voice call.",
+        "status": "new",
+        "source": "retell" if data.get("provider") == "retell" else "voice",
+        "call_attempts": 0,
+        "last_call": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    inserted = mongo_client.leads.insert_one(lead)
+    lead["_id"] = inserted.inserted_id
+    print(f"Created inbound lead {lead['_id']} from {label}")
+    return str(inserted.inserted_id), lead
+
+
 def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[str, Any] = None) -> Dict[str, Any]:
     """Log a new call"""
     try:
@@ -120,7 +188,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             return {"success": False, "error": "Database not connected"}
 
         now = datetime.now()
-        lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id and ObjectId.is_valid(lead_id) else None
+        lead_id, lead = _ensure_inbound_lead(phone_number, lead_id, call_data, now)
         mongo_client.customers.update_one(
             {"phone": phone_number},
             {
@@ -163,6 +231,8 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             "created_at": datetime.now(),
             "updated_at": datetime.now()
         }
+        if call_data:
+            call_record.update({field: call_data[field] for field in EXTRA_CALL_FIELDS if field in call_data})
 
         session_id = (call_data or {}).get("call_session_id")
         if session_id:
@@ -186,6 +256,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     "transfer_succeeded": call_record["transfer_succeeded"],
                     "accepted_by": call_record["accepted_by"],
                     "handled_by": call_record["handled_by"],
+                    **{field: call_record.get(field) for field in EXTRA_CALL_FIELDS if field in call_record},
                     "updated_at": datetime.now(),
                     "call_date": call_record["call_date"]
                 }
@@ -195,7 +266,6 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                 )
                 updated_record = mongo_client.calls.find_one({"_id": existing["_id"]})
                 updated_record["_id"] = str(updated_record["_id"])
-                _run_call_automations(updated_record)
                 print(f"✅ Updated existing call record with session_id: {session_id}")
                 return {"success": True, "data": updated_record, "note": "updated_existing_by_session"}
             else:
@@ -221,8 +291,6 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
 
         if call_data:
             update_lead_status_from_call(phone_number, lead_id, call_data)
-        _run_call_automations(call_record)
-
         return {"success": True, "data": call_record}
 
     except Exception as e:
@@ -294,6 +362,8 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
 
         query = {}
         if filters:
+            if filters.get("direction"):
+                query["direction"] = filters["direction"]
             if filters.get("phone_number"):
                 query["phone_number"] = filters["phone_number"]
             if filters.get("lead_id"):
@@ -469,6 +539,7 @@ async def get_calls_endpoint(
         phone_number: Optional[str] = Query(None),
         lead_id: Optional[str] = Query(None),
         status: Optional[str] = Query(None),
+        direction: Optional[str] = Query(None),
         interest_status: Optional[str] = Query(None),
         date_from: Optional[str] = Query(None),
         date_to: Optional[str] = Query(None),
@@ -484,6 +555,8 @@ async def get_calls_endpoint(
             filters["lead_id"] = lead_id
         if status:
             filters["status"] = status
+        if direction:
+            filters["direction"] = direction
         if interest_status:
             filters["interest_status"] = interest_status
         if date_from:

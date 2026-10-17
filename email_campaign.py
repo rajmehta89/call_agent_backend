@@ -350,10 +350,16 @@ def notify_pending_approval_digest() -> Dict[str, Any]:
 async def email_campaign_worker() -> None:
     import asyncio
     while True:
+        # Let FastAPI finish startup before the first synchronous Mongo/provider
+        # work. Without this initial yield, an active campaign can block the
+        # server's startup event while discovery is running.
+        await asyncio.sleep(WORKER_INTERVAL_SECONDS)
         try:
-            refill_campaign_candidates()
-            notify_pending_approval_digest()
-            process_email_outbox()
+            # These functions perform synchronous Mongo/provider/SMTP work;
+            # keep them off FastAPI's event loop so health and UI requests
+            # remain responsive during discovery and delivery.
+            await asyncio.to_thread(refill_campaign_candidates)
+            await asyncio.to_thread(notify_pending_approval_digest)
+            await asyncio.to_thread(process_email_outbox)
         except Exception as exc:
             print(f"Email campaign worker cycle failed: {exc}", flush=True)
-        await asyncio.sleep(WORKER_INTERVAL_SECONDS)

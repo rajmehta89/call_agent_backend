@@ -4,33 +4,35 @@ Single entry point for Render deployment
 Combines all backend services into one FastAPI application
 """
 
+import logging
 import os
 import sys
-import asyncio
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from env_loader import load_project_env
 
-# Load environment variables before importing routers so every channel sees
-# the same local/reference .env configuration.
+# Load only this project's environment file before importing application modules.
 load_project_env()
-
-from routers import auth_api, config_api, calls_api, omnichannel_api, platform_api, transfer_api, twilio_api, whatsapp_api
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-optional_routers = []
-for module_name in ("leads_api_mongo", "webhook_api", "websocket_api", "inbound_api"):
-    try:
-        module = __import__(f"routers.{module_name}", fromlist=["router"])
-        optional_routers.append(module.router)
-    except Exception as exc:
-        print(f"Skipping optional router {module_name}: {exc}")
+# App-wide log level; set LOG_LEVEL=DEBUG in .env to see debug output.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+# Third-party libraries are very chatty at DEBUG (e.g. Mongo heartbeats every few seconds).
+for _noisy in ("pymongo", "httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "asyncio", "websockets", "multipart", "watchfiles", "hpack", "openai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, platform_api, retell_api, transfer_api, twilio_api, voice_provider_api
+from routers.leads_api_mongo import router as leads_router
 
 # Create FastAPI app
 app = FastAPI(
@@ -39,18 +41,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
-@app.on_event("startup")
-async def start_email_campaign_worker() -> None:
-    from email_campaign import email_campaign_worker
-    app.state.email_campaign_task = asyncio.create_task(email_campaign_worker())
-
-
-@app.on_event("shutdown")
-async def stop_email_campaign_worker() -> None:
-    task = getattr(app.state, "email_campaign_task", None)
-    if task:
-        task.cancel()
 
 # Add CORS middleware
 app.add_middleware(
@@ -65,17 +55,8 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {
-        "message": "AI Agent Backend is running",
-        "services": [
-            "Configuration API",
-            "Leads Management API",
-            "Calls API",
-            "WebSocket Server",
-            "Webhook Server",
-            "SMS API",
-            "Outbound Caller API",
-            "Inbound Call API"
-        ]
+        "message": "Inbound Call CRM backend is running",
+        "services": ["Inbound Twilio voice", "Call history", "Leads CRM"]
     }
 
 @app.get("/health")
@@ -86,13 +67,13 @@ async def health_check():
 app.include_router(config_api.router)
 app.include_router(auth_api.router)
 app.include_router(calls_api.router)
-app.include_router(omnichannel_api.router)
 app.include_router(platform_api.router)
-app.include_router(transfer_api.router)
 app.include_router(twilio_api.router)
-app.include_router(whatsapp_api.router)
-for router in optional_routers:
-    app.include_router(router)
+app.include_router(custom_twilio_voice_api.router)
+app.include_router(retell_api.router)
+app.include_router(transfer_api.router)
+app.include_router(leads_router)
+app.include_router(voice_provider_api.router)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

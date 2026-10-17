@@ -80,9 +80,13 @@ class BrainUrlPayload(BaseModel):
 
 class ShopifyConfigPayload(BaseModel):
     store_domain: str
+    auth_mode: str = "client_credentials"  # or "admin_token"
     access_token: str = ""
+    client_id: str = ""
+    client_secret: str = ""
     api_version: str = "2025-10"
     test_connection: bool = True
+
 
 
 class AutomationPayload(BaseModel):
@@ -186,8 +190,17 @@ def _apply_saved_shopify_config() -> None:
         return
     saved = mongo_client.platform_settings.find_one({"key": "shopify"})
     values = saved.get("value", {}) if saved else {}
-    if values.get("store_domain") and values.get("access_token"):
-        shopify_service.configure(values["store_domain"], values["access_token"], values.get("api_version", "2025-10"))
+    if values.get("store_domain") and (values.get("access_token") or (values.get("client_id") and values.get("client_secret"))):
+        signature = (values.get("store_domain"), values.get("access_token"), values.get("client_id"), values.get("client_secret"), values.get("api_version"))
+        current = (shopify_service.store_domain, shopify_service.static_token, shopify_service.client_id, shopify_service.client_secret, shopify_service.api_version)
+        if signature != current:  # re-configuring would throw away a cached 24-hour token
+            shopify_service.configure(
+                values["store_domain"],
+                values.get("access_token", ""),
+                values.get("api_version", "2025-10"),
+                client_id=values.get("client_id", ""),
+                client_secret=values.get("client_secret", ""),
+            )
 
 
 _apply_saved_shopify_config()
@@ -830,7 +843,7 @@ async def decide_email_draft(draft_id: str, payload: ValuePayload):
 
 
 @router.put("/tools")
-async def update_tools(payload: ValuePayload):
+async def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     tools = {**DEFAULT_TOOLS, **{key: bool(value) for key, value in payload.value.items() if key in DEFAULT_TOOLS}}
     stored = _upsert_setting("ai_tools", tools)
     _audit("update", "ai_tools", after=tools)
@@ -1102,13 +1115,14 @@ async def update_settings(payload: ValuePayload):
 
 
 @router.get("/shopify/status")
-async def shopify_status():
+async def shopify_status(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _apply_saved_shopify_config()
     data = shopify_service.status()
     if shopify_service.configured:
         try:
-            data["products_count"] = len(shopify_service.products(limit=100))
-            data["api_status"] = "connected"
+            shop = shopify_service.shop()
+            data.update(shop_name=shop.get("name"), currency=shop.get("currencyCode"), products_count=shop.get("products_count"), api_status="connected")
+            data = {**data, **shopify_service.status()}  # token expiry is known after the first call
         except Exception as exc:
             data["api_status"] = "error"
             data["error"] = str(exc)
@@ -1116,29 +1130,49 @@ async def shopify_status():
 
 
 @router.put("/shopify/configure")
-async def configure_shopify(payload: ShopifyConfigPayload):
+async def configure_shopify(payload: ShopifyConfigPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _require_db()
     before = shopify_service.status()
     saved = mongo_client.platform_settings.find_one({"key": "shopify"}) or {}
     saved_values = saved.get("value", {}) if saved else {}
-    token = payload.access_token.strip() or str(saved_values.get("access_token") or shopify_service.access_token or "")
-    shopify_service.configure(payload.store_domain.strip(), token, payload.api_version.strip() or "2025-10")
-    stored = {"store_domain": shopify_service.store_domain, "access_token": token, "api_version": shopify_service.api_version}
+    # Blank secret fields keep what is already saved, so the form never has to show secrets again.
+    if payload.auth_mode == "admin_token":
+        token = payload.access_token.strip() or str(saved_values.get("access_token") or "")
+        client_id = client_secret = ""
+    else:
+        token = ""
+        client_id = payload.client_id.strip() or str(saved_values.get("client_id") or "")
+        client_secret = payload.client_secret.strip() or str(saved_values.get("client_secret") or "")
+    shopify_service.configure(payload.store_domain.strip(), token, payload.api_version.strip() or "2025-10", client_id=client_id, client_secret=client_secret)
+    stored = {"store_domain": shopify_service.store_domain, "access_token": token, "client_id": client_id, "client_secret": client_secret, "api_version": shopify_service.api_version}
     _upsert_setting("shopify", stored)
     data = shopify_service.status()
     if payload.test_connection and shopify_service.configured:
         try:
-            shopify_service.products(limit=1)
-            data["api_status"] = "connected"
+            shop = shopify_service.shop()
+            data = {**shopify_service.status(), "shop_name": shop.get("name"), "products_count": shop.get("products_count"), "api_status": "connected"}
         except Exception as exc:
             data["api_status"] = "error"
             data["error"] = str(exc)
-    _audit("update", "shopify", before=before, after={"store_domain": shopify_service.store_domain, "api_version": shopify_service.api_version, "access_token_configured": bool(token)})
+    _audit("update", "shopify", before=before, after={"store_domain": shopify_service.store_domain, "api_version": shopify_service.api_version, "auth_mode": shopify_service.auth_mode})
     return {"success": True, "data": data}
 
 
+@router.get("/shopify/scopes")
+async def shopify_scopes(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+    if not shopify_service.configured:
+        return {"success": True, "data": {"granted": [], "required": ["read_products", "read_inventory"]}}
+    try:
+        return {"success": True, "data": {
+            "granted": shopify_service.access_scopes(),
+            "required": ["read_products", "read_inventory"],
+        }}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.get("/shopify/products")
-async def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100)):
+async def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     try:
         return {"success": True, "data": shopify_service.products(search, limit)}
     except Exception as exc:
@@ -1146,7 +1180,7 @@ async def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100
 
 
 @router.get("/shopify/orders")
-async def shopify_orders(search: str = "", limit: int = Query(25, ge=1, le=100)):
+async def shopify_orders(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     try:
         return {"success": True, "data": shopify_service.orders(search, limit)}
     except Exception as exc:
@@ -1154,7 +1188,7 @@ async def shopify_orders(search: str = "", limit: int = Query(25, ge=1, le=100))
 
 
 @router.post("/shopify/sync")
-async def shopify_sync(scope: str = "all"):
+async def shopify_sync(scope: str = "all", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _require_db()
     if not shopify_service.configured:
         raise HTTPException(status_code=400, detail="Shopify is not configured")

@@ -34,6 +34,23 @@ MONGO_DB=ai_agent_assist
 # search is attempted first and lexical retrieval remains a safe fallback.
 OPENROUTER_API_KEY=
 OPENROUTER_MODEL=openai/gpt-oss-20b
+# Retell Custom LLM bridge. Keep disabled until the Retell agent is configured.
+# Retell connects to: wss://your-public-domain/api/retell/llm-websocket?token=<secret>
+# Retell appends {call_id}. Retell Custom LLM sockets do not send arbitrary
+# authentication headers, so use the URL token below and keep it private.
+RETELL_CUSTOM_LLM_ENABLED=false
+# Create an API key with the webhook badge in Retell and keep it server-side.
+RETELL_API_KEY=
+RETELL_CUSTOM_LLM_SECRET=replace-with-a-long-random-secret
+RETELL_OPENROUTER_MODEL=openai/gpt-oss-20b
+RETELL_BEGIN_MESSAGE=Hello, how can I help you today?
+RETELL_MAX_RESPONSE_TOKENS=60
+# Keep false in production unless transcript/answer content is explicitly needed for debugging.
+RETELL_LOG_CONTENT=false
+# Priority order for the same model. OpenRouter fails over automatically when a provider is unavailable.
+RETELL_OPENROUTER_PROVIDER_ORDER=coreweave,deepinfra,groq
+RETELL_OPENROUTER_REASONING_EFFORT=low
+
 RAG_EMBEDDING_MODEL=text-embedding-3-small
 RAG_ATLAS_VECTOR_SEARCH=true
 RAG_ATLAS_VECTOR_INDEX_NAME=vector_index
@@ -91,6 +108,16 @@ TWILIO_CALLER_ID=+1xxxxxxxxxx
 TWILIO_PUBLIC_BASE_URL=https://your-public-ngrok-domain.ngrok-free.app
 TWILIO_CONVERSATION_LANG=en-US
 TWILIO_HUMAN_AGENT_NUMBER=+1xxxxxxxxxx
+
+# Optional self-managed voice route: Twilio Media Streams -> Deepgram -> AI Brain -> ElevenLabs.
+# Keep false until the credentials below are configured. Route the Twilio number to
+# /api/custom-voice/inbound only when you want this path rather than Retell.
+CUSTOM_TWILIO_VOICE_ENABLED=false
+DEEPGRAM_API_KEY=
+CUSTOM_DEEPGRAM_MODEL=nova-3
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_ID=
+ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 
 # WhatsApp: auto selects Meta direct Cloud API first, then Twilio WhatsApp.
 # Set WHATSAPP_PROVIDER=meta or twilio to force one path.

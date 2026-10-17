@@ -188,7 +188,7 @@ class DynamicQA:
         
         return prompt
 
-    def get_response(self, user_input: str, conversation_history=None, system_context: str = "", temperature=None) -> str:
+    def get_response(self, user_input: str, conversation_history=None, system_context: str = "", temperature=None, final_instructions: str = "") -> str:
         """Calls LLM with up-to-date context. Returns the assistant's reply."""
         try:
             if not self.ai_services.is_llm_configured():
@@ -204,7 +204,9 @@ class DynamicQA:
             # optional: keep recent history if wanted
             messages = [
                 {'role': 'system', 'content': system_prompt},
-                *conversation_history[-4:],  # last exchanges if you want context
+                *conversation_history,  # already size-capped and summarised by conversation_memory
+                # Repeated next to the question: small models follow rules here far more reliably than at the top.
+                *([{'role': 'system', 'content': final_instructions}] if final_instructions else []),
                 {'role': 'user', 'content': user_input}
             ]
             
