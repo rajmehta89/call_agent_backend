@@ -9,6 +9,9 @@ from pymongo import MongoClient
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from env_loader import load_project_env
+import logging
+
+logger = logging.getLogger(__name__)
 
 load_project_env()
 
@@ -20,15 +23,15 @@ class MongoDBClient:
         self.last_error: Optional[str] = None
         
         if not self.mongo_uri:
-            print("MONGO_URI not found in environment variables")
-            print("Please add your MongoDB Atlas connection string to .env file")
+            logger.warning("MONGO_URI not found in environment variables")
+            logger.info("Please add your MongoDB Atlas connection string to .env file")
             self.client = None
             self.db = None
             self.last_error = "MONGO_URI not configured"
             return
         
         try:
-            print("Connecting to MongoDB Atlas...")
+            logger.info("Connecting to MongoDB Atlas...")
             self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
             # Force a real connection during startup so bad URIs or Atlas access issues fail early.
             self.client.admin.command("ping")
@@ -141,10 +144,10 @@ class MongoDBClient:
             self.discovery_runs.create_index("created_at")
             self.notifications.create_index("read")
             
-            print("MongoDB connected successfully")
+            logger.info("MongoDB connected successfully")
             
         except Exception as e:
-            print(f"MongoDB connection failed: {e}")
+            logger.error(f"MongoDB connection failed: {e}")
             self.client = None
             self.db = None
             self.last_error = str(e)

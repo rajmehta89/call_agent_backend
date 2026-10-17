@@ -11,10 +11,14 @@ from typing import Any, Dict, List, Optional
 from ai_services import AIServices
 from agent_config import agent_config
 from conversation_memory import bounded_history
+from logging_setup import timed
 from mongo_client import mongo_client
 from qa_engine import DynamicQA
 from response_renderer import render_response
 from shopify_service import phones_match, shopify_service
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from bs4 import BeautifulSoup
@@ -185,12 +189,13 @@ class BrainService:
             return []
         model = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small").strip()
         try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/embeddings",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "input": texts, "dimensions": self._embedding_dimensions(), "encoding_format": "float"},
-                timeout=30,
-            )
+            with timed(logger, f"embeddings {model}", warn_after_ms=2000):
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/embeddings",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"model": model, "input": texts, "dimensions": self._embedding_dimensions(), "encoding_format": "float"},
+                    timeout=30,
+                )
             response.raise_for_status()
             items = response.json().get("data") or []
             items = sorted(items, key=lambda item: item.get("index", 0))
@@ -199,7 +204,7 @@ class BrainService:
                 return []
             return vectors
         except Exception as exc:
-            print(f"OpenRouter embedding failed; trying fallback: {type(exc).__name__}")
+            logger.warning(f"OpenRouter embedding failed; trying fallback: {type(exc).__name__}")
             return []
 
     def _gemini_embedding(self, text: str, task_type: str) -> List[float]:
@@ -226,7 +231,7 @@ class BrainService:
             values = ((response.json().get("embedding") or {}).get("values") or [])
             return values if isinstance(values, list) else []
         except Exception as exc:
-            print(f"Gemini embedding failed: {type(exc).__name__}")
+            logger.error(f"Gemini embedding failed: {type(exc).__name__}")
             return []
 
     def _gemini_embeddings(self, chunks: List[str]) -> List[List[float]]:
@@ -260,7 +265,7 @@ class BrainService:
                         if vectors and len(vectors) == len(chunks) and all(isinstance(vector, list) and vector for vector in vectors):
                             return vectors, "openai"
                     except Exception as exc:
-                        print(f"OpenAI embedding failed; trying fallback: {type(exc).__name__}")
+                        logger.warning(f"OpenAI embedding failed; trying fallback: {type(exc).__name__}")
             elif provider == "gemini":
                 vectors = self._gemini_embeddings(chunks)
                 if vectors and any(vectors):

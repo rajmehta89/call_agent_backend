@@ -9,6 +9,9 @@ from bson import ObjectId
 
 from email_policy import approval_window_open, get_email_policy, send_window_open
 from mongo_client import mongo_client
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_EMAIL_CAMPAIGN: Dict[str, Any] = {
@@ -338,7 +341,7 @@ def notify_pending_approval_digest() -> Dict[str, Any]:
     try:
         result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
     except Exception as exc:
-        print(f"Campaign approval digest failed: {exc}", flush=True)
+        logger.error(f"Campaign approval digest failed: {exc}")
         return {"status": "error", "count": len(drafts), "reason": "Gmail delivery failed"}
     if result.get("status") != "sent":
         return {"status": "error", "count": len(drafts), "reason": result.get("reason", "Digest was not sent")}
@@ -362,4 +365,4 @@ async def email_campaign_worker() -> None:
             await asyncio.to_thread(notify_pending_approval_digest)
             await asyncio.to_thread(process_email_outbox)
         except Exception as exc:
-            print(f"Email campaign worker cycle failed: {exc}", flush=True)
+            logger.error(f"Email campaign worker cycle failed: {exc}")

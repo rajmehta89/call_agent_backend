@@ -1,6 +1,9 @@
 import os
 from real_estate_data import REAL_ESTATE_INFO
 from env_loader import load_project_env
+import logging
+
+logger = logging.getLogger(__name__)
 
 load_project_env()
 
@@ -102,8 +105,8 @@ class Config:
 
 # Debug check when running directly
 if __name__ == "__main__":
-    print("✅ Config loaded successfully")
+    print("Config loaded successfully")
     print(f"Allowed Origins: {ALLOWED_ORIGINS}")
-    print(f"Google TTS API Key: {'✔ Loaded' if Config.GOOGLE_TTS_API_KEY else '❌ Missing'}")
-    print(f"Google STT API Key: {'✔ Loaded' if Config.GOOGLE_STT_API_KEY else '❌ Missing'}")
-    print(f"GROQ API Key: {'✔ Loaded' if Config.GROQ_API_KEY else '❌ Missing'}")
+    print(f"Google TTS API Key: {'Loaded' if Config.GOOGLE_TTS_API_KEY else 'Missing'}")
+    print(f"Google STT API Key: {'Loaded' if Config.GOOGLE_STT_API_KEY else 'Missing'}")
+    print(f"GROQ API Key: {'Loaded' if Config.GROQ_API_KEY else 'Missing'}")

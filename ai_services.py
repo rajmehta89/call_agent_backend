@@ -8,6 +8,11 @@ from groq import Groq
 from openai import OpenAI
 from config import Config
 from real_estate_data import REAL_ESTATE_INFO
+import logging
+
+from logging_setup import timed
+
+logger = logging.getLogger(__name__)
 
 
 class _CompletionAdapter:
@@ -53,18 +58,18 @@ class AIServices:
         self.groq_client = None
         self.openai_client = None
 
-        print(f"Initializing AIServices...")
-        print(f"LLM provider selected: {self.provider}")
-        print(f"GROQ_API_KEY present: {'Yes' if self.config.GROQ_API_KEY else 'No'}")
-        print(f"OPENAI_API_KEY present: {'Yes' if self.config.OPENAI_API_KEY else 'No'}")
-        print(f"OPENROUTER_API_KEY present: {'Yes' if self.config.OPENROUTER_API_KEY else 'No'}")
+        logger.debug(f"Initializing AIServices...")
+        logger.debug(f"LLM provider selected: {self.provider}")
+        logger.debug(f"GROQ_API_KEY present: {'Yes' if self.config.GROQ_API_KEY else 'No'}")
+        logger.debug(f"OPENAI_API_KEY present: {'Yes' if self.config.OPENAI_API_KEY else 'No'}")
+        logger.debug(f"OPENROUTER_API_KEY present: {'Yes' if self.config.OPENROUTER_API_KEY else 'No'}")
 
         if self.provider == "groq" and self.config.GROQ_API_KEY:
             try:
                 self.groq_client = Groq(api_key=self.config.GROQ_API_KEY)
-                print("Groq client initialized successfully")
+                logger.debug("Groq client initialized successfully")
             except Exception as e:
-                print(f"Failed to initialize Groq client: {e}")
+                logger.error(f"Failed to initialize Groq client: {e}")
 
         if self.provider in {"openai", "openrouter"} and ((self.provider == "openai" and self.config.OPENAI_API_KEY) or (self.provider == "openrouter" and self.config.OPENROUTER_API_KEY)):
             try:
@@ -75,9 +80,9 @@ class AIServices:
                 self.groq_client = _ClientAdapter(self)
                 if not self.config.GROQ_API_KEY:
                     self.config.GROQ_API_KEY = "openrouter-proxy" if self.provider == "openrouter" else "openai-proxy"
-                print(f"{self.provider.title()} client initialized successfully")
+                logger.debug(f"{self.provider.title()} client initialized successfully")
             except Exception as e:
-                print(f"Failed to initialize OpenAI client: {e}")
+                logger.error(f"Failed to initialize OpenAI client: {e}")
 
     def _resolve_provider(self) -> str:
         if self.config.LLM_PROVIDER in {"groq", "openai", "openrouter"}:
@@ -127,14 +132,16 @@ class AIServices:
         if self.provider in {"openai", "openrouter"}:
             if not self.openai_client:
                 raise RuntimeError(f"{self.provider.title()} client is not initialized")
-            response = self.openai_client.chat.completions.create(
-                model=self.config.OPENAI_MODEL if self.provider == "openai" else self.config.OPENROUTER_MODEL,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                extra_body=self._openrouter_extra_body(),
-            )
+            model = self.config.OPENAI_MODEL if self.provider == "openai" else self.config.OPENROUTER_MODEL
+            with timed(logger, f"LLM {model}", warn_after_ms=4000):
+                response = self.openai_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    extra_body=self._openrouter_extra_body(),
+                )
             return (response.choices[0].message.content or "").strip()
 
         if not self.groq_client:
@@ -208,26 +215,26 @@ class AIServices:
                     alternatives = results[0]['alternatives']
                     if alternatives and 'transcript' in alternatives[0]:
                         transcript = alternatives[0]['transcript'].strip()
-                        print(f"You: {transcript}")
+                        logger.debug(f"You: {transcript}")
                         return transcript
                 
-                print(" STT returned no transcript.")
+                logger.debug(" STT returned no transcript.")
                 return ""
             else:
-                print(f"STT HTTP {response.status_code}")
+                logger.info(f"STT HTTP {response.status_code}")
                 return ""
                 
         except Exception as e:
             if attempt < 3:
-                print(f" STT retry {attempt}/3...")
+                logger.warning(f" STT retry {attempt}/3...")
                 time.sleep(0.1 * attempt)
                 return self.transcribe_audio(audio_data, attempt + 1)
-            print(f"STT fatal error: {e}")
+            logger.error(f"STT fatal error: {e}")
             return ""
     
     def get_llm_response(self, user_input, conversation_history):
         """Get response from Groq LLM, strictly using real estate data only"""
-        print("Thinking...")
+        logger.debug("Thinking...")
         try:
             # Add user input to history
             conversation_history.append({"role": "user", "content": user_input})
@@ -258,11 +265,11 @@ class AIServices:
             )
             conversation_history.append({"role": "assistant", "content": ai_text})
             
-            print(f"Bot: {ai_text}")
+            logger.debug(f"Bot: {ai_text}")
             return ai_text
             
         except Exception as e:
-            print(f"Groq Error: {e}")
+            logger.error(f"Groq Error: {e}")
             return "Sorry, can you repeat that?"
     
     def text_to_speech(self, text):
@@ -270,7 +277,7 @@ class AIServices:
         if not text.strip():
             return None
         
-        print("Speaking...")
+        logger.debug("Speaking...")
         try:
             request_body = {
                 "input": {"text": text},
@@ -305,9 +312,9 @@ class AIServices:
                     
                     return filename
             
-            print(f"TTS Error: {response.status_code}")
+            logger.error(f"TTS Error: {response.status_code}")
             return None
             
         except Exception as e:
-            print(f"TTS Error: {e}")
+            logger.error(f"TTS Error: {e}")
             return None

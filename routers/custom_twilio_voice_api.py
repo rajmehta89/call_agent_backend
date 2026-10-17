@@ -21,6 +21,7 @@ from fastapi.responses import PlainTextResponse
 from brain_service import brain_service
 from auth_service import require_user
 from conversation_memory import ConversationMemory
+from logging_setup import bind_call, timed
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from routers.calls_api import log_call
 from voice_provider_settings import provider_enabled, provider_snapshot
@@ -155,6 +156,19 @@ async def custom_voice_config() -> Dict[str, Any]:
     }
 
 
+class _async_timed:
+    """async-with version of logging_setup.timed for awaited provider calls."""
+
+    def __init__(self, what: str) -> None:
+        self._timer = timed(logger, what)
+
+    async def __aenter__(self) -> None:
+        self._timer.__enter__()
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return bool(self._timer.__exit__(*exc_info))
+
+
 async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     """Register the call with Retell, then bridge Twilio to Retell over SIP."""
     payload: Dict[str, Any] = {"agent_id": os.getenv("RETELL_AGENT_ID", "").strip(), "direction": "inbound"}
@@ -162,7 +176,7 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
         payload["from_number"] = form["From"]
     if str(form.get("To") or "").startswith("+"):
         payload["to_number"] = form["To"]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client, _async_timed("Retell register-phone-call"):
         response = await client.post(
             "https://api.retellai.com/v2/register-phone-call",
             headers={"Authorization": f"Bearer {os.getenv('RETELL_API_KEY', '').strip()}"},
@@ -179,6 +193,7 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
 async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
     providers = provider_snapshot()
+    bind_call((await request.form()).get("CallSid"))
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
             return PlainTextResponse(await _retell_sip_twiml(dict(await request.form())), media_type="text/xml")
@@ -293,6 +308,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def answer(text: str, heard_at: float) -> None:
         nonlocal filler_index, unanswered_text
+        bind_call(call_sid)  # tasks copy their context when created, before the call id was known
         thinking = asyncio.ensure_future(asyncio.to_thread(brain_service.respond, text, memory.history(), "voice", caller, memory.summary))
         filler_after = _filler_after_seconds()
         if filler_after:
@@ -317,6 +333,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     def finish_utterance() -> None:
         nonlocal reply_task, unanswered_text
+        bind_call(call_sid)
         text = " ".join(utterance).strip()
         utterance.clear()
         if not text:
@@ -379,6 +396,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         params = start.get("customParameters") or {}
                         caller = str(params.get("caller") or caller)
                         call_sid = str(params.get("call_sid") or call_sid)
+                        bind_call(call_sid)
                         if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
                             await websocket.close(code=1008)

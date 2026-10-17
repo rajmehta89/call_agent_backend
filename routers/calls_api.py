@@ -11,6 +11,9 @@ from bson import ObjectId
 from mongo_client import mongo_client
 
 from auth_service import require_user
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/calls", tags=["calls"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
@@ -64,7 +67,7 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
     """
     try:
         if not mongo_client.is_connected():
-            print("⚠️ Cannot update lead status: Database not connected")
+            logger.error("Cannot update lead status: Database not connected")
             return
 
         lead = None
@@ -78,7 +81,7 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
             lead = mongo_client.leads.find_one({"phone": phone_number})
 
         if not lead:
-            print(f"⚠️ No lead found for phone {phone_number} or lead_id {lead_id}")
+            logger.warning(f"No lead found for phone {phone_number} or lead_id {lead_id}")
             return
 
         lead_id = str(lead["_id"])
@@ -96,16 +99,16 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
         if call_status == "initiated":
             if current_status == "new":
                 new_status = "called"
-                print(f"📞 Lead {lead['name']} moved to 'called' (call initiated)")
+                logger.info(f"Lead {lead['name']} moved to 'called' (call initiated)")
 
         elif call_status in {"completed", "transferred"} and call_duration > 0:
             if current_status in ["new", "called"]:
                 if has_conversation:
                     new_status = "contacted"
-                    print(f"💬 Lead {lead['name']} moved to 'contacted' (conversation happened)")
+                    logger.info(f"Lead {lead['name']} moved to 'contacted' (conversation happened)")
                 elif call_duration > 5:
                     new_status = "contacted"
-                    print(f"📞 Lead {lead['name']} moved to 'contacted' (call answered)")
+                    logger.info(f"Lead {lead['name']} moved to 'contacted' (call answered)")
                 else:
                     if current_status == "new":
                         new_status = "called"
@@ -114,7 +117,7 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
             confidence = interest_analysis.get("confidence", 0)
             if confidence > 0.7 and current_status in ["called", "contacted"]:
                 new_status = "converted"
-                print(f"🎯 Lead {lead['name']} moved to 'converted' (interested with {confidence:.0%} confidence)")
+                logger.info(f"Lead {lead['name']} moved to 'converted' (interested with {confidence:.0%} confidence)")
 
         if new_status != current_status:
             mongo_client.leads.update_one(
@@ -127,12 +130,12 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
                     }
                 }
             )
-            print(f"✅ Lead {lead['name']} status updated: {current_status} -> {new_status}")
+            logger.info(f"Lead {lead['name']} status updated: {current_status} -> {new_status}")
         else:
-            print(f"📋 Lead {lead['name']} status unchanged: {current_status}")
+            logger.info(f"Lead {lead['name']} status unchanged: {current_status}")
 
     except Exception as e:
-        print(f"❌ Error updating lead status: {e}")
+        logger.error(f"Error updating lead status: {e}")
 
 def _ensure_inbound_lead(
     phone_number: str,
@@ -179,7 +182,7 @@ def _ensure_inbound_lead(
     }
     inserted = mongo_client.leads.insert_one(lead)
     lead["_id"] = inserted.inserted_id
-    print(f"Created inbound lead {lead['_id']} from {label}")
+    logger.info(f"Created inbound lead {lead['_id']} from {label}")
     return str(inserted.inserted_id), lead
 
 
@@ -268,7 +271,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                 )
                 updated_record = mongo_client.calls.find_one({"_id": existing["_id"]})
                 updated_record["_id"] = str(updated_record["_id"])
-                print(f"✅ Updated existing call record with session_id: {session_id}")
+                logger.info(f"Updated existing call record with session_id: {session_id}")
                 return {"success": True, "data": updated_record, "note": "updated_existing_by_session"}
             else:
                 call_record["call_session_id"] = session_id
@@ -287,16 +290,16 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                         }
                     }
                 )
-                print(f"✅ Updated lead {lead_id} last_call timestamp")
+                logger.info(f"Updated lead {lead_id} last_call timestamp")
             except Exception as e:
-                print(f"⚠️ Failed to update lead timestamps: {e}")
+                logger.error(f"Failed to update lead timestamps: {e}")
 
         if call_data:
             update_lead_status_from_call(phone_number, lead_id, call_data)
         return {"success": True, "data": call_record}
 
     except Exception as e:
-        print(f"❌ Error logging call: {e}")
+        logger.error(f"Error logging call: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -397,7 +400,7 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
                         "company": ld.get("company", "")
                     }
             except Exception as e:
-                print(f"⚠️ Lead join failed: {e}")
+                logger.error(f"Lead join failed: {e}")
 
         for call in calls:
             call["_id"] = str(call["_id"])
@@ -435,7 +438,7 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
         }
 
     except Exception as e:
-        print(f"❌ Error getting calls: {e}")
+        logger.error(f"Error getting calls: {e}")
         return {"success": False, "error": str(e)}
 
 def get_call_by_id(call_id: str) -> Dict[str, Any]:
@@ -463,7 +466,7 @@ def get_call_by_id(call_id: str) -> Dict[str, Any]:
         return {"success": True, "data": call}
 
     except Exception as e:
-        print(f"❌ Error getting call: {e}")
+        logger.error(f"Error getting call: {e}")
         return {"success": False, "error": str(e)}
 
 # API Endpoints
@@ -533,7 +536,7 @@ async def get_call_stats():
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error getting call stats: {e}")
+        logger.error(f"Error getting call stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("")
@@ -635,7 +638,7 @@ async def get_lead_call_stats(lead_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error getting lead call stats: {e}")
+        logger.error(f"Error getting lead call stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{call_id}")
@@ -676,7 +679,7 @@ async def get_call_messages(lead_id: str):
                 })
         return {"success": True, "data": messages, "total": len(messages)}
     except Exception as e:
-        print(f"❌ Error getting call messages: {e}")
+        logger.error(f"Error getting call messages: {e}")
         raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.post("")

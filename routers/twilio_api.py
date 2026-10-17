@@ -19,6 +19,7 @@ from twilio.rest import Client
 from ai_services import AIServices
 from agent_config import agent_config
 from auth_service import require_permission, require_user
+from logging_setup import bind_call
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
 from qa_engine import RealEstateQA
@@ -319,7 +320,8 @@ async def outbound_connect(request: Request):
 @router.post("/status", dependencies=[Depends(verify_twilio_request)])
 async def status_callback(request: Request):
     payload = dict(await request.form())
-    print(f"Twilio status callback: {payload}")
+    bind_call(payload.get("CallSid"))
+    logger.info("Twilio call status: %s (duration %ss)", payload.get("CallStatus"), payload.get("CallDuration", "-"))
     update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"))
     return {"success": True}
 
@@ -339,7 +341,7 @@ async def transfer_status_callback(request: Request):
         "canceled": "canceled",
     }
     transfer_status = status_map.get(dial_status, dial_status or "failed")
-    print(f"Twilio human transfer callback: {payload}")
+    logger.info("Twilio human transfer status: %s", payload.get("DialCallStatus"))
     record = transfer_service.update_transfer(parent_sid, transfer_status)
     update_call_from_twilio(
         parent_sid,
@@ -388,6 +390,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     return
                 session["session_id"] = data.get("sessionId") or data.get("callSid")
                 session["call_sid"] = data.get("callSid")
+                bind_call(session["call_sid"])
                 session["phone_number"] = data.get("from") or "unknown"
                 session["direction"] = data.get("direction") or "inbound"
                 outbound_context = get_outbound_call_context(session["call_sid"])
@@ -497,7 +500,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                         session["transfer_status"] = "dialing"
                         transfer_service.update_transfer(session["session_id"], "dialing", transfer_destination)
                     except Exception as exc:
-                        print(f"Twilio transfer failed: {exc}")
+                        logger.error(f"Twilio transfer failed: {exc}")
                         session["transfer_status"] = "failed"
                         session["transfer_error"] = str(exc)
                         transfer_service.update_transfer(session["session_id"], "failed", transfer_destination, str(exc))
@@ -534,7 +537,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        print(f"Twilio ConversationRelay websocket error: {exc}")
+        logger.error(f"Twilio ConversationRelay websocket error: {exc}")
     finally:
         handoff = transfer_service.get_call(session.get("session_id", "")) or {}
         transfer_service.close_call(session.get("session_id"))

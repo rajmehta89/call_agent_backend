@@ -7,6 +7,7 @@ Two ways to connect:
 """
 
 import json
+import logging
 import re
 import threading
 import time
@@ -14,6 +15,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+from logging_setup import timed
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_VERSION = "2025-10"
 SEARCH_STOP_WORDS = {
@@ -141,11 +146,13 @@ class ShopifyService:
             return self._token
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = self._http(
+        operation = re.sub(r"[^a-zA-Z]+", " ", query.split("{", 2)[1] if "{" in query else query).split()[0:1]
+        with timed(logger, f"Shopify {operation[0] if operation else 'query'}", warn_after_ms=2500):
+            payload = self._http(
             f"https://{self.store_domain}/admin/api/{self.api_version}/graphql.json",
-            json.dumps({"query": query, "variables": variables or {}}).encode(),
-            {"X-Shopify-Access-Token": self._bearer(), "Content-Type": "application/json", "Accept": "application/json"},
-        )
+                json.dumps({"query": query, "variables": variables or {}}).encode(),
+                {"X-Shopify-Access-Token": self._bearer(), "Content-Type": "application/json", "Accept": "application/json"},
+            )
         if payload.get("errors") and not payload.get("data"):
             raise RuntimeError("Shopify: " + "; ".join(str(item.get("message", item)) for item in payload["errors"])[:300])
         return payload.get("data") or {}

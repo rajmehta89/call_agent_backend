@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
 from auth_service import require_user
+from logging_setup import bind_call
 
 from ai_services import AIServices
 from brain_service import brain_service
@@ -28,6 +29,8 @@ from qa_engine import DynamicQA
 from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/api/retell", tags=["retell"])
@@ -54,7 +57,7 @@ retell_logger = _configure_retell_logger()
 def _trace(message: str, *, error: bool = False) -> None:
     """Mirror useful call diagnostics to the console and logs/retell-debug.log."""
     (retell_logger.error if error else retell_logger.info)(message)
-    print(message)
+    logger.info(message)
 
 
 def _enabled() -> bool:
@@ -420,6 +423,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         return
 
     await websocket.accept()
+    bind_call(call_id)
     _trace(f"retell_ws_connected call={call_id}")
     started_at = datetime.now()
     started_clock = perf_counter()

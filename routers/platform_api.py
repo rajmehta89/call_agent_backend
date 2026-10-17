@@ -27,6 +27,9 @@ from secret_store import decrypt_secret, encrypt_secret
 from shopify_service import shopify_service
 from ai_services import AIServices
 from campaign_registry import CAMPAIGN_TYPES, create_campaign, delete_campaign, get_campaigns, update_campaign
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/api/platform", tags=["platform"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
@@ -714,7 +717,7 @@ async def notify_email_outbox(payload: ValuePayload):
     try:
         result = gmail_service.send([owner_email], f"Review {len(drafts)} AI outreach email(s)", "\n".join(lines))
     except Exception as exc:
-        print(f"Gmail approval notification failed: {type(exc).__name__}: {exc}", flush=True)
+        logger.error(f"Gmail approval notification failed: {type(exc).__name__}: {exc}")
         raise HTTPException(status_code=502, detail="Gmail delivery failed; check the Gmail app password and SMTP settings") from exc
     if result.get("status") != "sent":
         raise HTTPException(status_code=409, detail=result.get("reason", "Approval digest was not sent"))

@@ -8,7 +8,11 @@ import logging
 import os
 import sys
 import uvicorn
-from fastapi import FastAPI
+import time
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from env_loader import load_project_env
@@ -21,15 +25,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# App-wide log level; set LOG_LEVEL=DEBUG in .env to see debug output.
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    stream=sys.stdout,
-)
-# Third-party libraries are very chatty at DEBUG (e.g. Mongo heartbeats every few seconds).
-for _noisy in ("pymongo", "httpx", "httpx2", "httpcore", "httpcore2", "urllib3", "asyncio", "websockets", "multipart", "watchfiles", "hpack", "openai"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+from logging_setup import bind_call, setup_logging
+
+# Console + logs/app.log; set LOG_LEVEL=DEBUG in .env for more detail.
+setup_logging()
+logger = logging.getLogger("relaydesk.http")
 
 from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, platform_api, retell_api, transfer_api, twilio_api, voice_provider_api
 from routers.leads_api_mongo import router as leads_router
@@ -53,6 +53,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Polling endpoints would drown out everything else at INFO.
+QUIET_PATHS = ("/health", "/api/platform/notifications")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """One line per request with status and duration; unexpected errors are logged with their traceback."""
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:8]
+    bind_call(request_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("%s %s crashed after %.0fms", request.method, request.url.path, (time.perf_counter() - started) * 1000)
+        return JSONResponse({"detail": "Internal server error", "request_id": request_id}, status_code=500)
+    elapsed = (time.perf_counter() - started) * 1000
+    level = logging.DEBUG if request.url.path.startswith(QUIET_PATHS) else logging.WARNING if response.status_code >= 500 else logging.INFO
+    logger.log(level, "%s %s -> %s in %.0fms", request.method, request.url.path, response.status_code, elapsed)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # Health check endpoint
 @app.get("/")

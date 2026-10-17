@@ -7,6 +7,9 @@ import json
 import os
 from typing import Dict, Any
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 class AgentConfig:
     def __init__(self, config_file_path: str = "agent_config.json"):
@@ -55,7 +58,7 @@ class AgentConfig:
                 self.save_config(self.default_config)
                 return self.default_config.copy()
         except Exception as e:
-            print(f"Error loading config: {e}")
+            logger.error(f"Error loading config: {e}")
             return self.default_config.copy()
 
     def save_config(self, config: Dict[str, Any] = None) -> bool:
@@ -70,10 +73,10 @@ class AgentConfig:
             if config:
                 self.config = config_to_save
 
-            print(f"Configuration saved to {self.config_file_path}")
+            logger.info(f"Configuration saved to {self.config_file_path}")
             return True
         except Exception as e:
-            print(f"Error saving config: {e}")
+            logger.error(f"Error saving config: {e}")
             return False
 
     def update_config(self, updates: Dict[str, Any]) -> bool:
@@ -82,7 +85,7 @@ class AgentConfig:
             self.config.update(updates)
             return self.save_config()
         except Exception as e:
-            print(f"Error updating config: {e}")
+            logger.error(f"Error updating config: {e}")
             return False
 
     def _needs_reload(self) -> bool:
@@ -105,7 +108,7 @@ class AgentConfig:
                 return True
             return True  # No reload needed
         except Exception as e:
-            print(f"Error reloading config: {e}")
+            logger.error(f"Error reloading config: {e}")
             return False
 
     def get_greeting_message(self) -> str:
