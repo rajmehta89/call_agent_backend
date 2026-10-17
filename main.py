@@ -31,7 +31,7 @@ from logging_setup import bind_call, setup_logging
 setup_logging()
 logger = logging.getLogger("relaydesk.http")
 
-from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, platform_api, retell_api, transfer_api, twilio_api, voice_provider_api
+from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
 from routers.leads_api_mongo import router as leads_router
 
 # Create FastAPI app
@@ -93,6 +93,7 @@ app.include_router(config_api.router)
 app.include_router(auth_api.router)
 app.include_router(calls_api.router)
 app.include_router(platform_api.router)
+app.include_router(shopify_api.router)
 app.include_router(twilio_api.router)
 app.include_router(custom_twilio_voice_api.router)
 app.include_router(retell_api.router)
