@@ -15,11 +15,13 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 import websockets
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
 from brain_service import brain_service
+from auth_service import require_user
 from conversation_memory import ConversationMemory
+from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from routers.calls_api import log_call
 from voice_provider_settings import provider_enabled, provider_snapshot
 from routers.twilio_api import _build_conversation_twiml, _get_request_base_url
@@ -138,7 +140,7 @@ def _greeting_text() -> str:
         return "Hello, how can I help you today?"
 
 
-@router.get("/config")
+@router.get("/config", dependencies=[Depends(require_user)])
 async def custom_voice_config() -> Dict[str, Any]:
     """Readiness information only. API credentials never leave the server."""
     custom = provider_snapshot()["custom"]
@@ -173,7 +175,7 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     return f'<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Sip>{sip_uri}</Sip></Dial></Response>'
 
 
-@router.post("/inbound", response_class=PlainTextResponse)
+@router.post("/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
     providers = provider_snapshot()
@@ -205,6 +207,7 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Connect><Stream url=\"" + html.escape(stream_url, quote=True) + "\">"
         f'<Parameter name="caller" value="{caller}" /><Parameter name="call_sid" value="{call_sid}" />'
+        f'<Parameter name="stream_token" value="{stream_token(str(form.get("CallSid") or ""))}" />'
         "</Stream></Connect></Response>",
         media_type="text/xml",
     )
@@ -376,6 +379,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         params = start.get("customParameters") or {}
                         caller = str(params.get("caller") or caller)
                         call_sid = str(params.get("call_sid") or call_sid)
+                        if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):
+                            logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
+                            await websocket.close(code=1008)
+                            return
                         greeting = _greeting_text()
                         responses.append({"content": greeting, "timestamp": datetime.now().isoformat()})
                         memory.add_assistant(greeting)

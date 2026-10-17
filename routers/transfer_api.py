@@ -1,13 +1,15 @@
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import Depends, APIRouter, HTTPException
 from pydantic import BaseModel
 
 from transfer_service import transfer_service
 from routers.calls_api import update_call_from_twilio
 
 
-router = APIRouter(prefix="/api/handoffs", tags=["handoffs"])
+from auth_service import require_user
+
+router = APIRouter(prefix="/api/handoffs", tags=["handoffs"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
 
 class AcceptTransferRequest(BaseModel):

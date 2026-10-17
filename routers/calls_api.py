@@ -3,14 +3,16 @@ Calls API Router - Complete FastAPI conversion from Flask
 Handles call logging, retrieval, and linking with leads
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import Depends, APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from bson import ObjectId
 from mongo_client import mongo_client
 
-router = APIRouter(prefix="/api/calls", tags=["calls"])
+from auth_service import require_user
+
+router = APIRouter(prefix="/api/calls", tags=["calls"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
 # Provider-neutral operational fields.  Keeping these on the call document
 # means the existing history and detail endpoints expose them without a second

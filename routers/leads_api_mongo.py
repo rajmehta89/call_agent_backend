@@ -7,7 +7,7 @@ import io
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, File, HTTPException, Path, Query, UploadFile
+from fastapi import Depends, APIRouter, File, HTTPException, Path, Query, UploadFile
 from pydantic import BaseModel
 
 from env_loader import load_project_env
@@ -15,7 +15,9 @@ from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
 load_project_env()
 
-router = APIRouter(prefix="/api/leads", tags=["Leads Management"])
+from auth_service import require_user
+
+router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
 
 class Lead(BaseModel):

@@ -3,15 +3,18 @@ Configuration API Router - Agent Configuration Management
 Converted from Flask to FastAPI for Render deployment
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import Depends, APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 
 from agent_config import agent_config
 
+from auth_service import require_permission
+
 router = APIRouter(
     prefix="/api/config",
-    tags=["Configuration"]
+    tags=["Configuration"],
+    dependencies=[Depends(require_permission("manage_agents"))],  # changes the AI prompt: admins only
 )
 
 # Pydantic models

@@ -18,7 +18,8 @@ from twilio.rest import Client
 
 from ai_services import AIServices
 from agent_config import agent_config
-from auth_service import require_permission
+from auth_service import require_permission, require_user
+from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
 from qa_engine import RealEstateQA
 from routers.calls_api import log_call, update_call_from_twilio
@@ -73,6 +74,9 @@ def _get_request_base_url(request: Request) -> str:
     return TWILIO_PUBLIC_BASE_URL
 
 
+RELAY_TOKEN_SUBJECT = "conversation-relay"
+
+
 def _build_conversation_twiml(public_base_url: Optional[str] = None) -> str:
     ws_url = f"{_get_ws_base_url(public_base_url)}/api/twilio/ws"
     greeting = html.escape(agent_config.get_greeting_message(), quote=True)
@@ -80,7 +84,9 @@ def _build_conversation_twiml(public_base_url: Optional[str] = None) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Connect>"
-        f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" language="{TWILIO_CONVERSATION_LANG}" />'
+        f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" language="{TWILIO_CONVERSATION_LANG}">'
+        f'<Parameter name="stream_token" value="{stream_token(RELAY_TOKEN_SUBJECT)}" />'
+        "</ConversationRelay>"
         "</Connect>"
         "</Response>"
     )
@@ -188,7 +194,7 @@ def get_outbound_call_context(call_sid: Optional[str]) -> Optional[Dict[str, Any
     return OUTBOUND_CALL_CONTEXT.get(call_sid)
 
 
-@router.get("/config")
+@router.get("/config", dependencies=[Depends(require_user)])
 async def twilio_config() -> Dict[str, Any]:
     """Safe local setup diagnostics; never return Twilio credentials."""
     public_base_url = _get_http_base_url()
@@ -239,12 +245,12 @@ async def _routed_twiml(request: Request) -> PlainTextResponse:
     return await custom_inbound(request)
 
 
-@router.post("/inbound", response_class=PlainTextResponse)
+@router.post("/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def inbound_call(request: Request):
     return await _routed_twiml(request)
 
 
-@router.post("/browser-connect", response_class=PlainTextResponse)
+@router.post("/browser-connect", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def browser_connect(request: Request):
     """Voice SDK TwiML entry point for a browser-only inbound-call test."""
     return await _routed_twiml(request)
@@ -305,12 +311,12 @@ async def browser_token(user: Dict[str, Any] = Depends(require_permission("handl
     return {"success": True, "data": {"token": token.to_jwt(), "expires_in": BROWSER_TOKEN_TTL_SECONDS}}
 
 
-@router.post("/outbound/connect", response_class=PlainTextResponse)
+@router.post("/outbound/connect", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def outbound_connect(request: Request):
     return PlainTextResponse("Outbound calling is disabled", status_code=410)
 
 
-@router.post("/status")
+@router.post("/status", dependencies=[Depends(verify_twilio_request)])
 async def status_callback(request: Request):
     payload = dict(await request.form())
     print(f"Twilio status callback: {payload}")
@@ -318,7 +324,7 @@ async def status_callback(request: Request):
     return {"success": True}
 
 
-@router.post("/transfer-status")
+@router.post("/transfer-status", dependencies=[Depends(verify_twilio_request)])
 async def transfer_status_callback(request: Request):
     """Persist the result of the human leg created by <Dial>."""
     payload = dict(await request.form())
@@ -376,6 +382,10 @@ async def twilio_conversation_ws(websocket: WebSocket):
             message_type = data.get("type")
 
             if message_type == "setup":
+                if not valid_stream_token(RELAY_TOKEN_SUBJECT, str((data.get("customParameters") or {}).get("stream_token") or "")):
+                    logger.warning("closing ConversationRelay socket without a valid stream token")
+                    await websocket.close(code=1008)
+                    return
                 session["session_id"] = data.get("sessionId") or data.get("callSid")
                 session["call_sid"] = data.get("callSid")
                 session["phone_number"] = data.get("from") or "unknown"

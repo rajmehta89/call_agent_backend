@@ -23,12 +23,13 @@ from email_templates import add_email_template, get_email_templates, normalize_d
 from prospect_discovery import discover_prospects, discovery_status, search_locations
 from gmail_service import gmail_service
 from mongo_client import mongo_client
+from secret_store import decrypt_secret, encrypt_secret
 from shopify_service import shopify_service
 from ai_services import AIServices
 from campaign_registry import CAMPAIGN_TYPES, create_campaign, delete_campaign, get_campaigns, update_campaign
 
 
-router = APIRouter(prefix="/api/platform", tags=["platform"])
+router = APIRouter(prefix="/api/platform", tags=["platform"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
 ROLE_PERMISSIONS = {
     "owner": ["*"],
@@ -189,7 +190,9 @@ def _apply_saved_shopify_config() -> None:
     if not mongo_client.is_connected():
         return
     saved = mongo_client.platform_settings.find_one({"key": "shopify"})
-    values = saved.get("value", {}) if saved else {}
+    values = dict(saved.get("value", {})) if saved else {}
+    for field in ("access_token", "client_secret"):
+        values[field] = decrypt_secret(values.get(field) or "")
     if values.get("store_domain") and (values.get("access_token") or (values.get("client_id") and values.get("client_secret"))):
         signature = (values.get("store_domain"), values.get("access_token"), values.get("client_id"), values.get("client_secret"), values.get("api_version"))
         current = (shopify_service.store_domain, shopify_service.static_token, shopify_service.client_id, shopify_service.client_secret, shopify_service.api_version)
@@ -1137,14 +1140,14 @@ async def configure_shopify(payload: ShopifyConfigPayload, user: Dict[str, Any] 
     saved_values = saved.get("value", {}) if saved else {}
     # Blank secret fields keep what is already saved, so the form never has to show secrets again.
     if payload.auth_mode == "admin_token":
-        token = payload.access_token.strip() or str(saved_values.get("access_token") or "")
+        token = payload.access_token.strip() or decrypt_secret(str(saved_values.get("access_token") or ""))
         client_id = client_secret = ""
     else:
         token = ""
         client_id = payload.client_id.strip() or str(saved_values.get("client_id") or "")
-        client_secret = payload.client_secret.strip() or str(saved_values.get("client_secret") or "")
+        client_secret = payload.client_secret.strip() or decrypt_secret(str(saved_values.get("client_secret") or ""))
     shopify_service.configure(payload.store_domain.strip(), token, payload.api_version.strip() or "2025-10", client_id=client_id, client_secret=client_secret)
-    stored = {"store_domain": shopify_service.store_domain, "access_token": token, "client_id": client_id, "client_secret": client_secret, "api_version": shopify_service.api_version}
+    stored = {"store_domain": shopify_service.store_domain, "access_token": encrypt_secret(token), "client_id": client_id, "client_secret": encrypt_secret(client_secret), "api_version": shopify_service.api_version}
     _upsert_setting("shopify", stored)
     data = shopify_service.status()
     if payload.test_connection and shopify_service.configured:

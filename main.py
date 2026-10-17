@@ -43,10 +43,13 @@ app = FastAPI(
 
 
 # Add CORS middleware
+# Browsers may only call this API from the dashboard's own origins. Set CORS_ORIGINS
+# (comma-separated) in production, e.g. "https://app.example.com".
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.56.1:3000"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
-    allow_credentials=True,
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",") if origin.strip()],
+    allow_credentials=False,  # the dashboard authenticates with a bearer token, not cookies
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -18,7 +18,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
+
+from auth_service import require_user
 
 from ai_services import AIServices
 from brain_service import brain_service
@@ -341,7 +343,7 @@ async def _stream_reply(
         yield "I’m sorry, I’m having trouble responding right now. Please try again in a moment."
 
 
-@router.get("/config")
+@router.get("/config", dependencies=[Depends(require_user)])
 async def retell_config_status() -> Dict[str, Any]:
     """Safe readiness data for the dashboard; secrets are never returned."""
     return {
