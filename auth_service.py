@@ -17,6 +17,7 @@ from mongo_client import mongo_client
 ALL_PERMISSIONS = [
     "view_dashboard",
     "handle_conversations",
+    "assign_conversations",
     "handle_calls",
     "view_customers",
     "manage_assigned_leads",
@@ -73,12 +74,18 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+_roles_ready = False
+
+
 def ensure_roles() -> None:
-    if not mongo_client.is_connected():
+    """Create the default roles once per process; they only need inserting the first time."""
+    global _roles_ready
+    if _roles_ready or not mongo_client.is_connected():
         return
     now = datetime.utcnow()
     for role in DEFAULT_ROLES:
         mongo_client.roles.update_one({"name": role["name"]}, {"$setOnInsert": {**role, "system": True, "created_at": now, "updated_at": now}}, upsert=True)
+    _roles_ready = True
 
 
 def role_document(role_name: str) -> Optional[Dict[str, Any]]:

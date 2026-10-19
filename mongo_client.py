@@ -32,7 +32,9 @@ class MongoDBClient:
         
         try:
             logger.info("Connecting to MongoDB Atlas...")
-            self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
+            # Networks like phone hotspots silently drop idle connections; recycling them after 60s
+            # means a request never waits on a dead socket.
+            self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000, maxIdleTimeMS=60000, connectTimeoutMS=10000, socketTimeoutMS=20000)
             # Force a real connection during startup so bad URIs or Atlas access issues fail early.
             self.client.admin.command("ping")
             self.db = self.client[self.database_name]
@@ -60,6 +62,7 @@ class MongoDBClient:
             self.email_outbox = self.db.email_outbox
             self.campaign_prospects = self.db.campaign_prospects
             self.discovery_runs = self.db.discovery_runs
+            self.team_messages = self.db.team_messages
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
@@ -71,6 +74,10 @@ class MongoDBClient:
             self.calls.create_index("phone_number")
             self.calls.create_index("call_date")
             self.calls.create_index("status")
+            self.calls.create_index("assigned_to", sparse=True)
+            self.team_messages.create_index([("workspace_id", 1), ("created_at", -1)])
+            self.team_messages.create_index("mentions")
+            self.team_messages.create_index("conversation_id", sparse=True)
             # Unique session id to deduplicate multiple WS reconnects for the same call
             try:
                 self.calls.create_index("call_session_id", unique=True, sparse=True)
