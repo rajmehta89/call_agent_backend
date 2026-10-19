@@ -21,6 +21,7 @@ from fastapi.responses import PlainTextResponse
 from brain_service import brain_service
 from auth_service import require_user
 from conversation_memory import ConversationMemory
+import live_transcript
 from logging_setup import bind_call, timed
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from routers.calls_api import log_call
@@ -261,6 +262,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     # Question currently being answered, until its reply starts playing.
     unanswered_text = ""
     active = True
+    pending_saves: set[asyncio.Task[Any]] = set()
 
     async def send_twilio(payload: Dict[str, Any]) -> None:
         async with send_lock:
@@ -268,6 +270,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def send_audio(chunk: bytes) -> None:
         await send_twilio({"event": "media", "streamSid": stream_sid, "media": {"payload": base64.b64encode(chunk).decode("ascii")}})
+
+    def save_progress() -> None:
+        """Write the transcript so far, so the inbox shows the call while it is happening."""
+        if call_sid:
+            lines = live_transcript.ordered_from_lists(transcript, responses)
+            task = asyncio.create_task(asyncio.to_thread(live_transcript.save_live, call_sid, caller, "custom_twilio", lines))
+            pending_saves.add(task)  # hold a reference until it finishes, or the task can be garbage-collected
+            task.add_done_callback(pending_saves.discard)
 
     def bot_busy() -> bool:
         return bool(pending_mark) or bool(reply_task and not reply_task.done())
@@ -329,6 +339,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         unanswered_text = ""  # committed: from here a new utterance is a new turn
         memory.add(text, reply)
         responses.append({"content": reply, "timestamp": datetime.now().isoformat()})
+        save_progress()
         first_audio = await speak(reply)
         logger.info("custom voice turn call=%s brain=%.2fs first_audio=%.2fs total=%.2fs", call_sid, brain_seconds, first_audio, brain_seconds + first_audio)
 
@@ -355,6 +366,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         unanswered_text = text
         transcript.append({"content": text, "timestamp": datetime.now().isoformat()})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
+        save_progress()
         reply_task = asyncio.create_task(answer(text, perf_counter()))
         reply_task.add_done_callback(log_reply_failure)
 
@@ -409,6 +421,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         greeting = _greeting_text()
                         responses.append({"content": greeting, "timestamp": datetime.now().isoformat()})
                         memory.add_assistant(greeting)
+                        save_progress()
                         reply_task = asyncio.create_task(speak(greeting, cache_key=_audio_cache_key(greeting)))
                         reply_task.add_done_callback(log_reply_failure)
                         if _filler_after_seconds():
@@ -444,6 +457,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "provider_call_status": "ended",
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],
+                "messages": live_transcript.ordered_from_lists(transcript, responses),
                 "summary": memory.summary or f"Custom Twilio voice call with {len(transcript)} caller turns and {len(responses)} AI responses.",
                 "sentiment": "neutral",
                 "call_session_id": call_sid or stream_sid,

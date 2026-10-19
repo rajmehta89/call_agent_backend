@@ -26,6 +26,7 @@ from logging_setup import bind_call
 from ai_services import AIServices
 from brain_service import brain_service
 from qa_engine import DynamicQA
+import live_transcript
 from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
@@ -186,6 +187,8 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
     outcome_status = "transfer_requested" if human_requested and transfer_status not in {"completed", "accepted"} else "completed"
     if str(call.get("call_status", "")).lower() == "error":
         outcome_status = "failed"
+    elif str(call.get("call_status", "")).lower() in {"registered", "ongoing"}:
+        outcome_status = live_transcript.LIVE_STATUS  # transcript_updated arrives while the call is still running
 
     latency = call.get("latency") or {}
     e2e = latency.get("e2e") or {}
@@ -229,6 +232,10 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
         "human_callback_requested": human_requested,
         "analysis_status": "complete" if event == "call_analyzed" else "pending",
         "transcript_with_tool_calls": call.get("transcript_with_tool_calls") or [],
+        "messages": live_transcript.ordered_from_retell(
+            call.get("transcript_object") or [],
+            datetime.fromtimestamp(float(call["start_timestamp"]) / 1000) if call.get("start_timestamp") else None,
+        ),
         "provider_started_at": _timestamp_from_ms(call.get("start_timestamp")),
         "provider_ended_at": _timestamp_from_ms(call.get("end_timestamp")),
     }
@@ -431,6 +438,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     callback_requested = False
     user_messages: List[Dict[str, str]] = []
     agent_messages: List[Dict[str, str]] = []
+    live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
+    live_saves: set[asyncio.Task[None]] = set()
     services = AIServices()
     services.config.OPENROUTER_MODEL = os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b").strip()
     intent_analyzer = DynamicQA(services)
@@ -475,6 +484,25 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     async def send_event(payload: Dict[str, Any]) -> None:
         async with send_lock:
             await websocket.send_json(payload)
+
+    def save_progress(transcript: Any, reply: str = "") -> None:
+        """Rebuild the ordered transcript from Retell's (it is always complete and in order) and save it.
+        Lines keep the time they were first seen; Retell's live transcript carries no timings."""
+        nonlocal live_messages
+        now = datetime.now().isoformat()
+        lines = live_transcript.ordered_from_retell(transcript)
+        if reply:
+            lines.append({"role": "agent", "text": reply, "at": ""})
+        for index, line in enumerate(lines):
+            previous = live_messages[index] if index < len(live_messages) else None
+            line["at"] = previous["at"] if previous and previous["role"] == line["role"] else now
+        if lines == live_messages:
+            return
+        live_messages = lines
+        phone = caller_number if caller_number != "unknown" else "Web caller"
+        task = asyncio.create_task(asyncio.to_thread(live_transcript.save_live, call_id, phone, "retell", list(lines)))
+        live_saves.add(task)
+        task.add_done_callback(live_saves.discard)
 
     async def handle_response(event: Dict[str, Any], response_id: int) -> None:
         nonlocal callback_requested, user_messages
@@ -527,6 +555,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             return
 
         agent_messages.append({"content": reply, "timestamp": datetime.now().isoformat()})
+        save_progress(event.get("transcript"), reply)
         transfer_service.append_message(call_id, "assistant", reply)
         if _log_content_enabled():
             _trace(f"retell_llm_answer call={call_id} response_id={response_id} answer={reply!r}")
@@ -579,6 +608,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     _trace(f"retell_ws_ignored_event call={call_id} type={interaction_type or 'missing'}")
                 continue
 
+            save_progress(transcript)
             response_id = event.get("response_id")
             if not isinstance(response_id, int):
                 continue
@@ -622,6 +652,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     "call_session_id": call_id,
                     "provider": "retell",
                     "started_at": started_at.isoformat(),
+                    "messages": live_messages,
                 },
             )
             _trace(f"retell_ws_fallback_call_saved call={call_id} messages={len(user_messages) + len(agent_messages)} callback={callback_requested}")

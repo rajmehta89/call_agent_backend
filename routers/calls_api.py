@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from bson import ObjectId
 from mongo_client import mongo_client
+import re
 
 from auth_service import require_user
 import logging
@@ -47,7 +48,18 @@ EXTRA_CALL_FIELDS = (
     "transcript_with_tool_calls",
     "provider_started_at",
     "provider_ended_at",
+    "messages",  # ordered transcript written live during the call (live_transcript.py)
 )
+
+_BROWSER_CALLER = re.compile(r"^client:(browser_[A-Za-z0-9]+)_[A-Za-z0-9]+$")
+
+
+def caller_identity(phone_number: str) -> str:
+    """One identity per caller. Browser test calls arrive as client:browser_<user>_<random>, a new value
+    every call; dropping the random part keeps all of one user's test calls on one lead and inbox thread."""
+    raw = str(phone_number or "").strip()
+    match = _BROWSER_CALLER.match(raw)
+    return f"client:{match.group(1)}" if match else raw
 
 # Pydantic Models
 class LogCallRequest(BaseModel):
@@ -153,19 +165,18 @@ def _ensure_inbound_lead(
     if existing:
         return str(existing["_id"]), existing
 
-    raw_identifier = str(phone_number or "").strip()
+    raw_identifier = caller_identity(phone_number)
     if not raw_identifier or raw_identifier.lower() in {"unknown", "anonymous"}:
         return None, None
 
     session_id = str(data.get("call_session_id") or "").strip()
-    is_web_call = raw_identifier.lower() == "web caller" or raw_identifier.startswith("client:")
     lead_phone = f"web:{session_id}" if raw_identifier.lower() == "web caller" and session_id else raw_identifier
     existing = mongo_client.leads.find_one({"phone": lead_phone})
     if existing:
         return str(existing["_id"]), existing
 
     label = "Web caller" if raw_identifier.lower() == "web caller" else "Browser caller" if raw_identifier.startswith("client:") else "Inbound caller"
-    if session_id and is_web_call:
+    if session_id and raw_identifier.lower() == "web caller":  # browser callers share one lead, so no per-call suffix
         label = f"{label} {session_id[-6:]}"
     lead = {
         "name": label,
@@ -194,14 +205,15 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
 
         now = datetime.now()
         lead_id, lead = _ensure_inbound_lead(phone_number, lead_id, call_data, now)
+        identity = caller_identity(phone_number)
         mongo_client.customers.update_one(
-            {"phone": phone_number},
+            {"phone": identity},
             {
                 "$set": {"updated_at": now},
                 "$addToSet": {"channels": "voice"},
                 "$setOnInsert": {
                     "name": (lead or {}).get("name", ""),
-                    "phone": phone_number,
+                    "phone": identity,
                     "email": (lead or {}).get("email", ""),
                     "location": "",
                     "lead_status": (lead or {}).get("status", "none"),

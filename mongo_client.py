@@ -63,6 +63,7 @@ class MongoDBClient:
             self.campaign_prospects = self.db.campaign_prospects
             self.discovery_runs = self.db.discovery_runs
             self.team_messages = self.db.team_messages
+            self.inbox_threads = self.db.inbox_threads  # per-caller inbox state (assignment), keyed by caller identity
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
@@ -74,7 +75,7 @@ class MongoDBClient:
             self.calls.create_index("phone_number")
             self.calls.create_index("call_date")
             self.calls.create_index("status")
-            self.calls.create_index("assigned_to", sparse=True)
+            self.inbox_threads.create_index("assigned_to", sparse=True)
             self.team_messages.create_index([("workspace_id", 1), ("created_at", -1)])
             self.team_messages.create_index("mentions")
             self.team_messages.create_index("conversation_id", sparse=True)
