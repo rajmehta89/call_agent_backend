@@ -186,7 +186,12 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     retell_call_id = response.json()["call_id"]
     logger.info("retell answering call %s (retell call %s)", form.get("CallSid"), retell_call_id)
     sip_uri = html.escape(f"sip:{retell_call_id}@sip.retellai.com", quote=True)
-    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Sip>{sip_uri}</Sip></Dial></Response>'
+    # Browser calls arrive From "client:..."; Twilio rejects that as a SIP caller ID (error 13247).
+    caller_id = str(form.get("From") or "")
+    if not caller_id.startswith("+"):
+        caller_id = (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
+    caller_attr = f' callerId="{html.escape(caller_id, quote=True)}"' if caller_id else ""
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Dial{caller_attr}><Sip>{sip_uri}</Sip></Dial></Response>'
 
 
 @router.post("/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
