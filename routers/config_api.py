@@ -22,6 +22,7 @@ class ConfigUpdate(BaseModel):
     greeting_message: Optional[str] = None
     exit_message: Optional[str] = None
     system_prompt: Optional[str] = None
+    voice_prompt: Optional[str] = None  # full voice-call prompt; empty string = built-in voice rules
     knowledge_base_enabled: Optional[bool] = None
     knowledge_base: Optional[str] = None
     human_transfer: Optional[Dict[str, Any]] = None
@@ -55,6 +56,8 @@ async def update_config(data: ConfigUpdate):
             updates["exit_message"] = data.exit_message.strip()
         if data.system_prompt is not None:
             updates["system_prompt"] = data.system_prompt.strip()
+        if data.voice_prompt is not None:
+            updates["voice_prompt"] = data.voice_prompt.strip()
         if data.knowledge_base_enabled is not None:
             updates["knowledge_base_enabled"] = data.knowledge_base_enabled
         if data.knowledge_base is not None:

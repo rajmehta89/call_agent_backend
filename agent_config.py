@@ -1,15 +1,35 @@
 """
 Dynamic Agent Configuration Management
 Handles greeting messages, exit messages, and prompt configurations
+
+Stored in MongoDB (platform_settings, key "agent_config") so every server and every redeploy share it.
+agent_config.json is kept as the first-run default and as a fallback while the database is unreachable.
+Reads are cached for DB_REFRESH_SECONDS so a voice turn never waits on the database.
 """
 
 import json
 import os
-from typing import Dict, Any
+import threading
+import time
+from typing import Dict, Any, Optional
 from datetime import datetime
+from timeutil import utc_iso
 import logging
 
 logger = logging.getLogger(__name__)
+
+DB_KEY = "agent_config"
+DB_REFRESH_SECONDS = 30
+
+
+def _settings_collection():
+    """platform_settings when the database is reachable, else None (imported lazily: mongo_client loads after this module)."""
+    try:
+        from mongo_client import mongo_client
+        return mongo_client.platform_settings if mongo_client and mongo_client.is_connected() else None
+    except Exception as error:  # never let config reads break a call
+        logger.warning("agent config: database unavailable (%s); using the local file", error)
+        return None
 
 class AgentConfig:
     def __init__(self, config_file_path: str = "agent_config.json"):
@@ -34,9 +54,11 @@ class AgentConfig:
                 "fallback_message": "I am transferring you to a human agent now. They will have the context from this call.",
                 "agents": []
             },
-            "last_updated": datetime.now().isoformat(),
+            "last_updated": utc_iso(),
             "version": "1.0"
         }
+        self._db_checked_at = 0.0
+        self._refreshing = False
         self.config = self.load_config()
 
         # Initialize last modified timestamp for config reload tracking
@@ -45,14 +67,37 @@ class AgentConfig:
         else:
             self._last_modified = 0
 
+    def _load_from_db(self) -> Optional[Dict[str, Any]]:
+        collection = _settings_collection()
+        if collection is None:
+            return None
+        document = collection.find_one({"key": DB_KEY})
+        self._db_checked_at = time.monotonic()
+        return {**self.default_config, **document["value"]} if document and isinstance(document.get("value"), dict) else None
+
+    def _save_to_db(self, config: Dict[str, Any]) -> bool:
+        collection = _settings_collection()
+        if collection is None:
+            return False
+        collection.update_one({"key": DB_KEY}, {"$set": {"value": config, "updated_at": datetime.utcnow()}}, upsert=True)
+        self._db_checked_at = time.monotonic()
+        return True
+
     def load_config(self) -> Dict[str, Any]:
-        """Load configuration from file or create with defaults"""
+        """Load configuration from the database, else the file (seeding the database from it), else defaults"""
+        try:
+            stored = self._load_from_db()
+            if stored is not None:
+                return stored
+        except Exception as e:
+            logger.error(f"Error loading config from the database: {e}")
         try:
             if os.path.exists(self.config_file_path):
                 with open(self.config_file_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    # Merge with defaults to ensure all keys exist
-                    return {**self.default_config, **config}
+                    config = {**self.default_config, **json.load(f)}  # merge with defaults so all keys exist
+                if self._save_to_db(config):
+                    logger.info("agent config: copied %s into the database", self.config_file_path)
+                return config
             else:
                 # Create default config file
                 self.save_config(self.default_config)
@@ -65,23 +110,43 @@ class AgentConfig:
         """Save configuration to file"""
         try:
             config_to_save = config or self.config
-            config_to_save["last_updated"] = datetime.now().isoformat()
+            config_to_save["last_updated"] = utc_iso()
 
-            with open(self.config_file_path, 'w', encoding='utf-8') as f:
+            saved_to_db = False
+            try:
+                saved_to_db = self._save_to_db(config_to_save)
+            except Exception as e:
+                logger.error(f"Error saving config to the database: {e}")
+            with open(self.config_file_path, 'w', encoding='utf-8') as f:  # local copy: offline fallback
                 json.dump(config_to_save, f, indent=2, ensure_ascii=False)
+            self._last_modified = os.path.getmtime(self.config_file_path)
 
             if config:
                 self.config = config_to_save
 
-            logger.info(f"Configuration saved to {self.config_file_path}")
+            logger.info("Configuration saved (%s)", "database + local file" if saved_to_db else f"local file only: {self.config_file_path}")
             return True
         except Exception as e:
             logger.error(f"Error saving config: {e}")
             return False
 
     def update_config(self, updates: Dict[str, Any]) -> bool:
-        """Update specific configuration values"""
+        """Update specific configuration values.
+        Writes only the changed fields, then reloads the whole record: the in-memory copy can be up to
+        DB_REFRESH_SECONDS old (or come from another process), and saving it whole would silently undo settings
+        saved elsewhere in the meantime, e.g. the knowledge copy written by the Knowledge page."""
         try:
+            collection = _settings_collection()
+            if collection is not None:
+                fields = {f"value.{key}": value for key, value in updates.items()}
+                collection.update_one({"key": DB_KEY}, {"$set": {**fields, "value.last_updated": utc_iso(), "updated_at": datetime.utcnow()}}, upsert=True)
+                stored = self._load_from_db()
+                if stored is not None:
+                    self.config = stored
+                    with open(self.config_file_path, 'w', encoding='utf-8') as f:  # local copy: offline fallback
+                        json.dump(self.config, f, indent=2, ensure_ascii=False)
+                    self._last_modified = os.path.getmtime(self.config_file_path)
+                    return True
             self.config.update(updates)
             return self.save_config()
         except Exception as e:
@@ -98,10 +163,32 @@ class AgentConfig:
         except Exception:
             return True  # If we can't check, assume we need to reload
 
-    def reload_config(self) -> bool:
-        """Reload configuration from file if it has been modified"""
+    def _refresh_from_db(self) -> None:
         try:
-            if self._needs_reload():
+            stored = self._load_from_db()
+            if stored is not None:
+                self.config = stored
+        except Exception as e:
+            logger.warning(f"background config refresh failed: {e}")
+        finally:
+            self._refreshing = False
+
+    def reload_config(self) -> bool:
+        """Pick up changes: from the database every DB_REFRESH_SECONDS, else from the file if it was modified"""
+        try:
+            if self._db_checked_at and time.monotonic() - self._db_checked_at >= DB_REFRESH_SECONDS:
+                # Serve the copy in memory and refresh it in the background: a database round trip (0.1-0.3 s to
+                # the cloud) must not sit inside a live call turn. Changes still show within one refresh period.
+                if not self._refreshing:
+                    self._refreshing = True
+                    threading.Thread(target=self._refresh_from_db, name="agent-config-refresh", daemon=True).start()
+                return True
+            if self._db_checked_at == 0.0:
+                stored = self._load_from_db()
+                if stored is not None:
+                    self.config = stored
+                    return True
+            if self._db_checked_at == 0.0 and self._needs_reload():
                 self.config = self.load_config()
                 if os.path.exists(self.config_file_path):
                     self._last_modified = os.path.getmtime(self.config_file_path)
@@ -125,6 +212,12 @@ class AgentConfig:
         """Get current system prompt (reloads config to get latest)"""
         self.reload_config()
         return self.config.get("system_prompt", self.default_config["system_prompt"])
+
+    def get_voice_prompt(self) -> str:
+        """Full voice-call prompt written by the business ({{business_knowledge}} marks where knowledge goes).
+        Empty means the built-in voice rules are used (routers/retell_api.py)."""
+        self.reload_config()
+        return str(self.config.get("voice_prompt") or "").strip()
 
     def get_knowledge_base_enabled(self) -> bool:
         """Get knowledge base enabled status"""

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import hmac
+import logging
 import os
 import re
 from typing import Any, Dict
@@ -11,6 +12,7 @@ from auth_service import ensure_roles, hash_password, invitation_hash, issue_tok
 from mongo_client import mongo_client
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 
@@ -66,7 +68,7 @@ def _auth_response(user: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.post("/signup")
-async def signup(payload: SignupPayload):
+def signup(payload: SignupPayload):
     if not mongo_client.is_connected():
         raise HTTPException(status_code=503, detail="Database not connected")
     email = payload.email.lower()
@@ -93,50 +95,84 @@ async def signup(payload: SignupPayload):
 
 
 @router.get("/config")
-async def auth_config():
+def auth_config():
     first_account = mongo_client.users.count_documents({}) == 0 if mongo_client.is_connected() else True
     return {"success": True, "data": {"setup_required": bool(os.getenv("BOOTSTRAP_SETUP_TOKEN")), "public_signup_enabled": os.getenv("ALLOW_PUBLIC_SIGNUP", "false").lower() in {"1", "true", "yes", "on"}, "first_account_is_admin": first_account, "workspace_name": _configured_workspace_name()}}
 
 
+# Password guessing: after LOGIN_MAX_FAILURES wrong passwords for one email within LOGIN_WINDOW, that email is
+# locked for the rest of the window. Failures live in MongoDB (login_failures, TTL index) so the lock survives
+# restarts and holds across servers.
+LOGIN_MAX_FAILURES = 10
+LOGIN_WINDOW = timedelta(minutes=15)
+
+
+def _recent_failures(email: str) -> int:
+    return mongo_client.login_failures.count_documents({"email": email, "at": {"$gt": datetime.utcnow() - LOGIN_WINDOW}})
+
+
+def _record_failure(email: str) -> int:
+    mongo_client.login_failures.insert_one({"email": email, "at": datetime.utcnow()})
+    return _recent_failures(email)
+
+
+def _clear_failures(email: str) -> None:
+    mongo_client.login_failures.delete_many({"email": email})
+
+
 @router.post("/login")
-async def login(payload: LoginPayload):
+def login(payload: LoginPayload):
     if not mongo_client.is_connected():
         raise HTTPException(status_code=503, detail="Database not connected")
-    user = mongo_client.users.find_one({"email": payload.email.lower()})
+    email = payload.email.lower()
+    if _recent_failures(email) >= LOGIN_MAX_FAILURES:
+        logger.warning("auth: %s is locked after %d failed sign-ins", email, LOGIN_MAX_FAILURES)
+        raise HTTPException(status_code=429, detail="Too many failed sign-in attempts. Try again in 15 minutes.")
+    user = mongo_client.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user.get("password_hash", "")):
+        logger.info("auth: failed sign-in for %s (%d in the last 15 min)", email, _record_failure(email))
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user.get("active") is False:
+        raise HTTPException(status_code=403, detail="This account has been deactivated. Ask a workspace admin to reactivate it.")
+    _clear_failures(email)
     return {"success": True, "data": _auth_response(user)}
 
 
 @router.get("/me")
-async def me(user: Dict[str, Any] = Depends(require_user)):
+def me(user: Dict[str, Any] = Depends(require_user)):
     return {"success": True, "data": public_user(user)}
 
 
 @router.put("/profile")
-async def update_profile(payload: ProfilePayload, user: Dict[str, Any] = Depends(require_user)):
+def update_profile(payload: ProfilePayload, user: Dict[str, Any] = Depends(require_user)):
     values = {"name": payload.name.strip(), "phone": payload.phone.strip(), "timezone": payload.timezone.strip(), "language": payload.language.strip(), "updated_at": datetime.utcnow()}
     mongo_client.users.update_one({"_id": user["_id"]}, {"$set": values})
     return {"success": True, "data": public_user(mongo_client.users.find_one({"_id": user["_id"]}))}
 
 
 @router.post("/logout")
-async def logout(user: Dict[str, Any] = Depends(require_user)):
-    return {"success": True, "data": {"logged_out": True}}
+def logout(everywhere: bool = False, user: Dict[str, Any] = Depends(require_user)):
+    """Signing out of one browser just drops its token there; everywhere=true also invalidates every other session."""
+    if everywhere:
+        mongo_client.users.update_one({"_id": user["_id"]}, {"$inc": {"auth_version": 1}, "$set": {"updated_at": datetime.utcnow()}})
+        logger.info("auth: %s signed out everywhere", user.get("email"))
+    return {"success": True, "data": {"logged_out": True, "everywhere": everywhere}}
 
 
 @router.post("/password")
-async def change_password(payload: ChangePasswordPayload, user: Dict[str, Any] = Depends(require_user)):
+def change_password(payload: ChangePasswordPayload, user: Dict[str, Any] = Depends(require_user)):
     if not verify_password(payload.current_password, user.get("password_hash", "")):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if payload.current_password == payload.new_password:
         raise HTTPException(status_code=400, detail="Choose a new password")
     mongo_client.users.update_one({"_id": user["_id"]}, {"$set": {"password_hash": hash_password(payload.new_password), "updated_at": datetime.utcnow()}, "$inc": {"auth_version": 1}})
-    return {"success": True, "data": {"password_updated": True}}
+    logger.info("auth: %s changed their password (other sessions signed out)", user.get("email"))
+    # Other devices are signed out (auth_version moved on); this browser gets a fresh token and stays signed in.
+    return {"success": True, "data": {"password_updated": True, "token": issue_token(mongo_client.users.find_one({"_id": user["_id"]}))}}
 
 
 @router.get("/invite/{token}")
-async def invite_preview(token: str):
+def invite_preview(token: str):
     if not mongo_client.is_connected():
         raise HTTPException(status_code=503, detail="Database not connected")
     invitation = mongo_client.invitations.find_one({"token_hash": invitation_hash(token), "status": "pending", "expires_at": {"$gt": datetime.utcnow()}})
@@ -146,7 +182,7 @@ async def invite_preview(token: str):
 
 
 @router.post("/accept-invite")
-async def accept_invite(payload: AcceptInvitePayload):
+def accept_invite(payload: AcceptInvitePayload):
     if not mongo_client.is_connected():
         raise HTTPException(status_code=503, detail="Database not connected")
     invitation = mongo_client.invitations.find_one({"token_hash": invitation_hash(payload.token), "status": "pending", "expires_at": {"$gt": datetime.utcnow()}})

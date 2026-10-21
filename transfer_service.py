@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from timeutil import utc_iso
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
@@ -39,8 +40,8 @@ class TransferService:
                 "transfer_error": existing.get("transfer_error"),
                 "notes": existing.get("notes"),
                 "messages": existing.get("messages", []),
-                "created_at": existing.get("created_at", datetime.now().isoformat()),
-                "updated_at": datetime.now().isoformat(),
+                "created_at": existing.get("created_at", utc_iso()),
+                "updated_at": utc_iso(),
             }
             self._calls[session_id] = record
             return deepcopy(record)
@@ -57,11 +58,11 @@ class TransferService:
                 {
                     "speaker": speaker,
                     "content": content,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": utc_iso(),
                 }
             )
             record["messages"] = record["messages"][-30:]
-            record["updated_at"] = datetime.now().isoformat()
+            record["updated_at"] = utc_iso()
 
     def request_transfer(
         self,
@@ -85,7 +86,7 @@ class TransferService:
             record["status"] = "awaiting_human"
             record["transfer_status"] = "requested"
             record["transfer_error"] = None
-            record["updated_at"] = datetime.now().isoformat()
+            record["updated_at"] = utc_iso()
             return deepcopy(record)
 
     def update_transfer(
@@ -106,7 +107,7 @@ class TransferService:
                 record["handled_by"] = destination
             if error:
                 record["transfer_error"] = error
-            record["updated_at"] = datetime.now().isoformat()
+            record["updated_at"] = utc_iso()
             return deepcopy(record)
 
     def accept_transfer(self, session_id: str, agent_name: str) -> Optional[Dict[str, Any]]:
@@ -118,8 +119,8 @@ class TransferService:
             record["accepted_by"] = agent_name
             record["handled_by"] = agent_name
             record["transfer_status"] = "accepted"
-            record["accepted_at"] = datetime.now().isoformat()
-            record["updated_at"] = datetime.now().isoformat()
+            record["accepted_at"] = utc_iso()
+            record["updated_at"] = utc_iso()
             return deepcopy(record)
 
     def resolve_transfer(self, session_id: str, notes: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -130,8 +131,8 @@ class TransferService:
             record["status"] = "resolved"
             record["transfer_status"] = "completed"
             record["notes"] = notes or record.get("notes")
-            record["resolved_at"] = datetime.now().isoformat()
-            record["updated_at"] = datetime.now().isoformat()
+            record["resolved_at"] = utc_iso()
+            record["updated_at"] = utc_iso()
             return deepcopy(record)
 
     def close_call(self, session_id: Optional[str]) -> None:
@@ -143,7 +144,7 @@ class TransferService:
                 return
             if record.get("status") == "active":
                 record["status"] = "completed"
-            record["updated_at"] = datetime.now().isoformat()
+            record["updated_at"] = utc_iso()
 
     def get_active_handoffs(self) -> List[Dict[str, Any]]:
         with self._lock:

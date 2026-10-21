@@ -5,6 +5,7 @@ Handles database connections and collections
 """
 
 import os
+import time
 from pymongo import MongoClient
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -30,6 +31,18 @@ class MongoDBClient:
             self.last_error = "MONGO_URI not configured"
             return
         
+        self._last_attempt = 0.0
+        self._connect()
+
+    # A failed connection is retried at most this often, from is_connected(), so a network drop while the
+    # server starts (e.g. a phone hotspot) heals by itself instead of leaving every request "not connected".
+    RECONNECT_EVERY_SECONDS = 10
+    # How long a successful ping is trusted before is_connected() pings again.
+    PING_TRUST_SECONDS = 15
+    _last_ok = 0.0
+
+    def _connect(self) -> None:
+        self._last_attempt = time.monotonic()
         try:
             logger.info("Connecting to MongoDB Atlas...")
             # Networks like phone hotspots silently drop idle connections; recycling them after 60s
@@ -64,12 +77,14 @@ class MongoDBClient:
             self.discovery_runs = self.db.discovery_runs
             self.team_messages = self.db.team_messages
             self.inbox_threads = self.db.inbox_threads  # per-caller inbox state (assignment), keyed by caller identity
+            self.login_failures = self.db.login_failures  # wrong passwords, expire after 15 min (sign-in lockout)
             
             # Create indexes for better performance
             self.leads.create_index("phone", unique=True)
             self.leads.create_index("email")
             self.leads.create_index("status")
             self.leads.create_index("created_at")
+            self.leads.create_index("assigned_to", sparse=True)  # team members see the leads assigned to them
             
             self.calls.create_index("lead_id")
             self.calls.create_index("phone_number")
@@ -151,6 +166,10 @@ class MongoDBClient:
             self.campaign_prospects.create_index("created_at")
             self.discovery_runs.create_index("created_at")
             self.notifications.create_index("read")
+            # The bell and the inbox read a person's unread notices every few seconds.
+            self.notifications.create_index([("recipient", 1), ("read", 1), ("created_at", -1)])
+            self.login_failures.create_index("at", expireAfterSeconds=15 * 60)
+            self.login_failures.create_index("email")
             
             logger.info("MongoDB connected successfully")
             
@@ -161,16 +180,26 @@ class MongoDBClient:
             self.last_error = str(e)
     
     def is_connected(self) -> bool:
-        """Check if MongoDB is connected"""
+        """Check if MongoDB is connected, reconnecting if the last attempt failed."""
         if self.client is None:
-            return False
+            if not self.mongo_uri or time.monotonic() - self._last_attempt < self.RECONNECT_EVERY_SECONDS:
+                return False
+            logger.warning("MongoDB is not connected (%s); retrying", self.last_error)
+            self._connect()
+            return self.client is not None
 
+        # A ping is a network round trip (0.4 s, at times over 2 s, to Atlas) and a voice turn asks several times
+        # before it can speak: trust a successful ping for a few seconds. Failed queries still raise and are handled.
+        if time.monotonic() - self._last_ok < self.PING_TRUST_SECONDS:
+            return True
         try:
             self.client.admin.command("ping")
             self.last_error = None
+            self._last_ok = time.monotonic()
             return True
         except Exception as exc:
             self.last_error = str(exc)
+            self._last_ok = 0.0
             return False
     
     def get_database_stats(self) -> Dict[str, Any]:

@@ -5,7 +5,10 @@ import json
 import os
 import re
 import requests
-from time import perf_counter
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
+import threading
+from time import monotonic, perf_counter
 from typing import Any, Dict, List, Optional
 
 from ai_services import AIServices
@@ -61,6 +64,127 @@ VOICE_REPLY_CHECKLIST = (
     "confirm it on a callback. (3) Speak as the assistant and refer to the owner by name, never 'I build' or "
     "'my rate'. (4) Under 30 words, no opener like 'Sure' or 'Great', and no question unless you truly need one."
 )
+
+
+# Live-call speed: a voice turn must not wait on slow network lookups that rarely change.
+# - query embeddings are cached by text (prefetched while the caller is still speaking, see retell_api);
+# - small reads (channel settings, caller context, the knowledge documents) are cached for a few seconds.
+_EMBEDDING_CACHE: "OrderedDict[str, List[float]]" = OrderedDict()
+_EMBEDDING_CACHE_SIZE = 512
+_EMBEDDING_LOCK = threading.Lock()
+_EMBEDDING_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
+_EMBEDDING_INFLIGHT: Dict[str, Future] = {}
+_TTL_CACHE: Dict[str, tuple] = {}
+_TTL_LOCK = threading.Lock()
+
+
+def _ttl_cached(key: str, ttl_seconds: float, load):
+    """Return a recent value for key, or load and remember it. Used only for reads that may be a few seconds stale."""
+    now = monotonic()
+    with _TTL_LOCK:
+        hit = _TTL_CACHE.get(key)
+        if hit and now - hit[0] < ttl_seconds:
+            return hit[1]
+    value = load()
+    with _TTL_LOCK:
+        _TTL_CACHE[key] = (now, value)
+    return value
+
+
+# Local embeddings: a small open model (BAAI/bge-small-en-v1.5, ~67 MB, CPU) turns a question into a search vector
+# in ~35 ms, against 1-1.5 s for a network embedding API, and cannot be rate-limited or go down. Knowledge chunks
+# keep their OpenRouter vector ("embedding", used by Atlas search) and also get a local one ("embedding_local").
+# Turn off with LOCAL_EMBEDDINGS=false; if the model cannot load, search falls back to the network embeddings.
+_LOCAL_EMBEDDER: Any = None
+_LOCAL_EMBEDDER_FAILED = False
+_LOCAL_EMBEDDER_LOCK = threading.Lock()
+
+
+def _local_embedder() -> Any:
+    global _LOCAL_EMBEDDER, _LOCAL_EMBEDDER_FAILED
+    if _LOCAL_EMBEDDER is not None or _LOCAL_EMBEDDER_FAILED:
+        return _LOCAL_EMBEDDER
+    if os.getenv("LOCAL_EMBEDDINGS", "true").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    with _LOCAL_EMBEDDER_LOCK:
+        if _LOCAL_EMBEDDER is None and not _LOCAL_EMBEDDER_FAILED:
+            try:
+                from fastembed import TextEmbedding
+                cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "fastembed")
+                _LOCAL_EMBEDDER = TextEmbedding(os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"), cache_dir=cache_dir)
+                logger.info("local embedding model ready: %s", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"))
+            except Exception as exc:
+                _LOCAL_EMBEDDER_FAILED = True
+                logger.warning(f"local embeddings unavailable, using network embeddings: {type(exc).__name__}: {exc}")
+    return _LOCAL_EMBEDDER
+
+
+def local_embeddings(texts: List[str], query: bool = False) -> List[List[float]]:
+    """Normalised local vectors for texts (passages by default, or search queries); [] when unavailable."""
+    model = _local_embedder()
+    if model is None or not texts:
+        return []
+    try:
+        vectors = model.query_embed(texts) if query else model.passage_embed(texts)
+        return [[float(value) for value in vector] for vector in vectors]
+    except Exception as exc:
+        logger.warning(f"local embedding failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+def clear_brain_caches() -> None:
+    """Forget cached settings and documents (call after editing the brain so the next turn sees it at once).
+    Also bumps the shared brain version, so other server processes drop their copies within seconds."""
+    with _TTL_LOCK:
+        _TTL_CACHE.clear()
+    try:
+        if mongo_client.is_connected():
+            mongo_client.platform_settings.update_one({"key": "brain_version"}, {"$inc": {"value": 1}}, upsert=True)
+    except Exception as exc:
+        logger.warning(f"could not bump the brain version: {type(exc).__name__}")
+    # The knowledge changed: rebuild the speech-recognition key terms from it (background, voice_keyterms.py).
+    from voice_keyterms import schedule_refresh
+    schedule_refresh()
+
+
+def _brain_version() -> int:
+    """The shared knowledge version, re-read at most every 5 seconds; cached knowledge is keyed by it."""
+    def load() -> int:
+        try:
+            record = mongo_client.platform_settings.find_one({"key": "brain_version"}, {"value": 1}) if mongo_client.is_connected() else None
+            return int((record or {}).get("value") or 0)
+        except Exception:
+            return -1
+    return _swr_cached("brain_version", 5, load)
+
+
+_SWR_REFRESHING: set = set()
+
+
+def _swr_cached(key: str, ttl_seconds: float, load):
+    """Like _ttl_cached, but once a value exists a stale one is returned at once and refreshed in the background
+    (stale-while-revalidate): live call turns never wait on a database round trip for it."""
+    now = monotonic()
+    with _TTL_LOCK:
+        hit = _TTL_CACHE.get(key)
+        if hit and now - hit[0] < ttl_seconds:
+            return hit[1]
+        refresh = bool(hit) and key not in _SWR_REFRESHING
+        if refresh:
+            _SWR_REFRESHING.add(key)
+    if not hit:
+        return _ttl_cached(key, ttl_seconds, load)
+    if refresh:
+        def run() -> None:
+            try:
+                value = load()
+                with _TTL_LOCK:
+                    _TTL_CACHE[key] = (monotonic(), value)
+            finally:
+                with _TTL_LOCK:
+                    _SWR_REFRESHING.discard(key)
+        threading.Thread(target=run, name=f"refresh-{key}", daemon=True).start()
+    return hit[1]
 
 
 class BrainService:
@@ -272,7 +396,28 @@ class BrainService:
                     return vectors, "gemini"
         return [[] for _ in chunks], None
 
-    def ingest_text(self, source_type: str, source_name: str, text: str, source_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    @staticmethod
+    def _section_chunks(items: List[Dict[str, str]], max_chars: int = 900) -> List[str]:
+        """Chunks for the business knowledge: one section at a time, whole lines only (an FAQ question stays with
+        its answer), each chunk labelled with its section. Small focused chunks let a voice turn fetch just the
+        facts it needs instead of a quarter of the whole knowledge."""
+        chunks: List[str] = []
+        for item in items:
+            label = f"{item['source_name']}:"
+            current: List[str] = []
+            for line in (line.strip() for line in item["text"].splitlines()):
+                if not line:
+                    continue
+                if current and len("\n".join([label, *current, line])) > max_chars:
+                    chunks.append("\n".join([label, *current]))
+                    current = []
+                current.append(line)
+            if current:
+                chunks.append("\n".join([label, *current]))
+        return chunks
+
+    def ingest_text(self, source_type: str, source_name: str, text: str, source_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                    chunks: Optional[List[str]] = None) -> Dict[str, Any]:
         collection = getattr(mongo_client, "brain_documents", None)
         sources = getattr(mongo_client, "brain_sources", None)
         if not mongo_client.is_connected() or collection is None or sources is None:
@@ -281,8 +426,9 @@ class BrainService:
         if not clean_text:
             raise ValueError("The source did not contain readable text")
         source_id = source_id or f"{source_type}:{hashlib.sha256(clean_text.encode('utf-8')).hexdigest()}"
-        chunks = self._chunk_text(clean_text, metadata)
+        chunks = chunks or self._chunk_text(clean_text, metadata)
         vectors, embedding_provider = self._embeddings(chunks)
+        local_vectors = local_embeddings(chunks)
         now = datetime.utcnow()
         collection.delete_many({"source_id": source_id})
         documents = [{
@@ -294,10 +440,12 @@ class BrainService:
             "chunk_index": index,
             "embedding": vectors[index] if index < len(vectors) else [],
             "embedding_model": self._embedding_model_name(embedding_provider) if vectors[index] else None,
+            "embedding_local": local_vectors[index] if index < len(local_vectors) else [],
             "metadata": metadata or {},
             "updated_at": now,
         } for index, chunk in enumerate(chunks)]
         collection.insert_many(documents)
+        clear_brain_caches()  # the next call turn searches the new knowledge at once
         source = {
             "source_id": source_id,
             "source_type": source_type,
@@ -320,12 +468,14 @@ class BrainService:
         # Remove pre-RAG rows and replace only the settings source; uploaded, scraped, and Shopify sources remain intact.
         collection.delete_many({"source_id": {"$exists": False}})
         collection.delete_many({"source_id": "brain_settings"})
+        clear_brain_caches()
         sources = getattr(mongo_client, "brain_sources", None)
         if sources is not None:
             sources.delete_one({"source_id": "brain_settings"})
-        text = "\n\n".join(f"{item['source_name']}:\n{item['text']}" for item in self._knowledge_source_items(brain))
+        items = self._knowledge_source_items(brain)
+        text = "\n\n".join(f"{item['source_name']}:\n{item['text']}" for item in items)
         if text:
-            self.ingest_text("settings", "Business knowledge", text, source_id="brain_settings")
+            self.ingest_text("settings", "Business knowledge", text, source_id="brain_settings", chunks=self._section_chunks(items))
         return self.index_status()
 
     def ingest_pdf(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
@@ -351,10 +501,17 @@ class BrainService:
         response = requests.get(url, timeout=20, headers={"User-Agent": "AgentFlow knowledge crawler/1.0"})
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        for element in soup(["script", "style", "noscript", "svg"]):
+        title = " ".join(soup.title.get_text(" ", strip=True).split()) if soup.title else url
+        for element in soup(["script", "style", "noscript", "svg", "nav", "header", "iframe", "form"]):
             element.decompose()
-        title = soup.title.get_text(" ", strip=True) if soup.title else url
-        text = soup.get_text("\n", strip=True)
+        # Keep the page's own content plus the footer (contact details usually live there); site menus repeated on
+        # every page would otherwise fill each chunk and drown out what the page is actually about.
+        main = soup.find("main")
+        footer = soup.find("footer")
+        if main is not None:
+            text = "\n".join(part.get_text("\n", strip=True) for part in (main, footer) if part is not None)
+        else:
+            text = soup.get_text("\n", strip=True)
         return self.ingest_text("web", title[:200], text, source_id=f"web:{hashlib.sha256(url.encode('utf-8')).hexdigest()}", metadata={"url": url})
 
     def ingest_shopify_catalog(self) -> Dict[str, Any]:
@@ -406,6 +563,23 @@ class BrainService:
         else:
             raise ValueError("This source is live-managed and does not need a static resync")
         return {**result, "status": "ready", "resynced": True}
+
+    def delete_source(self, source_id: str) -> Dict[str, Any]:
+        """Remove a knowledge source and every chunk of it, so no channel can quote it again (takes effect at once)."""
+        sources = getattr(mongo_client, "brain_sources", None)
+        collection = getattr(mongo_client, "brain_documents", None)
+        if not mongo_client.is_connected() or sources is None or collection is None:
+            raise RuntimeError("Database not connected")
+        if source_id == "brain_settings":
+            raise ValueError("Business knowledge is edited on the Knowledge form: clear the text there and save")
+        source = sources.find_one({"source_id": source_id}, {"source_name": 1, "source_type": 1})
+        removed = collection.delete_many({"source_id": source_id}).deleted_count
+        if not source and not removed:
+            raise LookupError("Source not found")
+        sources.delete_one({"source_id": source_id})
+        clear_brain_caches()
+        logger.info("knowledge source removed: %s (%d chunks)", source_id, removed)
+        return {"source_id": source_id, "source_name": (source or {}).get("source_name", ""), "source_type": (source or {}).get("source_type", ""), "chunks_removed": removed}
 
     def resync_static_sources(self) -> Dict[str, Any]:
         """Rebuild business knowledge and refresh every stored webpage/PDF source."""
@@ -466,7 +640,151 @@ class BrainService:
         except (TypeError, ValueError):
             return 0.4
 
-    def retrieve_knowledge(self, user_input: str, limit: int = 4) -> List[Dict[str, Any]]:
+    def _embed_query_uncached(self, text: str) -> List[float]:
+        for provider in self._embedding_provider_order():
+            vector: List[float] = []
+            if provider == "openrouter":
+                vectors = self._openrouter_embeddings([text])
+                vector = vectors[0] if vectors else []
+            elif provider == "openai":
+                model = self._embedding_model()
+                if model is not None:
+                    try:
+                        vector = model.get_query_embedding(text)
+                    except Exception:
+                        vector = []
+            elif provider == "gemini":
+                vector = self._gemini_embedding(text, "RETRIEVAL_QUERY")
+            if vector:
+                return vector
+        return []
+
+    def _embedding_future(self, text: str) -> Future:
+        """One embedding request per distinct text at a time; the result lands in the cache when it finishes."""
+        with _EMBEDDING_LOCK:
+            if text in _EMBEDDING_CACHE:
+                done: Future = Future(); done.set_result(_EMBEDDING_CACHE[text]); return done
+            running = _EMBEDDING_INFLIGHT.get(text)
+            if running is not None:
+                return running
+
+            def work() -> List[float]:
+                try:
+                    vector = self._embed_query_uncached(text)
+                    if vector:
+                        with _EMBEDDING_LOCK:
+                            _EMBEDDING_CACHE[text] = vector
+                            _EMBEDDING_CACHE.move_to_end(text)
+                            while len(_EMBEDDING_CACHE) > _EMBEDDING_CACHE_SIZE:
+                                _EMBEDDING_CACHE.popitem(last=False)
+                    return vector
+                finally:
+                    with _EMBEDDING_LOCK:
+                        _EMBEDDING_INFLIGHT.pop(text, None)
+
+            future = _EMBEDDING_POOL.submit(work)
+            _EMBEDDING_INFLIGHT[text] = future
+            return future
+
+    def prefetch_query_embedding(self, text: str) -> None:
+        """Start embedding a caller's words before the reply is needed (no-op when cached or already running)."""
+        text = str(text or "").strip()
+        # With the local model the search vector takes ~35 ms when the answer needs it, so a network request now
+        # would only cost money and tie up a worker thread during the call.
+        if text and _local_embedder() is None:
+            self._embedding_future(text)
+
+    def query_embedding(self, text: str, budget_ms: Optional[int] = None) -> List[float]:
+        """Embedding for a search query. With a budget, give up waiting after budget_ms (the request keeps running
+        and fills the cache for next time) so a live call falls back to keyword search instead of stalling."""
+        future = self._embedding_future(text)
+        if budget_ms is not None and not future.done():
+            # Live call: the caller's final words usually extend words we embedded while they were speaking.
+            # That earlier embedding is close enough to search with, and needs no wait.
+            earlier = self._cached_prefix_embedding(text)
+            if earlier:
+                return earlier
+        try:
+            return future.result(timeout=None if budget_ms is None else budget_ms / 1000)
+        except FutureTimeout:
+            logger.info(f"query embedding exceeded {budget_ms} ms; using keyword search for this turn")
+            return []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _cached_prefix_embedding(text: str) -> List[float]:
+        """Embedding of the longest cached text whose words start the given text and cover most of it (60%+)."""
+        words = re.findall(r"[a-z0-9']+", text.lower())
+        if len(words) < 2:
+            return []
+        best: List[float] = []
+        best_length = 0
+        with _EMBEDDING_LOCK:
+            for key, vector in _EMBEDDING_CACHE.items():
+                key_words = re.findall(r"[a-z0-9']+", key.lower())
+                if best_length < len(key_words) <= len(words) and len(key_words) >= 0.6 * len(words) and words[:len(key_words)] == key_words:
+                    best, best_length = vector, len(key_words)
+        return best
+
+    def _knowledge_documents(self) -> List[Dict[str, Any]]:
+        """The knowledge chunks (text and embeddings), cached briefly: the brain changes rarely, calls ask often."""
+        collection = getattr(mongo_client, "brain_documents", None)
+        return _swr_cached(f"brain_documents:{_brain_version()}", 300, lambda: list(collection.find({}, {"text": 1, "embedding": 1, "embedding_local": 1, "source_name": 1, "source_type": 1}).limit(5000)))
+
+    def ensure_local_embeddings(self) -> int:
+        """Give every knowledge chunk a local vector (older chunks predate them). Returns how many were added."""
+        collection = getattr(mongo_client, "brain_documents", None)
+        if collection is None or not mongo_client.is_connected() or _local_embedder() is None:
+            return 0
+        missing = list(collection.find({"$or": [{"embedding_local": {"$exists": False}}, {"embedding_local": []}]}, {"text": 1}))
+        if not missing:
+            return 0
+        vectors = local_embeddings([str(item.get("text", "")) for item in missing])
+        for item, vector in zip(missing, vectors):
+            collection.update_one({"_id": item["_id"]}, {"$set": {"embedding_local": vector}})
+        clear_brain_caches()
+        logger.info("added local embeddings to %d knowledge chunks", len(vectors))
+        return len(vectors)
+
+    def _local_retrieve(self, user_input: str, query_tokens: set, limit: int) -> Optional[List[Dict[str, Any]]]:
+        """Fast path: local query vector + in-memory cosine over the cached chunks. None means "not available here"
+        (model missing, or some chunks have no local vector yet), so the caller uses the network path instead."""
+        if _local_embedder() is None:
+            return None
+        documents = self._knowledge_documents()
+        if not documents:
+            return []
+        if any(not item.get("embedding_local") for item in documents):
+            threading.Thread(target=self.ensure_local_embeddings, daemon=True).start()
+            return None
+        query = local_embeddings([user_input], query=True)
+        if not query:
+            return None
+        query_vector = query[0]
+        try:
+            vector_only_min = float(os.getenv("LOCAL_VECTOR_ONLY_MIN", "0.55"))  # bge-small: on-topic 0.52-0.68, off-topic <= 0.50
+        except ValueError:
+            vector_only_min = 0.55
+        scored: List[tuple[float, Dict[str, Any]]] = []
+        for item in documents:
+            text = str(item.get("text", ""))
+            lexical = len(query_tokens.intersection(set(re.findall(r"[a-z0-9]{3,}", text.lower())))) / max(len(query_tokens), 1)
+            vector_score = sum(left * right for left, right in zip(query_vector, item["embedding_local"]))  # both normalised
+            # Same rule as the network path: a loose semantic match alone must not make an off-topic question answerable.
+            if lexical <= 0 and vector_score < vector_only_min:
+                continue
+            scored.append((0.75 * vector_score + 0.25 * lexical, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        minimum = self._minimum_relevance()
+        return [{"source": item.get("source_name", "Knowledge"), "source_type": item.get("source_type", "settings"), "text": item.get("text", ""), "score": round(score, 3)} for score, item in scored if score >= minimum][:limit]
+
+    def knowledge_text(self) -> str:
+        """All knowledge as one text (cached with the documents), e.g. to check whether a place is mentioned at all."""
+        documents = self._knowledge_documents() if mongo_client.is_connected() else []
+        return _swr_cached(f"knowledge_text:{_brain_version()}:{len(documents)}", 300, lambda: "\n".join(str(item.get("text", "")) for item in documents))
+
+    def retrieve_knowledge(self, user_input: str, limit: int = 4, embed_budget_ms: Optional[int] = None) -> List[Dict[str, Any]]:
         collection = getattr(mongo_client, "brain_documents", None)
         if not mongo_client.is_connected() or collection is None or not user_input.strip():
             return []
@@ -482,28 +800,16 @@ class BrainService:
             query_tokens.update(query_aliases.get(token, set()))
         if not query_tokens:
             return []
-        query_vector: List[float] = []
-        for provider in self._embedding_provider_order():
-            if provider == "openrouter":
-                vectors = self._openrouter_embeddings([user_input])
-                query_vector = vectors[0] if vectors else []
-            elif provider == "openai":
-                model = self._embedding_model()
-                if model is not None:
-                    try:
-                        query_vector = model.get_query_embedding(user_input)
-                    except Exception:
-                        query_vector = []
-            elif provider == "gemini":
-                query_vector = self._gemini_embedding(user_input, "RETRIEVAL_QUERY")
-            if query_vector:
-                break
+        local = self._local_retrieve(user_input.strip(), query_tokens, limit)
+        if local is not None:
+            return local
+        query_vector = self.query_embedding(user_input.strip(), embed_budget_ms)
         atlas_hits = self._atlas_vector_retrieve(query_vector, limit)
         if atlas_hits:
             return atlas_hits
         query_norm = sum(value * value for value in query_vector) ** 0.5
         scored: List[tuple[float, Dict[str, Any]]] = []
-        for item in collection.find({}).limit(5000):
+        for item in self._knowledge_documents():
             text = str(item.get("text", ""))
             text_tokens = set(re.findall(r"[a-z0-9]{3,}", text.lower()))
             lexical = len(query_tokens.intersection(text_tokens)) / max(len(query_tokens), 1)
@@ -537,7 +843,7 @@ class BrainService:
             "knowledge_enabled": True,
             "shopify_access": True,
         }
-        stored = self._setting(f"{channel}_agent", {})
+        stored = _swr_cached(f"setting:{channel}_agent:{_brain_version()}", 60, lambda: self._setting(f"{channel}_agent", {}))
         return {**defaults, **stored} if isinstance(stored, dict) else defaults
 
     def _out_of_scope_response(self) -> str:
@@ -578,6 +884,10 @@ class BrainService:
     def customer_context(self, phone: Optional[str]) -> str:
         if not phone or not mongo_client.is_connected():
             return ""
+        # Asked on every voice turn for the same caller; a few seconds' staleness is fine.
+        return _swr_cached(f"customer:{phone}", 30, lambda: self._customer_context_uncached(phone))
+
+    def _customer_context_uncached(self, phone: str) -> str:
         customer = mongo_client.customers.find_one({"phone": phone})
         lead = mongo_client.leads.find_one({"phone": phone})
         parts: List[str] = []

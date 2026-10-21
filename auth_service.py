@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta
@@ -12,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, Header, HTTPException, status
 
 from mongo_client import mongo_client
+
+logger = logging.getLogger(__name__)
 
 
 ALL_PERMISSIONS = [
@@ -32,13 +35,22 @@ ALL_PERMISSIONS = [
     "manage_workspace",
 ]
 
+# Two roles for a team, plus the owner who created the workspace:
+#   admin        everything, including Team settings; assigns inbox conversations, never receives them
+#   team member  works the inbox: assigned conversations, @mentions, team channel; calls and their leads
+# ("agent" is the team member role's internal name; the owner is an admin who cannot be removed.)
 DEFAULT_ROLES = [
-    {"name": "owner", "label": "Owner", "description": "Full workspace access.", "permissions": ["*"]},
-    {"name": "admin", "label": "Admin", "description": "Full workspace administration and access control.", "permissions": ["*"]},
-    {"name": "manager", "label": "Manager", "description": "Run customer operations and review analytics.", "permissions": ["manage_agents", "manage_data", "manage_automations", "manage_leads", "view_customers", "view_analytics", "view_dashboard"]},
-    {"name": "agent", "label": "Agent", "description": "Handle assigned conversations, calls, and leads.", "permissions": ["handle_conversations", "handle_calls", "manage_assigned_leads", "view_customers", "view_dashboard"]},
-    {"name": "viewer", "label": "Viewer", "description": "Read-only dashboard and analytics access.", "permissions": ["view_dashboard", "view_analytics"]},
+    {"name": "owner", "label": "Owner", "description": "Created the workspace. Same access as an admin and cannot be removed.", "permissions": ["*"]},
+    {"name": "admin", "label": "Admin", "description": "Full access: team, settings and the whole inbox. Assigns conversations to team members.", "permissions": ["*"]},
+    {"name": "agent", "label": "Team member", "description": "Works the inbox: conversations assigned to them, @mentions and the team channel, plus calls and their leads.",
+     "permissions": ["view_dashboard", "handle_conversations", "handle_calls", "manage_assigned_leads", "view_customers"]},
 ]
+TEAM_MEMBER_ROLE = "agent"
+# Roles that earlier versions created and that are gone now; anyone still holding one becomes a team member.
+RETIRED_ROLES = ("manager", "viewer")
+# Bump when DEFAULT_ROLES changes. Built-in roles saved under an older version are upgraded once;
+# an admin's later edits to a role are kept because it then carries the current version.
+ROLE_DEFAULTS_VERSION = 3
 
 
 def _secret() -> bytes:
@@ -78,14 +90,31 @@ _roles_ready = False
 
 
 def ensure_roles() -> None:
-    """Create the default roles once per process; they only need inserting the first time."""
+    """Create the built-in roles, and upgrade ones saved by an older version of DEFAULT_ROLES. Runs once per process."""
     global _roles_ready
     if _roles_ready or not mongo_client.is_connected():
         return
     now = datetime.utcnow()
     for role in DEFAULT_ROLES:
-        mongo_client.roles.update_one({"name": role["name"]}, {"$setOnInsert": {**role, "system": True, "created_at": now, "updated_at": now}}, upsert=True)
+        mongo_client.roles.update_one({"name": role["name"]}, {"$setOnInsert": {**role, "system": True, "defaults_version": ROLE_DEFAULTS_VERSION, "created_at": now, "updated_at": now}}, upsert=True)
+        upgraded = mongo_client.roles.update_one(
+            {"name": role["name"], "system": True, "$or": [{"defaults_version": {"$exists": False}}, {"defaults_version": {"$lt": ROLE_DEFAULTS_VERSION}}]},
+            {"$set": {"label": role["label"], "description": role["description"], "permissions": role["permissions"], "defaults_version": ROLE_DEFAULTS_VERSION, "updated_at": now}},
+        )
+        if upgraded.modified_count:
+            logger.info("roles: upgraded built-in role %s to defaults v%d: %s", role["name"], ROLE_DEFAULTS_VERSION, role["permissions"])
+    for retired in RETIRED_ROLES:
+        moved = mongo_client.users.update_many({"role": retired}, {"$set": {"role": TEAM_MEMBER_ROLE, "updated_at": now}, "$inc": {"auth_version": 1}})
+        pending = mongo_client.invitations.update_many({"role": retired, "status": "pending"}, {"$set": {"role": TEAM_MEMBER_ROLE, "updated_at": now}})
+        removed = mongo_client.roles.delete_one({"name": retired, "system": True})
+        if moved.modified_count or pending.modified_count or removed.deleted_count:
+            logger.info("roles: retired %s (%d users and %d invites moved to team member)", retired, moved.modified_count, pending.modified_count)
     _roles_ready = True
+
+
+def can_assign_conversations(user: Dict[str, Any]) -> bool:
+    """Owners and admins hand out inbox conversations; they are never assigned one."""
+    return has_permission(user, "assign_conversations")
 
 
 def role_document(role_name: str) -> Optional[Dict[str, Any]]:

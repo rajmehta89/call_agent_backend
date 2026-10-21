@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
+from urllib.parse import quote
 
 from mongo_client import mongo_client
 
@@ -17,6 +18,10 @@ def notify_human_assignment(
     if not mongo_client.is_connected() or not hasattr(mongo_client, "notifications"):
         return False
     now = datetime.utcnow()
+    # Clicking it opens the caller's inbox conversation (live transcript included); same key as inbox_api._thread_key.
+    from routers.calls_api import caller_identity
+    identity = caller_identity(customer or "")
+    link = f"/inbox?open={quote(identity, safe='')}" if channel == "voice" and identity.startswith(("+", "client:")) else "/inbox" if channel == "voice" else None
     mongo_client.notifications.insert_one({
         "type": "human_assignment",
         "channel": channel,
@@ -26,6 +31,7 @@ def notify_human_assignment(
         "recipient": recipient or "Human team",
         "conversation_id": conversation_id,
         "call_session_id": call_session_id,
+        "link": link,
         "created_at": now,
         "read": False,
     })

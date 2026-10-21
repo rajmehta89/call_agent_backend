@@ -14,8 +14,8 @@ from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, Field
 
 from agent_config import agent_config
-from brain_service import DEFAULT_TOOLS, brain_service
-from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, has_permission, invitation_hash, require_permission, require_user, role_document
+from brain_service import DEFAULT_TOOLS, brain_service, clear_brain_caches
+from auth_service import ALL_PERMISSIONS, DEFAULT_ROLES, ensure_roles, has_permission, invitation_hash, require_permission, require_user, role_document
 from email_campaign import campaign_action, campaign_status, get_email_campaign, process_email_outbox, save_email_campaign
 from email_service import email_service
 from email_policy import approval_window_open, get_email_policy, save_email_policy, send_window_open
@@ -33,13 +33,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/platform", tags=["platform"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
-ROLE_PERMISSIONS = {
-    "owner": ["*"],
-    "admin": ["manage_workspace", "manage_team", "manage_roles", "manage_agents", "manage_integrations", "manage_data", "view_analytics"],
-    "manager": ["manage_agents", "manage_data", "assign_leads", "view_analytics"],
-    "agent": ["handle_conversations", "handle_calls", "manage_assigned_leads", "view_customers"],
-    "viewer": ["view_dashboard", "view_analytics"],
-}
+ROLE_PERMISSIONS = {role["name"]: role["permissions"] for role in DEFAULT_ROLES}  # one source of truth: auth_service.DEFAULT_ROLES
 
 
 class ValuePayload(BaseModel):
@@ -146,6 +140,7 @@ def _upsert_setting(key: str, value: Dict[str, Any]) -> Dict[str, Any]:
         {"$set": {"value": value, "updated_at": now}, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
+    clear_brain_caches()  # live calls read settings through a short cache; show the change on the next turn
     return {"key": key, "value": value, "updated_at": now}
 
 
@@ -179,28 +174,32 @@ def _audit(action: str, resource: str, before: Any = None, after: Any = None, ac
 
 
 @router.get("/permissions")
-async def permissions():
+def permissions():
     return {"success": True, "data": {"available": ALL_PERMISSIONS, "roles": ROLE_PERMISSIONS}}
 
 
 @router.get("/audit")
-async def audit_logs(limit: int = Query(100, ge=1, le=500)):
+def audit_logs(limit: int = Query(100, ge=1, le=500)):
     _require_db()
     return {"success": True, "data": _serialize(list(mongo_client.audit_logs.find({}).sort("created_at", -1).limit(limit)))}
 
 
 @router.get("/notifications")
-async def notifications(unread_only: bool = False, user: Dict[str, Any] = Depends(require_user)):
+def notifications(unread_only: bool = False, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     query: Dict[str, Any] = {"read": False} if unread_only else {}
-    if user.get("role") not in {"owner", "admin"}:
+    if user.get("role") in {"owner", "admin"}:
+        # Admins oversee handoff alerts, but inbox notices (assignments, mentions) belong to the person they name.
+        mine = {"$or": [{"channel": {"$ne": "inbox"}}, {"recipient": {"$in": [str(user.get("name") or ""), str(user.get("email") or "")]}}]}
+        query = {"$and": [query, mine]} if query else mine
+    else:
         recipients = [str(user.get("name") or ""), str(user.get("email") or ""), "Human team", "team"]
         query = {"$and": [query, {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}]} if query else {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}
     return {"success": True, "data": _serialize(list(mongo_client.notifications.find(query).sort("created_at", -1).limit(100)))}
 
 
 @router.post("/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: str, user: Dict[str, Any] = Depends(require_user)):
+def mark_notification_read(notification_id: str, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     if not ObjectId.is_valid(notification_id):
         raise HTTPException(status_code=400, detail="Invalid notification id")
@@ -217,7 +216,7 @@ async def mark_notification_read(notification_id: str, user: Dict[str, Any] = De
 
 
 @router.get("/dashboard")
-async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = None, channel: Optional[str] = None):
+def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = None, channel: Optional[str] = None):
     _require_db()
     calls = _count(mongo_client.calls)
     whatsapp = _count(mongo_client.whatsapp_conversations)
@@ -292,7 +291,7 @@ async def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = No
 
 
 @router.get("/brain")
-async def get_brain():
+def get_brain():
     config = brain_service.brain_config()
     if config.get("index", {}).get("documents_count", 0) == 0 and any(config.get(key) for key in ("company_information", "business_description", "locations", "working_hours", "services", "faqs", "policies", "website_content", "custom_knowledge")):
         config["index"] = brain_service.reindex_knowledge(config)
@@ -300,8 +299,10 @@ async def get_brain():
     return {"success": True, "data": config}
 
 
-@router.put("/brain")
-async def update_brain(payload: ValuePayload):
+@router.put("/brain", dependencies=[Depends(require_permission("manage_data"))])
+def update_brain(payload: ValuePayload):
+    # "index" and "sources" are read-only status the page loaded with GET /brain; never store them as knowledge.
+    payload.value = {key: value for key, value in payload.value.items() if key not in {"index", "sources"}}
     stored = _upsert_setting("brain", payload.value)
     knowledge = {
         "company_information": payload.value.get("company_information", ""),
@@ -321,7 +322,7 @@ async def update_brain(payload: ValuePayload):
     return {"success": True, "data": _serialize(stored)}
 
 
-@router.post("/brain/upload")
+@router.post("/brain/upload", dependencies=[Depends(require_permission("manage_data"))])
 async def upload_brain_source(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="A file is required")
@@ -338,8 +339,8 @@ async def upload_brain_source(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/brain/scrape")
-async def scrape_brain_source(payload: BrainUrlPayload):
+@router.post("/brain/scrape", dependencies=[Depends(require_permission("manage_data"))])
+def scrape_brain_source(payload: BrainUrlPayload):
     if not payload.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Use an http or https URL")
     try:
@@ -348,24 +349,24 @@ async def scrape_brain_source(payload: BrainUrlPayload):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/brain/shopify")
-async def ingest_brain_shopify():
+@router.post("/brain/shopify", dependencies=[Depends(require_permission("manage_data"))])
+def ingest_brain_shopify():
     try:
         return {"success": True, "data": brain_service.ingest_shopify_catalog()}
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/brain/resync")
-async def resync_brain_sources():
+@router.post("/brain/resync", dependencies=[Depends(require_permission("manage_data"))])
+def resync_brain_sources():
     try:
         return {"success": True, "data": brain_service.resync_static_sources()}
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/brain/resync/{source_id:path}")
-async def resync_brain_source(source_id: str):
+@router.post("/brain/resync/{source_id:path}", dependencies=[Depends(require_permission("manage_data"))])
+def resync_brain_source(source_id: str):
     try:
         return {"success": True, "data": brain_service.resync_source(source_id)}
     except Exception as exc:
@@ -373,19 +374,31 @@ async def resync_brain_source(source_id: str):
 
 
 @router.get("/brain/sources")
-async def get_brain_sources():
+def get_brain_sources():
     return {"success": True, "data": brain_service.source_list()}
 
 
+@router.delete("/brain/sources/{source_id:path}", dependencies=[Depends(require_permission("manage_data"))])
+def delete_brain_source(source_id: str):
+    try:
+        result = brain_service.delete_source(source_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit("delete", "brain_source", before=result)
+    return {"success": True, "data": result}
+
+
 @router.get("/agents/{channel}")
-async def get_channel_agent(channel: str, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
+def get_channel_agent(channel: str, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
     if channel not in {"voice", "whatsapp"}:
         raise HTTPException(status_code=404, detail="Unknown channel")
     return {"success": True, "data": brain_service.channel_config(channel)}
 
 
 @router.put("/agents/{channel}")
-async def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
+def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_agents"))):
     if channel not in {"voice", "whatsapp"}:
         raise HTTPException(status_code=404, detail="Unknown channel")
     stored = _upsert_setting(f"{channel}_agent", payload.value)
@@ -394,47 +407,47 @@ async def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[s
 
 
 @router.get("/tools")
-async def get_tools():
+def get_tools():
     return {"success": True, "data": brain_service.tools()}
 
 
 @router.get("/gmail/status")
-async def get_gmail_status():
+def get_gmail_status():
     return {"success": True, "data": gmail_service.status()}
 
 
 @router.get("/email-policy")
-async def get_email_policy_route():
+def get_email_policy_route():
     policy = get_email_policy()
     return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
 
 
 @router.put("/email-policy")
-async def update_email_policy(payload: ValuePayload):
+def update_email_policy(payload: ValuePayload):
     policy = save_email_policy(payload.value)
     _audit("update", "email_policy", after=policy)
     return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
 
 
 @router.get("/email-campaign")
-async def get_email_campaign_route():
+def get_email_campaign_route():
     return {"success": True, "data": campaign_status()}
 
 
 @router.get("/campaigns")
-async def get_campaign_registry_route():
+def get_campaign_registry_route():
     return {"success": True, "data": {"campaigns": get_campaigns(), "types": CAMPAIGN_TYPES}}
 
 
 @router.post("/campaigns")
-async def create_campaign_route(payload: ValuePayload):
+def create_campaign_route(payload: ValuePayload):
     campaign = create_campaign(payload.value)
     _audit("create", "campaign", after=campaign)
     return {"success": True, "data": campaign}
 
 
 @router.put("/campaigns/{campaign_id}")
-async def update_campaign_route(campaign_id: str, payload: ValuePayload):
+def update_campaign_route(campaign_id: str, payload: ValuePayload):
     try:
         campaign = update_campaign(campaign_id, payload.value)
     except KeyError as exc:
@@ -444,7 +457,7 @@ async def update_campaign_route(campaign_id: str, payload: ValuePayload):
 
 
 @router.post("/campaigns/{campaign_id}/scrape")
-async def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
+def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
     campaigns = get_campaigns()
     campaign = next((item for item in campaigns if item["id"] == campaign_id), None)
     if not campaign:
@@ -482,7 +495,7 @@ async def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
 
 
 @router.delete("/campaigns/{campaign_id}")
-async def delete_campaign_route(campaign_id: str):
+def delete_campaign_route(campaign_id: str):
     try:
         delete_campaign(campaign_id)
     except KeyError as exc:
@@ -492,14 +505,14 @@ async def delete_campaign_route(campaign_id: str):
 
 
 @router.put("/email-campaign")
-async def update_email_campaign(payload: ValuePayload):
+def update_email_campaign(payload: ValuePayload):
     campaign = save_email_campaign(payload.value)
     _audit("update", "email_campaign", after=campaign)
     return {"success": True, "data": campaign_status()}
 
 
 @router.post("/email-campaign/action")
-async def email_campaign_action(payload: ValuePayload):
+def email_campaign_action(payload: ValuePayload):
     try:
         campaign = campaign_action(str(payload.value.get("action", "")))
     except ValueError as exc:
@@ -510,12 +523,12 @@ async def email_campaign_action(payload: ValuePayload):
 
 
 @router.get("/email-templates")
-async def get_email_templates_route():
+def get_email_templates_route():
     return {"success": True, "data": get_email_templates()}
 
 
 @router.post("/email-templates")
-async def create_email_template(payload: EmailTemplatePayload):
+def create_email_template(payload: EmailTemplatePayload):
     if not payload.name.strip() or not payload.subject.strip() or not payload.body.strip():
         raise HTTPException(status_code=400, detail="Template name, subject, and body are required")
     template = add_email_template(payload.dict())
@@ -524,7 +537,7 @@ async def create_email_template(payload: EmailTemplatePayload):
 
 
 @router.post("/email-templates/review")
-async def review_email_template(payload: ValuePayload):
+def review_email_template(payload: ValuePayload):
     name = str(payload.value.get("name") or "Custom outreach template").strip()
     subject = str(payload.value.get("subject") or "").strip()
     body = str(payload.value.get("body") or "").strip()
@@ -600,12 +613,12 @@ async def review_email_template(payload: ValuePayload):
 
 
 @router.get("/prospects/discovery-status")
-async def get_prospect_discovery_status():
+def get_prospect_discovery_status():
     return {"success": True, "data": discovery_status()}
 
 
 @router.get("/campaign-locations")
-async def search_campaign_locations(query: str = Query("", min_length=0, max_length=120)):
+def search_campaign_locations(query: str = Query("", min_length=0, max_length=120)):
     try:
         return {"success": True, "data": search_locations(query)}
     except RuntimeError as exc:
@@ -613,13 +626,13 @@ async def search_campaign_locations(query: str = Query("", min_length=0, max_len
 
 
 @router.get("/prospects")
-async def get_campaign_prospects(limit: int = Query(100, ge=1, le=500)):
+def get_campaign_prospects(limit: int = Query(100, ge=1, le=500)):
     _require_db()
     return {"success": True, "data": _serialize(list(mongo_client.campaign_prospects.find({}).sort("created_at", -1).limit(limit)))}
 
 
 @router.post("/prospects/discover")
-async def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
+def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
     try:
         return {"success": True, "data": discover_prospects(payload.query, payload.location, payload.max_results, payload.create_drafts, campaign_goal=payload.campaign_goal, shared_context=payload.shared_context, template_id=payload.template_id)}
     except RuntimeError as exc:
@@ -631,7 +644,7 @@ async def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
 
 
 @router.get("/email-outbox")
-async def get_email_outbox(status: str = ""):
+def get_email_outbox(status: str = ""):
     _require_db()
     query = {"status": status} if status.strip() else {}
     rows = list(mongo_client.email_outbox.find(query).sort("created_at", -1).limit(200))
@@ -644,7 +657,7 @@ async def get_email_outbox(status: str = ""):
 
 
 @router.post("/email-outbox/notify")
-async def notify_email_outbox(payload: ValuePayload):
+def notify_email_outbox(payload: ValuePayload):
     """Send the owner a review digest; it never approves or sends prospect emails."""
     _require_db()
     requested_ids = [str(item) for item in (payload.value.get("draft_ids") or [])]
@@ -693,7 +706,7 @@ async def notify_email_outbox(payload: ValuePayload):
 
 
 @router.post("/email-outbox")
-async def create_email_draft(payload: EmailDraftPayload):
+def create_email_draft(payload: EmailDraftPayload):
     _require_db()
     company = payload.company_name.strip()
     recipient = payload.recipient_email.strip().lower()
@@ -761,7 +774,7 @@ async def create_email_draft(payload: EmailDraftPayload):
 
 
 @router.post("/email-outbox/context-preview")
-async def generate_email_context(payload: ValuePayload):
+def generate_email_context(payload: ValuePayload):
     company = str(payload.value.get("company_name") or "").strip()
     website = str(payload.value.get("website") or "").strip()
     notes = str(payload.value.get("context") or "").strip()
@@ -790,7 +803,7 @@ async def generate_email_context(payload: ValuePayload):
 
 
 @router.put("/email-outbox/{draft_id}/decision")
-async def decide_email_draft(draft_id: str, payload: ValuePayload):
+def decide_email_draft(draft_id: str, payload: ValuePayload):
     _require_db()
     if not ObjectId.is_valid(draft_id):
         raise HTTPException(status_code=400, detail="Invalid draft id")
@@ -815,7 +828,7 @@ async def decide_email_draft(draft_id: str, payload: ValuePayload):
 
 
 @router.put("/tools")
-async def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     tools = {**DEFAULT_TOOLS, **{key: bool(value) for key, value in payload.value.items() if key in DEFAULT_TOOLS}}
     stored = _upsert_setting("ai_tools", tools)
     _audit("update", "ai_tools", after=tools)
@@ -823,7 +836,7 @@ async def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(req
 
 
 @router.get("/activity")
-async def get_activity(search: str = "", channel: str = "", success: Optional[bool] = None, limit: int = Query(100, ge=1, le=500)):
+def get_activity(search: str = "", channel: str = "", success: Optional[bool] = None, limit: int = Query(100, ge=1, le=500)):
     _require_db()
     query: Dict[str, Any] = {}
     if channel:
@@ -841,7 +854,7 @@ async def get_activity(search: str = "", channel: str = "", success: Optional[bo
 
 
 @router.get("/customers")
-async def get_customers(search: str = "", status: str = "", limit: int = Query(100, ge=1, le=500)):
+def get_customers(search: str = "", status: str = "", limit: int = Query(100, ge=1, le=500)):
     _require_db()
     query: Dict[str, Any] = {}
     if search:
@@ -853,7 +866,7 @@ async def get_customers(search: str = "", status: str = "", limit: int = Query(1
 
 
 @router.post("/customers")
-async def create_customer(payload: CustomerPayload):
+def create_customer(payload: CustomerPayload):
     _require_db()
     now = datetime.utcnow()
     data = {**payload.dict(), "channels": [], "lead_status": "none", "created_at": now, "updated_at": now, "archived": False}
@@ -864,7 +877,7 @@ async def create_customer(payload: CustomerPayload):
 
 
 @router.get("/customers/{customer_id}")
-async def get_customer(customer_id: str):
+def get_customer(customer_id: str):
     _require_db()
     try:
         customer = mongo_client.customers.find_one({"_id": ObjectId(customer_id)})
@@ -882,14 +895,14 @@ async def get_customer(customer_id: str):
 
 
 @router.put("/customers/{customer_id}")
-async def update_customer(customer_id: str, payload: ValuePayload):
+def update_customer(customer_id: str, payload: ValuePayload):
     _require_db()
     mongo_client.customers.update_one({"_id": ObjectId(customer_id)}, {"$set": {**payload.value, "updated_at": datetime.utcnow()}})
-    return await get_customer(customer_id)
+    return get_customer(customer_id)
 
 
 @router.get("/automations")
-async def get_automations():
+def get_automations():
     _require_db()
     rows = list(mongo_client.automations.find({}).sort("updated_at", -1))
     data = []
@@ -902,14 +915,14 @@ async def get_automations():
 
 
 @router.get("/automations/runs")
-async def get_automation_runs(limit: int = Query(50, ge=1, le=200)):
+def get_automation_runs(limit: int = Query(50, ge=1, le=200)):
     _require_db()
     rows = list(mongo_client.automation_runs.find({}).sort("created_at", -1).limit(limit))
     return {"success": True, "data": _serialize(rows)}
 
 
 @router.post("/automations")
-async def create_automation(payload: AutomationPayload):
+def create_automation(payload: AutomationPayload):
     _require_db()
     now = datetime.utcnow()
     data = {**payload.dict(), "runs": 0, "errors": 0, "version": 1, "created_at": now, "updated_at": now}
@@ -920,7 +933,7 @@ async def create_automation(payload: AutomationPayload):
 
 
 @router.put("/automations/{automation_id}")
-async def update_automation(automation_id: str, payload: ValuePayload):
+def update_automation(automation_id: str, payload: ValuePayload):
     _require_db()
     mongo_client.automations.update_one({"_id": ObjectId(automation_id)}, {"$set": {**payload.value, "updated_at": datetime.utcnow()}, "$inc": {"version": 1}})
     row = mongo_client.automations.find_one({"_id": ObjectId(automation_id)})
@@ -928,15 +941,14 @@ async def update_automation(automation_id: str, payload: ValuePayload):
 
 
 @router.get("/roles")
-async def get_roles(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def get_roles(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
-    for role in DEFAULT_ROLES:
-        mongo_client.roles.update_one({"name": role["name"]}, {"$setOnInsert": {**role, "system": True, "created_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}, upsert=True)
+    ensure_roles()
     return {"success": True, "data": _serialize(list(mongo_client.roles.find({}).sort([("system", -1), ("label", 1)])))}
 
 
 @router.post("/roles")
-async def create_role(payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+def create_role(payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
     _require_db()
     name = payload.name.strip().lower().replace(" ", "-")
     if mongo_client.roles.find_one({"name": name}):
@@ -953,7 +965,7 @@ async def create_role(payload: RolePayload, user: Dict[str, Any] = Depends(requi
 
 
 @router.put("/roles/{role_id}")
-async def update_role(role_id: str, payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+def update_role(role_id: str, payload: RolePayload, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
     _require_db()
     if not ObjectId.is_valid(role_id):
         raise HTTPException(status_code=400, detail="Invalid role id")
@@ -971,7 +983,7 @@ async def update_role(role_id: str, payload: RolePayload, user: Dict[str, Any] =
 
 
 @router.delete("/roles/{role_id}")
-async def delete_role(role_id: str, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
+def delete_role(role_id: str, user: Dict[str, Any] = Depends(require_permission("manage_roles"))):
     _require_db()
     if not ObjectId.is_valid(role_id):
         raise HTTPException(status_code=400, detail="Invalid role id")
@@ -986,26 +998,39 @@ async def delete_role(role_id: str, user: Dict[str, Any] = Depends(require_permi
     return {"success": True, "data": {"deleted": True}}
 
 
+TEAM_SECRET_FIELDS = ("password_hash", "token_hash", "auth_version")
+
+
+def _team_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A member or invitation as the browser may see it: never password or token hashes."""
+    return {key: value for key, value in row.items() if key not in TEAM_SECRET_FIELDS}
+
+
 @router.get("/team")
-async def get_team(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def get_team(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
     workspace_id = user.get("workspace_id", "default")
     members = list(mongo_client.users.find({"workspace_id": workspace_id}).sort("name", 1))
     pending = list(mongo_client.invitations.find({"workspace_id": workspace_id, "status": "pending"}).sort("created_at", -1))
-    rows = [{**member, "member_type": "user", "invitation_status": "accepted"} for member in members]
-    rows.extend({**invite, "member_type": "invitation", "active": False, "invitation_status": "pending"} for invite in pending if not any(member.get("email") == invite.get("email") for member in members))
+    rows = [{**_team_row(member), "member_type": "user", "invitation_status": "accepted"} for member in members]
+    rows.extend({**_team_row(invite), "member_type": "invitation", "active": False, "invitation_status": "pending"} for invite in pending if not any(member.get("email") == invite.get("email") for member in members))
+    logger.info("team: %s listed team (%d members, %d pending invites)", user.get("email"), len(members), len(pending))
     return {"success": True, "data": _serialize(rows)}
 
 
 @router.post("/team")
-async def invite_team_member(payload: TeamMemberPayload, background_tasks: BackgroundTasks, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def invite_team_member(payload: TeamMemberPayload, background_tasks: BackgroundTasks, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
     email = payload.email.strip().lower()
     role_name = payload.role.strip().lower()
     role = role_document(role_name)
     if not role:
         raise HTTPException(status_code=400, detail="Choose an existing role")
+    if role_name == "owner":
+        logger.warning("team: %s tried to invite %s as owner", user.get("email"), email)
+        raise HTTPException(status_code=400, detail="A workspace has one owner; invite this person as an admin instead")
     if mongo_client.users.find_one({"email": email, "workspace_id": user.get("workspace_id", "default")}) or mongo_client.invitations.find_one({"email": email, "workspace_id": user.get("workspace_id", "default"), "status": "pending"}):
+        logger.warning("team: %s tried to re-invite %s (already a member or pending)", user.get("email"), email)
         raise HTTPException(status_code=409, detail="This email already belongs to the workspace or has a pending invitation")
     now = datetime.utcnow()
     token = secrets.token_urlsafe(32)
@@ -1020,11 +1045,12 @@ async def invite_team_member(payload: TeamMemberPayload, background_tasks: Backg
     delivery = "queued" if email_service.configured else "manual_link_required"
     if email_service.configured:
         background_tasks.add_task(email_service.send_invitation, email, payload.name.strip(), user.get("workspace_name", "My workspace"), invite_url, role.get("label", role_name))
-    return {"success": True, "data": {**_serialize(invite), "invite_token": token, "invite_url": invite_url, "delivery": delivery}}
+    logger.info("team: %s invited %s as %s (delivery: %s)", user.get("email"), email, role_name, delivery)
+    return {"success": True, "data": {**_serialize(_team_row(invite)), "invite_token": token, "invite_url": invite_url, "delivery": delivery}}
 
 
 @router.put("/team/{member_id}")
-async def update_team_member(member_id: str, payload: TeamMemberUpdatePayload, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def update_team_member(member_id: str, payload: TeamMemberUpdatePayload, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
     if not ObjectId.is_valid(member_id):
         raise HTTPException(status_code=400, detail="Invalid member id")
@@ -1048,46 +1074,72 @@ async def update_team_member(member_id: str, payload: TeamMemberUpdatePayload, u
         if invalid:
             raise HTTPException(status_code=400, detail=f"Unknown permissions: {', '.join(invalid)}")
         updates["permissions"] = list(dict.fromkeys(payload.permissions))
+    if member.get("role") == "owner" and (payload.role is not None or payload.active is False):
+        logger.warning("team: %s tried to change the owner %s", user.get("email"), member.get("email"))
+        raise HTTPException(status_code=400, detail="The workspace owner's role and status cannot be changed")
+    if payload.active is False or payload.role is not None:
+        updates["auth_version"] = int(member.get("auth_version", 0)) + 1  # sign them out so the change applies now
     mongo_client.users.update_one({"_id": member["_id"]}, {"$set": updates})
-    return {"success": True, "data": _serialize(mongo_client.users.find_one({"_id": member["_id"]}))}
+    logger.info("team: %s updated %s (%s)", user.get("email"), member.get("email"), {key: value for key, value in updates.items() if key != "updated_at"})
+    return {"success": True, "data": _serialize(_team_row(mongo_client.users.find_one({"_id": member["_id"]})))}
 
 
 @router.delete("/team/{member_id}")
-async def deactivate_team_member(member_id: str, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def deactivate_team_member(member_id: str, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
     if not ObjectId.is_valid(member_id):
         raise HTTPException(status_code=400, detail="Invalid member id")
     if str(member_id) == str(user.get("_id")):
         raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
-    result = mongo_client.users.update_one({"_id": ObjectId(member_id), "workspace_id": user.get("workspace_id", "default"), "role": {"$ne": "owner"}}, {"$set": {"active": False, "updated_at": datetime.utcnow()}})
+    result = mongo_client.users.update_one({"_id": ObjectId(member_id), "workspace_id": user.get("workspace_id", "default"), "role": {"$ne": "owner"}},
+                                           {"$set": {"active": False, "updated_at": datetime.utcnow()}, "$inc": {"auth_version": 1}})
     if result.matched_count == 0:
+        logger.warning("team: %s could not deactivate %s (missing or owner)", user.get("email"), member_id)
         raise HTTPException(status_code=404, detail="Team member not found or cannot be deactivated")
+    logger.info("team: %s deactivated member %s", user.get("email"), member_id)
     return {"success": True, "data": {"deactivated": True}}
 
 
+@router.delete("/team/invitations/{invitation_id}")
+def revoke_invitation(invitation_id: str, user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    _require_db()
+    if not ObjectId.is_valid(invitation_id):
+        raise HTTPException(status_code=400, detail="Invalid invitation id")
+    invitation = mongo_client.invitations.find_one_and_update(
+        {"_id": ObjectId(invitation_id), "workspace_id": user.get("workspace_id", "default"), "status": "pending"},
+        {"$set": {"status": "revoked", "revoked_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
+    )
+    if not invitation:
+        logger.warning("team: %s tried to revoke missing invitation %s", user.get("email"), invitation_id)
+        raise HTTPException(status_code=404, detail="Pending invitation not found")
+    mongo_client.team_members.update_one({"email": invitation.get("email")}, {"$set": {"invitation_status": "revoked", "updated_at": datetime.utcnow()}})
+    logger.info("team: %s revoked the invitation for %s", user.get("email"), invitation.get("email"))
+    return {"success": True}
+
+
 @router.get("/invitations")
-async def get_invitations(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def get_invitations(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
     _require_db()
     rows = list(mongo_client.invitations.find({"workspace_id": user.get("workspace_id", "default")}).sort("created_at", -1))
-    return {"success": True, "data": _serialize(rows)}
+    return {"success": True, "data": _serialize([_team_row(row) for row in rows])}
 
 
 @router.get("/settings")
-async def get_settings():
+def get_settings():
     defaults = {"business": {}, "ai": {"default_model": os.getenv("OPENAI_MODEL", "")}, "notifications": {}, "security": {}, "billing": {"plan": "Development"}}
     stored = brain_service._setting("workspace_settings", {})
     return {"success": True, "data": {**defaults, **stored}}
 
 
 @router.put("/settings")
-async def update_settings(payload: ValuePayload):
+def update_settings(payload: ValuePayload):
     stored = _upsert_setting("workspace_settings", payload.value)
     _audit("update", "workspace_settings", after=payload.value)
     return {"success": True, "data": _serialize(stored)}
 
 
 @router.get("/search")
-async def global_search(q: str = Query(..., min_length=2)):
+def global_search(q: str = Query(..., min_length=2)):
     _require_db()
     regex = {"$regex": q, "$options": "i"}
     customers = list(mongo_client.customers.find({"$or": [{"name": regex}, {"phone": regex}, {"email": regex}]}).limit(10))
@@ -1098,7 +1150,7 @@ async def global_search(q: str = Query(..., min_length=2)):
 
 
 @router.get("/export/{resource}.csv")
-async def export_csv(resource: str):
+def export_csv(resource: str):
     _require_db()
     collections = {"customers": mongo_client.customers, "leads": mongo_client.leads, "calls": mongo_client.calls, "activity": mongo_client.ai_activity, "automations": mongo_client.automations}
     collection = collections.get(resource)

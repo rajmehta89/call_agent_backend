@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 from datetime import datetime
+from timeutil import utc_iso, utc_now
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
@@ -23,7 +24,7 @@ from logging_setup import bind_call
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
 from qa_engine import DynamicQA
-from routers.calls_api import log_call, update_call_from_twilio
+from routers.calls_api import log_call, record_failed_call, update_call_from_twilio
 from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
@@ -322,7 +323,11 @@ async def status_callback(request: Request):
     payload = dict(await request.form())
     bind_call(payload.get("CallSid"))
     logger.info("Twilio call status: %s (duration %ss)", payload.get("CallStatus"), payload.get("CallDuration", "-"))
-    update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"))
+    updated = update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"))
+    if not updated:
+        # Busy / no answer / failed calls never reached a voice agent, so no record exists yet: create one.
+        record_failed_call(payload.get("CallSid"), payload.get("From") or payload.get("Caller") or "unknown", payload.get("CallStatus"),
+                           direction=payload.get("Direction") or "inbound", error_code=payload.get("ErrorCode"))
     return {"success": True}
 
 
@@ -369,7 +374,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
         "phone_number": "unknown",
         "direction": "inbound",
         "lead_id": None,
-        "started_at": datetime.now(),
+        "started_at": utc_now(),
         "transfer_attempted": False,
         "transfer_succeeded": False,
         "transfer_status": None,
@@ -421,7 +426,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
             if not caller_text:
                 continue
 
-            timestamp = datetime.now().isoformat()
+            timestamp = utc_iso()
             user_transcript.append({"content": caller_text, "timestamp": timestamp})
             transfer_service.append_message(session["session_id"], "user", caller_text)
 
@@ -442,7 +447,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     if TWILIO_HUMAN_AGENT_NUMBER else
                     "I have recorded your request for a human follow-up. Our team will call you back using the number associated with this call."
                 )
-                ai_responses.append({"content": handoff_text, "timestamp": datetime.now().isoformat()})
+                ai_responses.append({"content": handoff_text, "timestamp": utc_iso()})
                 transfer_service.append_message(session["session_id"], "assistant", handoff_text)
                 await _send_text(websocket, handoff_text)
 
@@ -516,7 +521,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
 
             if bot.is_exit_intent(caller_text):
                 exit_text = bot.get_exit_message()
-                ai_responses.append({"content": exit_text, "timestamp": datetime.now().isoformat()})
+                ai_responses.append({"content": exit_text, "timestamp": utc_iso()})
                 transfer_service.append_message(session["session_id"], "assistant", exit_text)
                 await _send_text(websocket, exit_text)
                 break
@@ -530,7 +535,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
             ) or "I'm sorry, the AI service is not available right now."
             memory.add(caller_text, reply)
             history = memory.history()
-            ai_responses.append({"content": reply, "timestamp": datetime.now().isoformat()})
+            ai_responses.append({"content": reply, "timestamp": utc_iso()})
             transfer_service.append_message(session["session_id"], "assistant", reply)
             await _send_text(websocket, reply)
 
@@ -541,7 +546,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
     finally:
         handoff = transfer_service.get_call(session.get("session_id", "")) or {}
         transfer_service.close_call(session.get("session_id"))
-        duration = max((datetime.now() - session["started_at"]).total_seconds(), 0)
+        duration = max((utc_now() - session["started_at"]).total_seconds(), 0)
         if session.get("phone_number") and (user_transcript or ai_responses):
             transfer_requested = bool(session.get("transfer_attempted") or handoff.get("transfer_requested"))
             transfer_status = handoff.get("transfer_status") or session.get("transfer_status") or handoff.get("status")

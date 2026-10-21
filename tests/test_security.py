@@ -16,6 +16,8 @@ PUBLIC_ROUTES = {
     "/api/auth/login", "/api/auth/signup", "/api/auth/config", "/api/auth/invite/{token}", "/api/auth/accept-invite",
     # These verify the caller themselves: stream token, Retell secret, or Retell signature.
     "/api/custom-voice/media", "/api/twilio/ws", "/api/retell/llm-websocket/{call_id}", "/api/retell/webhook",
+    # Checks the sign-in token itself (passed in the URL: browsers' EventSource cannot send headers).
+    "/api/realtime/events",
 }
 GUARDS = {"require_user", "dependency", "verify_twilio_request"}
 
@@ -91,3 +93,13 @@ def test_secrets_are_encrypted_and_legacy_plain_text_still_reads():
     assert decrypt_secret(stored) == "shpss_secret_value"
     assert decrypt_secret("shpat_legacy") == "shpat_legacy"
     assert encrypt_secret(stored) == stored  # never double-encrypts
+
+
+def test_realtime_stream_requires_a_valid_sign_in():
+    from fastapi.testclient import TestClient
+
+    import main
+
+    client = TestClient(main.app)
+    assert client.get("/api/realtime/events").status_code == 422  # no token at all
+    assert client.get("/api/realtime/events", params={"token": "not-a-real-token"}).status_code == 401

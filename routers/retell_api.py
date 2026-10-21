@@ -13,18 +13,24 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
+from timeutil import utc_iso
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 from typing import Any, Dict, List, Optional
+
+from voice_keyterms import business_name
+from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
 from auth_service import require_user
 from logging_setup import bind_call
 
-from ai_services import AIServices
-from brain_service import brain_service
+from ai_services import AIServices, is_reasoning_model, warm_model_connection
+from brain_service import agent_config, brain_service
+from conversation_memory import bounded_history, voice_history_token_budget
 from qa_engine import DynamicQA
 import live_transcript
 from routers.calls_api import log_call
@@ -65,11 +71,48 @@ def _enabled() -> bool:
     return provider_enabled("retell")
 
 
-def _max_response_tokens() -> int:
+# Repeated as the last instruction before every voice reply: smaller, faster models (e.g. gpt-oss-20b) follow the
+# long system prompt's conversation rules much more reliably when the key ones come right before they answer.
+VOICE_TURN_CHECKLIST = (
+    "Before you reply, check: (1) Answer what the caller just said. If they ask you to repeat, explain again, or say they "
+    "did not understand, re-explain your previous answer in simpler words; do not change the subject. (2) Two or three short "
+    "spoken sentences, under 50 words; summarise in your own words, never read the knowledge out line by line. "
+    "(3) Ask for the caller's name, phone number or email ONLY after they have asked for a callback, meeting, quote or a person, "
+    "and then one detail per reply. Otherwise do not ask for their details at all. (4) If they ask whether something is booked "
+    "or confirmed, start with 'Not yet'. (5) Never ask for anything they already gave in this conversation. "
+    "(6) State only facts from the business knowledge. (7) If you repeat a phone number or email the caller gave, copy it "
+    "exactly as it was confirmed earlier in the conversation, digit by digit; if unsure, say 'the number you gave' instead."
+)
+
+
+def configure_voice_services(services: AIServices, model: str) -> AIServices:
+    """Voice model client: the main model, a fallback model used when the main one fails or stalls before saying
+    anything (VOICE_FALLBACK_MODEL, default gpt-4.1-mini), and how long a stall may last (VOICE_MODEL_STALL_SECONDS)."""
+    services.config.OPENROUTER_MODEL = model.strip()
+    services.fallback_model = os.getenv("VOICE_FALLBACK_MODEL", "openai/gpt-4.1-mini").strip()
     try:
-        return max(40, min(240, int(os.getenv("RETELL_MAX_RESPONSE_TOKENS", "120"))))
+        services.stream_timeout = max(2.0, float(os.getenv("VOICE_MODEL_STALL_SECONDS", "6")))
     except ValueError:
-        return 120
+        services.stream_timeout = 6.0
+    return services
+
+
+def _max_response_tokens(model: str = "") -> int:
+    """Token limit for one reply request. Reasoning models (gpt-oss) count their hidden thinking against the same
+    limit, so the spoken budget (RETELL_MAX_RESPONSE_TOKENS) gets a separate thinking allowance on top;
+    otherwise replies are cut off mid-sentence. Ordinary models (gpt-4.1-mini) need no allowance.
+    Reply length itself is kept short by the prompt."""
+    model = model or os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b")
+    try:
+        spoken = max(40, min(240, int(os.getenv("RETELL_MAX_RESPONSE_TOKENS", "120"))))
+    except ValueError:
+        spoken = 120
+    try:
+        thinking = max(0, min(2000, int(os.getenv("RETELL_REASONING_TOKEN_ALLOWANCE", "600"))))
+    except ValueError:
+        thinking = 600
+    reasoning_on = os.getenv("RETELL_OPENROUTER_REASONING_EFFORT", "low").strip().lower() in {"low", "medium", "high"} and is_reasoning_model(model)
+    return spoken + (thinking if reasoning_on else 0)
 
 
 def _serialize_messages(messages: List[Dict[str, str]], message_type: str) -> List[Dict[str, str]]:
@@ -89,7 +132,9 @@ def _transcript_as_messages(transcript: Any) -> List[Dict[str, str]]:
         role = str(item.get("role") or "").lower()
         if content and role in {"user", "agent", "assistant"}:
             messages.append({"role": "assistant" if role in {"agent", "assistant"} else "user", "content": content})
-    return messages[-10:]
+    # The whole call, not just the last few lines: a name, number or email given earlier must stay in view,
+    # or the agent asks for it again (it used to keep only the last 10 lines).
+    return bounded_history(messages, voice_history_token_budget())
 
 
 def _last_user_message(messages: List[Dict[str, str]]) -> str:
@@ -130,7 +175,7 @@ def _valid_retell_webhook(raw_body: bytes, signature: str) -> bool:
 
 def _timestamp_from_ms(value: Any) -> Optional[str]:
     try:
-        return datetime.fromtimestamp(float(value) / 1000).isoformat()
+        return datetime.fromtimestamp(float(value) / 1000, timezone.utc).isoformat()
     except (TypeError, ValueError, OSError):
         return None
 
@@ -156,7 +201,7 @@ def _retell_messages(call: Dict[str, Any]) -> tuple[List[Dict[str, str]], List[D
         if not content or role not in {"user", "agent", "assistant"}:
             continue
         timestamp = _timestamp_from_ms(float(started_at) + float(item.get("time_sec", 0)) * 1000) if started_at else None
-        message = {"content": content, "timestamp": timestamp or datetime.now().isoformat(), "type": "user" if role == "user" else "bot"}
+        message = {"content": content, "timestamp": timestamp or utc_iso(), "type": "user" if role == "user" else "bot"}
         (callers if role == "user" else agents).append(message)
     return callers, agents
 
@@ -234,7 +279,7 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
         "transcript_with_tool_calls": call.get("transcript_with_tool_calls") or [],
         "messages": live_transcript.ordered_from_retell(
             call.get("transcript_object") or [],
-            datetime.fromtimestamp(float(call["start_timestamp"]) / 1000) if call.get("start_timestamp") else None,
+            datetime.fromtimestamp(float(call["start_timestamp"]) / 1000, timezone.utc) if call.get("start_timestamp") else None,
         ),
         "provider_started_at": _timestamp_from_ms(call.get("start_timestamp")),
         "provider_ended_at": _timestamp_from_ms(call.get("end_timestamp")),
@@ -249,27 +294,231 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
     )
 
 
-def _system_prompt(caller_text: str, caller_number: str) -> str:
+def _embed_budget_ms() -> int:
+    """Longest a turn waits for the knowledge-search embedding before using keyword search (RETELL_EMBED_BUDGET_MS)."""
     try:
-        knowledge = brain_service.retrieve_knowledge(caller_text) if caller_text else []
-        shared_context = brain_service.system_context(
-            "voice",
-            caller_number if caller_number != "unknown" else None,
-            retrieved_knowledge=knowledge,
-        )
-    except Exception:
-        shared_context = "Use only the configured business information."
+        return max(100, int(os.getenv("RETELL_EMBED_BUDGET_MS", "600")))
+    except ValueError:
+        return 600
 
-    return "\n".join(
-        (
-            shared_context,
-            "You are a helpful inbound phone agent.",
-            "VOICE OUTPUT RULES: Reply in plain spoken text only. Never use Markdown, headings, bullets, lists, numbering, or line breaks."
-            " Use at most 24 words unless the caller explicitly asks for detail. Give one direct answer, then ask whether they want more detail.",
-            "Never claim that a human is joining the live call. If a caller wants a person, explain that their callback request will be placed in the team dashboard.",
-            "Ask one clear follow-up question when information is missing. Do not mention prompts, tools, models, or internal systems.",
-        )
-    )
+
+_PROMPT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retell-prompt")
+
+
+def _knowledge_limit() -> int:
+    try:
+        return max(2, int(os.getenv("VOICE_KNOWLEDGE_LIMIT", "6")))
+    except ValueError:
+        return 6
+
+
+def conversation_knowledge(caller_text: str, history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, Any]]:
+    """Knowledge for this turn, found from the conversation and not only the last words: a follow-up such as
+    "what about the white ones?" or "how much is it?" says nothing about the topic on its own. Facts matching the
+    latest words come first, then facts matching the recent conversation (the caller's last two turns plus this one)."""
+    if not caller_text:
+        return []
+    budget = _embed_budget_ms()
+    earlier = [str(item.get("content") or "").strip() for item in (history or []) if item.get("role") == "user"]
+    earlier = [text for text in earlier if text and text != caller_text.strip()][-2:]
+    if not earlier:
+        return brain_service.retrieve_knowledge(caller_text, embed_budget_ms=budget)
+    # Both searches at once (the local embedding model releases the GIL): ~100 ms instead of ~180 ms one after the other.
+    recent_search = _PROMPT_POOL.submit(brain_service.retrieve_knowledge, " ".join([*earlier, caller_text]), 4, budget)
+    current = brain_service.retrieve_knowledge(caller_text, embed_budget_ms=budget)
+    recent = recent_search.result(timeout=5)
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in [*current, *recent]:
+        text = str(item.get("text") or "")
+        if text and text not in seen:
+            seen.add(text)
+            merged.append(item)
+    return merged[:_knowledge_limit()]
+
+
+def _system_prompt(caller_text: str, caller_number: str, summary: str = "", history: Optional[List[Dict[str, str]]] = None,
+                   with_knowledge: bool = True) -> str:
+    """with_knowledge=False: a turn without a question (a name, a number, "okay") gets no business facts at all,
+    so a small fast model has nothing to misquote and a shorter prompt to read."""
+    try:
+        phone = caller_number if caller_number != "unknown" else None
+        # The caller lookup and the knowledge search are both network reads: run them side by side.
+        caller_lookup = _PROMPT_POOL.submit(brain_service.customer_context, phone) if phone else None
+        knowledge = conversation_knowledge(caller_text, history) if with_knowledge else NO_FACTS_NEEDED
+        if caller_lookup is not None:
+            caller_lookup.result(timeout=5)
+        business = agent_config.get_system_prompt().strip()
+        channel = brain_service.channel_config("voice")
+        caller = brain_service.customer_context(phone) if phone else ""
+    except Exception:
+        knowledge, business, channel, caller = [], "", {}, ""
+    custom = agent_config.get_voice_prompt()
+    if custom:
+        return _business_voice_prompt(custom, caller, phone, knowledge, summary)
+    return _voice_prompt(business, channel, caller, phone, knowledge, summary)
+
+
+KNOWLEDGE_PLACEHOLDER = "{{business_knowledge}}"
+NO_FACTS_NEEDED = [{"text": "(not needed for this reply: the caller asked no question. Do not state any product, price, "
+                            "or policy details in this reply.)"}]
+
+
+def _business_voice_prompt(template: str, caller: str, phone: Optional[str], knowledge: List[Dict[str, Any]], summary: str = "") -> str:
+    """The voice prompt written by the business (Settings → voice_prompt), used as the whole instruction set.
+    Only data is added: the knowledge found for this question (at {{business_knowledge}}, or at the end) and the
+    live call details the prompt refers to (caller ID, CRM record, earlier part of the call)."""
+    facts = "\n".join(f"- {item['text']}" for item in knowledge) or "- (nothing relevant was found for this question)"
+    details = [
+        f"Caller ID: {describe_caller_id(phone) if phone else 'not available (web call or hidden number)'}",
+        caller_country_line(phone or ""),
+        f"What we already know about this caller:\n{caller}" if caller else "This caller is not in the CRM yet.",
+        f"Earlier in this call (facts the caller already told you):\n{summary}" if summary else "",
+    ]
+    live = "\n\n## Live call details (filled in automatically)\n" + "\n".join(item for item in details if item)
+    if _knowledge_at_end():
+        # The model host reuses work for a prompt start it has seen before (prompt caching): with the facts for this
+        # question last, the whole written prompt is identical on every turn and starts answering sooner.
+        prompt = template.replace(KNOWLEDGE_PLACEHOLDER, "(see the Business knowledge section at the end of these instructions)")
+        return f"{prompt}{live}\n\n## Business knowledge (the facts for this question)\n{facts}"
+    prompt = template.replace(KNOWLEDGE_PLACEHOLDER, facts) if KNOWLEDGE_PLACEHOLDER in template else f"{template}\n\n## Business knowledge\n{facts}"
+    return prompt + live
+
+
+def _knowledge_at_end() -> bool:
+    """VOICE_KNOWLEDGE_AT_END: put the per-question facts at the end of the prompt instead of at {{business_knowledge}}."""
+    return os.getenv("VOICE_KNOWLEDGE_AT_END", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def voice_turn_reminder() -> str:
+    """Last instruction sent after the conversation on every turn. With a business-written voice prompt this is that
+    prompt's own final-rules section (a heading containing "Final"); otherwise the built-in checklist."""
+    custom = agent_config.get_voice_prompt()
+    if not custom:
+        return VOICE_TURN_CHECKLIST
+    final = _final_rules_section(custom)
+    # Small fast models (gpt-oss-20b) drift from long prompts; these few concrete rules, tested on real calls,
+    # keep them on track. VOICE_TURN_SAFETY=false sends only the business prompt's own final rules.
+    if os.getenv("VOICE_TURN_SAFETY", "true").strip().lower() not in {"0", "false", "no", "off"}:
+        final = f"{final}\n\n{VOICE_TURN_SAFETY_RULES}".strip()
+    # Keeps replies sounding like one flowing conversation rather than a fresh start each turn.
+    # VOICE_TURN_CONVERSATION=false leaves them out.
+    if os.getenv("VOICE_TURN_CONVERSATION", "true").strip().lower() not in {"0", "false", "no", "off"}:
+        final = f"{final}\n\n{VOICE_CONVERSATION_RULES}".strip()
+    return final
+
+
+VOICE_CONVERSATION_RULES = (
+    "Conversation: (1) Speak as the business: say 'we' and 'our'. Do not start a reply with the business name and do not "
+    "repeat the business name in your replies; the caller knows who they called. (2) Continue the conversation: build on what "
+    "you and the caller already said, refer back to it ('those ones', 'as I mentioned'), and never re-introduce the business "
+    "or repeat an earlier answer word for word. (3) The caller's words come from speech recognition and can be misheard: read "
+    "them in the context of the conversation and the business knowledge (a word that sounds like a product or the business "
+    "name means that), and answer what they meant without pointing out the mistake. (4) If the caller's words stop mid-sentence, "
+    "answer what they clearly mean from the conversation so far instead of asking them to clarify. (5) Describe products only "
+    "with the types, sizes, finishes and features written in the business knowledge. When the knowledge only names a product "
+    "category, say we stock it and point the caller to the website or catalogue for the styles; never add details of your own, "
+    "and keep the knowledge's meaning exact (if it says 'many products', do not say 'most' or 'all'). (6) Never say we do NOT have, sell or "
+    "offer something unless the knowledge says so: say it is not something you have details on, mention the closest thing the "
+    "knowledge does cover, and offer to have the team confirm. (7) When the caller names a city, suburb or area (for delivery, "
+    "installation or stores), never answer yes, no or 'should be fine' for that place unless the knowledge names it: say what the "
+    "knowledge says in general (for example 'nationwide' or 'most of Australia') and that the team will confirm for their area. "
+    "(8) The business's own phone number, email addresses, address and website written in the knowledge are public contact "
+    "details: when the caller asks for them, give them exactly as written (the privacy rules are about the caller's details). "
+    "(9) Sound like a friendly person on the phone, not a brochure: usually one or two short sentences (under about 30 words). "
+    "React to what the caller just said, give the gist in plain everyday words instead of reading policies or lists out (name "
+    "two or three things at most and say there are more; leave out fine print the caller didn't ask about), and use contractions. Then, unless the caller is wrapping up or giving their details, keep "
+    "the conversation going with one short, natural question about what they need (for example what they are working on or "
+    "looking for), so it feels like a conversation, not questions and answers. Vary how you start; do not begin every reply the same way. "
+    "(10) If the caller says 'hello?' or 'are you there?' in the middle of the call, they did not hear you: say you're here "
+    "and briefly repeat what you last asked or said. (11) If the caller is vague or unsure what to ask ('so what?', 'yes' "
+    "with nothing to act on, 'what can you do?'), do not just say you're here to help: say in one sentence what the business "
+    "can help with (from the knowledge) and ask one concrete question about what they need."
+)
+
+
+VOICE_TURN_SAFETY_RULES = (
+    "Also: (a) If the caller asks you to repeat, explain again, tell or 'text' them again, or says they did not understand, "
+    "re-explain your previous answer in simpler words; do not ask for their details. (b) Ask for name, phone or email only "
+    "after the caller asked for a callback, quote, meeting or a person, one detail per reply. (c) If asked whether something is "
+    "booked or confirmed, start with 'Not yet'. (d) When repeating a phone number or email, copy it exactly as the caller "
+    "confirmed it, digit by digit, or say 'the number you gave'. (e) Under 50 words; summarise, never read the knowledge out."
+)
+
+
+def _final_rules_section(custom: str) -> str:
+    """The prompt's own final-rules section: from a heading containing "Final" to the next heading at its level."""
+    lines = custom.splitlines()
+    for start, line in enumerate(lines):
+        heading = re.match(r"^(#+)\s+(.*)$", line.strip())
+        if heading and "final" in heading.group(2).lower():
+            level = len(heading.group(1))
+            end = next((index for index in range(start + 1, len(lines)) if (other := re.match(r"^(#+)\s", lines[index].strip())) and len(other.group(1)) <= level), len(lines))
+            return "\n".join(lines[start:end]).strip()
+    return ""
+
+
+def _voice_prompt(business: str, channel: Dict[str, Any], caller: str, phone: Optional[str], knowledge: List[Dict[str, Any]], summary: str = "") -> str:
+    """The whole instruction set for one spoken reply. Written for the phone only (the chat channels use
+    brain_service.system_context): one voice, one set of rules, no conflicting chat formatting advice."""
+    instructions = str(channel.get("instructions") or "").strip()
+    facts = "\n".join(f"- {item['text']}" for item in knowledge) or "- (nothing relevant was found for this question)"
+    sections = [
+        business or "You are the business's AI phone assistant.",
+        f"Channel instructions: {instructions}" if instructions and instructions != business else "",
+        f"Personality: {channel.get('personality') or 'Professional and helpful'}. Tone: {channel.get('tone') or 'Warm and concise'}. "
+        f"Language: {channel.get('language') or 'English'} (reply in the caller's language if they switch).",
+        "You are answering a live inbound phone call. Everything you write is spoken aloud by a voice, word for word.",
+        "# How to speak\n"
+        "- Answer the caller's actual question in your first sentence, then add one or two sentences of useful detail "
+        "(normally two to three natural sentences, about 25 to 50 words). Broad questions such as what you sell or what you offer deserve "
+        "the fuller answer; a simple yes or no question can be shorter.\n"
+        "- Every detail you add must be written in the business knowledge. Never add offers, discounts, free delivery, thresholds, "
+        "times, or promises that are not written there; if there is nothing more to add, a shorter answer is better than an invented one.\n"
+        "- Start straight with the answer. Never open with filler such as Sure, Great, Absolutely, Certainly, Of course, Got it, Perfect, or I'd love to.\n"
+        "- Ask at most one question per reply, and only when you need it to help them. Never ask for something they already told you.\n"
+        "- Plain spoken words only: no lists, bullet points, symbols, emojis, links, or formatting.\n"
+        "- You are the assistant, not the owner: refer to the owner by name in the third person, never 'I build' or 'my rate'.\n"
+        "- If the caller only says hello, yes, okay, or are you there, reply in a few words and invite them to go on.",
+        "# Facts and honesty\n"
+        "- State only facts written in the business knowledge section at the end. If the answer is not there, say you don't have that detail "
+        "and the team can confirm it on a callback. Never guess hours, availability, timelines, guarantees, or prices.\n"
+        "- Prices: when the caller asks about price, cost, or rates and the knowledge states a rate (for example an hourly rate), "
+        "say that rate with its number in your first sentence, then say final project pricing is confirmed after scoping, and offer a callback. "
+        "Stating a rate written in the knowledge is not guessing; never say you don't have pricing when a rate is written there.\n"
+        "- Services: name only the two or three that fit what the caller described, not the full list.",
+        "# Meetings, calls and callbacks (you cannot book anything)\n"
+        "- You have no calendar and cannot book, schedule, or confirm meetings, and you cannot send emails or messages. "
+        "Never say a meeting or call is booked, set, scheduled, or confirmed, and never promise a confirmation email or text.\n"
+        "- When the caller wants a meeting, call, quote, or a person: say you will pass the request to the team, who will contact them to confirm a time. "
+        "Then collect, one item per reply, only what you do not have yet: their name, the best phone number (skip it if the caller ID in the "
+        "This call section shows one), and if they offer it an email and a preferred day or time. Treat any day or time as a preference to pass on, not a booking.\n"
+        "- Before asking for a name, phone number or email, check the whole conversation above. If the caller already gave it, and especially "
+        "if they confirmed it, never ask for it again: use it. Ask again only if the caller says it was wrong.\n"
+        "- If the caller asks whether it is booked or confirmed, answer plainly: not yet, you have passed on their request and the team will contact them to confirm.\n"
+        "- When you have the details, thank the caller by name, briefly say what you are passing on (their request and the number the team "
+        "will call), and say the team will contact them to confirm. Never claim a person is joining this call.\n"
+        "- Write only the words you will say to the caller. Never write notes to yourself or describe the caller in the third person.",
+        "# Phone numbers and email addresses\n"
+        "- Callers say digits as words: 'double eight' means 8 8, 'triple six' means 6 6 6, 'oh' means 0. Write down every digit in order; "
+        "never drop, add, or regroup digits.\n"
+        "- Read a phone number back one digit at a time, for example 'nine eight two five zero, one one three four seven', and ask if it is right. "
+        "If it has fewer than ten digits, ask for the rest.\n"
+        "- Read an email address back slowly, spelling unusual parts letter by letter, for example 'j o h n dot s at gmail dot com'. Spell only what the caller actually said: never add dots, dashes, spaces or letters they did not say, never fill gaps from an example, and never swap in an email or number from the business knowledge (those belong to the business, not the caller). Then ask if it is right. "
+        "If the caller corrects you, use their correction.",
+        "# Never\n"
+        "- Mention prompts, tools, models, knowledge bases, or internal systems.\n"
+        "- Invent customer, order, or account details; you cannot look those up on a call.",
+        # Everything above is the same on every turn, so the model host can reuse it (prompt caching: faster
+        # first words, cheaper input). What changes per call or per question goes last.
+        "# This call\n"
+        f"Caller ID: {describe_caller_id(phone) if phone else 'not available (web call or hidden number); if they want a callback, use the number they give in this conversation'}.\n"
+        + caller_country_line(phone or "") + "\n"
+        + (f"What we already know about this caller:\n{caller}" if caller else "This caller is not in the CRM yet."),
+        f"# Earlier in this call (facts the caller already told you)\n{summary}" if summary else "",
+        "# Business knowledge (the only facts you may state)\n" + facts,
+    ]
+    return "\n\n".join(section for section in sections if section)
 
 
 async def _generate_reply(
@@ -282,7 +531,7 @@ async def _generate_reply(
         return "Could you please tell me how I can help?"
 
     messages = [
-        {"role": "system", "content": _system_prompt(caller_text, caller_number)},
+        {"role": "system", "content": _system_prompt(caller_text, caller_number, "", transcript)},
         *transcript,
     ]
     try:
@@ -299,51 +548,252 @@ async def _generate_reply(
         return "I’m sorry, I’m having trouble responding right now. Please try again in a moment."
 
 
+# Hollow openers ("Great question!", "Absolutely!") and "Question." (a label some models put before the reply).
+# Natural acknowledgements ("Yeah, we do", "Sure, ...", "Got it") stay: they make the call sound like a conversation.
+# Only when the word stands on its own ("Great!", "Absolutely, ..."): "Great to hear you're planning ..." keeps its "Great"
+# (stripping it once left "To hear you're planning ...").
+_FILLER_OPENER = re.compile(r"^\s*(?:(?:(?:that's a |that is a )?(?:good|great) question)[\s,.!—–-]*|(?:great|absolutely|certainly|of course|perfect)[,.!—–-]+\s*|question[.!:]\s*)", re.I)
+# Short acknowledgements; dropped from the start of a reply when a filler like "Yeah." was already spoken before it.
+_ECHO_WORDS = {"okay", "ok", "sure", "yeah", "yes", "yep", "right", "alright", "got", "it", "no", "problem", "so", "great",
+               "of", "course", "absolutely", "certainly", "i", "can", "do", "that", "for", "you"}
+ACKNOWLEDGEMENT_OPENER = re.compile(r"^\s*(?:yeah|yep|sure|okay|ok|alright|right|got it|no problem|mm-?hmm)[,.!—–-]+\s*", re.I)
+_SENTENCE_END = re.compile(r"[.!](?=\s|[A-Z])|\?")
+_GLUED_SENTENCE = re.compile(r"[.!](?=[A-Z][a-z])")
+
+
+class SpokenReplyGuard:
+    """Keeps a streamed reply speakable, whatever the model writes:
+    - drops a filler opener ("Sure,", "Great!") and capitalises what follows;
+    - ends the reply at its first question, so the agent never answers its own question for the caller;
+    - ends it at the first sentence break after max_words, so a reply never rambles on."""
+
+    def __init__(self, max_words: int = 45, strip_acknowledgement: bool = False, echo_of: str = "") -> None:
+        self.max_words = max_words
+        # A bridge phrase ("Sure, let me check.") was already said: drop the model's own "Sure," / "Yeah," too, and a
+        # first sentence that only repeats the bridge ("I can sort that out." after "Yeah, I can sort that out.").
+        self.strip_acknowledgement = strip_acknowledgement
+        self.echo_words = set(re.findall(r"[a-z']+", echo_of.lower())) | _ECHO_WORDS if echo_of else set()
+        self.raw = ""
+        self.skip = 0          # characters of filler removed from the start
+        self.started = False   # opener checked
+        self.sent = 0          # characters of the cleaned text already sent
+        self.done = False
+
+    def _opener(self) -> Optional[re.Match]:
+        match = _FILLER_OPENER.match(self.raw)
+        if not match and self.strip_acknowledgement:
+            match = ACKNOWLEDGEMENT_OPENER.match(self.raw)
+        return match
+
+    def _cleaned(self) -> str:
+        text = self.raw[self.skip:]
+        return text[:1].upper() + text[1:] if text else text
+
+    def _drop_echo(self, final: bool = False) -> bool:
+        """Drop leading sentences that only repeat the bridge. False while the first sentence is still incomplete."""
+        while self.echo_words:
+            end = _SENTENCE_END.search(self.raw)
+            if not end:
+                if final or len(self.raw) >= 80:
+                    break
+                return False
+            words = re.findall(r"[a-z']+", self.raw[:end.end()].lower())
+            if not words or len(words) > 8 or not all(word in self.echo_words for word in words):
+                break
+            self.raw = self.raw[end.end():].lstrip()
+        self.echo_words = set()
+        return True
+
+    def feed(self, chunk: str) -> str:
+        if self.done:
+            return ""
+        self.raw += chunk
+        if not self.started and not self._drop_echo():
+            return ""
+        if not self.started:
+            # Wait for the first few words before deciding whether they are filler.
+            if len(self.raw) < 14 and not _SENTENCE_END.search(self.raw):
+                return ""
+            match = self._opener()
+            if match and match.end() >= len(self.raw):
+                return ""  # only the filler so far: wait for the words after it
+            if match:
+                self.skip = match.end()
+            self.started = True
+        text = self._cleaned()
+        cut = len(text)
+        question = text.find("?", self.sent)
+        glued = _GLUED_SENTENCE.search(text, max(0, self.sent - 1))
+        if glued and (question == -1 or glued.start() < question):
+            # "...number.User didn't..." – a sentence glued on with no space is the model's private notes or a
+            # second reply leaking into the spoken text; end the reply before it.
+            cut, self.done = glued.start() + 1, True
+        elif question != -1:
+            cut, self.done = question + 1, True
+        elif len(text.split()) >= self.max_words:
+            words_seen = 0
+            for match in _SENTENCE_END.finditer(text):
+                words_seen = len(text[:match.end()].split())
+                if words_seen >= self.max_words:
+                    cut, self.done = match.end(), True
+                    break
+        if not self.done:
+            # Hold back a trailing "." or ".U" until the next characters show whether a glued sentence follows.
+            pending = re.search(r"[.!][A-Z]?$", text)
+            if pending:
+                cut = min(cut, max(self.sent, pending.start()))
+        out = text[self.sent:cut]
+        self.sent = cut
+        return out
+
+    def flush(self) -> str:
+        if self.done:
+            return ""
+        if not self.started:
+            self._drop_echo(final=True)
+            match = self._opener()
+            if match and match.end() < len(self.raw):
+                self.skip = match.end()
+        text = self._cleaned()
+        out = text[self.sent:]
+        self.sent = len(text)
+        return out
+
+
+_TRAILING_CONNECTORS = {"the", "a", "an", "and", "or", "but", "of", "for", "to", "with", "about", "in", "on", "at", "your", "my",
+                        "that", "which", "what", "is", "are", "do", "does", "can", "if", "so", "because", "like", "um", "uh"}
+
+
+def sounds_unfinished(text: str) -> bool:
+    """The caller paused mid-sentence: no closing punctuation, or the last word is one a sentence can't end on."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    words = re.findall(r"[a-z']+", stripped.lower())
+    return stripped[-1] not in ".?!" or (bool(words) and words[-1] in _TRAILING_CONNECTORS)
+
+
+def unfinished_wait_seconds() -> float:
+    """VOICE_UNFINISHED_WAIT_SECONDS: how long to wait for the rest of a sentence the caller broke off (0 = never)."""
+    try:
+        return max(0.0, float(os.getenv("VOICE_UNFINISHED_WAIT_SECONDS", "0.7")))
+    except ValueError:
+        return 0.7
+
+
+def voice_temperature() -> float:
+    """VOICE_TEMPERATURE: how freely the model words a spoken reply (0 = most literal, sticks closest to the knowledge)."""
+    try:
+        return max(0.0, min(1.0, float(os.getenv("VOICE_TEMPERATURE", "0.25"))))
+    except ValueError:
+        return 0.25
+
+
+def _max_spoken_words(fast: bool = False) -> int:
+    """Longest reply in words (RETELL_MAX_SPOKEN_WORDS); turns on the fast model (VOICE_FAST_MAX_WORDS) are
+    acknowledgements and detail requests, which should be short."""
+    name, default = ("VOICE_FAST_MAX_WORDS", 25) if fast else ("RETELL_MAX_SPOKEN_WORDS", 60)
+    try:
+        return max(15, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
 async def _stream_reply(
     services: AIServices,
     transcript: List[Dict[str, str]],
     caller_number: str,
     call_id: str,
     response_id: int,
+    reminder: bool = False,
 ):
     """Yield model deltas while recording the latency of each voice turn."""
     caller_text = _last_user_message(transcript)
     if not caller_text:
         yield "Could you please tell me how I can help?"
         return
+    if not reminder and sounds_unfinished(caller_text):
+        # The caller probably paused mid-sentence: wait a moment. If they go on, Retell asks again with the whole
+        # sentence and this reply is cancelled before a word of it is spoken (no half-started answer).
+        await asyncio.sleep(unfinished_wait_seconds())
 
     request_started = perf_counter()
     if _log_content_enabled():
         _trace(f"retell_llm_request call={call_id} response_id={response_id} caller={caller_text!r}")
 
     prompt_started = perf_counter()
-    system_prompt = await asyncio.to_thread(_system_prompt, caller_text, caller_number)
+    turn_model = None if reminder else choose_voice_model(caller_text, last_agent_text(transcript))
+    details_note, details_problem = ("", False) if reminder else contact_check(caller_text, last_agent_text(transcript), earlier_caller_texts(transcript, caller_text), caller_region(caller_number))
+    if details_problem:
+        turn_model = None  # a wrong number or email needs the careful model
+    bridge = ""
+    if not reminder and bridges_enabled() and turn_model is None:
+        # Said at once ("Sure, let me check."), before any database or model work: Retell speaks it while the
+        # knowledge search and the model run (~1.5 s).
+        said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
+        recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
+        bridge = bridge_phrase(caller_text, recent)
+        if bridge:
+            await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
+            yield bridge + " "
+    places = "" if reminder else place_note(caller_text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(transcript))
+    if places:
+        turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
+    system_prompt = await asyncio.to_thread(_system_prompt, caller_text, caller_number, "", transcript, turn_model is None or bool(places))
     retrieval_ms = (perf_counter() - prompt_started) * 1000
-    messages = [{"role": "system", "content": system_prompt}, *transcript]
+    reminder_text = voice_turn_reminder()
+    messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
+    if details_note:
+        messages.append({"role": "system", "content": details_note})
+    if places:
+        messages.append({"role": "system", "content": places})
+    misheard = "" if reminder else name_note(caller_text, business_name())
+    if misheard:
+        messages.append({"role": "system", "content": misheard})
+    if bridge:
+        messages.append({"role": "system", "content": bridge_note(bridge)})
+    elif turn_model is not None and not places:
+        messages.append({"role": "system", "content": FAST_TURN_NOTE})
+    if reminder:
+        # Retell asks for a nudge after the caller has been silent; without this the model may repeat its last answer.
+        messages.append({"role": "system", "content": "The caller has gone quiet. Check in with one short, friendly sentence, "
+                         "for example asking if they are still there or if there is anything else you can help with. Do not repeat your previous answer."})
     _trace(
         f"retell_llm_started call={call_id} response_id={response_id} "
-        f"model={services.config.OPENROUTER_MODEL} retrieval_ms={retrieval_ms:.0f}"
+        f"model={turn_model or services.config.OPENROUTER_MODEL} retrieval_ms={retrieval_ms:.0f}"
     )
 
+    iterator = None
     try:
         iterator = services.stream_chat_completion(
             messages,
-            _max_response_tokens(),
-            0.25,
+            _max_response_tokens(turn_model or ""),
+            voice_temperature(),
             1.0,
+            model=turn_model,
         )
         first_token_logged = False
+        guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
+        numbers = NumberSpeaker(caller_number_digits(transcript), known_numbers(brain_service.knowledge_text()))
         while True:
             chunk = await asyncio.to_thread(next, iterator, None)
             if chunk is None:
                 break
-            if not first_token_logged:
+            spoken = numbers.feed(guard.feed(chunk))
+            if spoken and not first_token_logged:
                 first_token_logged = True
                 _trace(
                     f"retell_llm_first_token call={call_id} response_id={response_id} "
                     f"elapsed_ms={(perf_counter() - request_started) * 1000:.0f}"
                 )
-            yield chunk
+            if spoken:
+                yield spoken
+            if guard.done:
+                _trace(f"retell_llm_reply_trimmed call={call_id} response_id={response_id} kept={guard.sent} chars")
+                break
+        rest = numbers.feed(guard.flush()) + numbers.flush()
+        if rest:
+            yield rest
         _trace(
             f"retell_llm_complete call={call_id} response_id={response_id} "
             f"elapsed_ms={(perf_counter() - request_started) * 1000:.0f}"
@@ -351,6 +801,14 @@ async def _stream_reply(
     except Exception as exc:
         _trace(f"retell_llm_stream_failed call={call_id} response_id={response_id} error={type(exc).__name__}: {exc}", error=True)
         yield "I’m sorry, I’m having trouble responding right now. Please try again in a moment."
+    finally:
+        # Also when this reply was superseded and cancelled: stop the model request instead of letting it run on.
+        close = getattr(iterator, "close", None)
+        if close:
+            try:
+                close()
+            except Exception:
+                pass
 
 
 @router.get("/config", dependencies=[Depends(require_user)])
@@ -432,16 +890,16 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     await websocket.accept()
     bind_call(call_id)
     _trace(f"retell_ws_connected call={call_id}")
-    started_at = datetime.now()
+    started_at = datetime.now(timezone.utc)  # aware: transcript line times are derived from it
     started_clock = perf_counter()
     caller_number = "unknown"
     callback_requested = False
     user_messages: List[Dict[str, str]] = []
     agent_messages: List[Dict[str, str]] = []
     live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
+    prefetched_text, prefetched_at = "", 0.0  # last caller words sent for an early knowledge-search embedding
     live_saves: set[asyncio.Task[None]] = set()
-    services = AIServices()
-    services.config.OPENROUTER_MODEL = os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b").strip()
+    services = configure_voice_services(AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b"))
     intent_analyzer = DynamicQA(services)
 
     if not services.is_llm_configured():
@@ -463,7 +921,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             "config": {"auto_reconnect": True, "call_details": True},
         }
     )
-    begin_message = os.getenv("RETELL_BEGIN_MESSAGE", "Hello, how can I help you today?").strip()
+    # The greeting set in Settings (agent config), unless RETELL_BEGIN_MESSAGE overrides it.
+    begin_message = (os.getenv("RETELL_BEGIN_MESSAGE", "").strip() or agent_config.get_greeting_message() or "Hello, how can I help you today?").strip()
     await websocket.send_json(
         {
             "response_type": "response",
@@ -473,7 +932,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         }
     )
     if begin_message:
-        agent_messages.append({"content": begin_message, "timestamp": datetime.now().isoformat()})
+        agent_messages.append({"content": begin_message, "timestamp": utc_iso()})
 
     # Retell pings every two seconds while a response is being generated. Keep
     # the receive loop free so it can return those pings and accept newer turns.
@@ -489,7 +948,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         """Rebuild the ordered transcript from Retell's (it is always complete and in order) and save it.
         Lines keep the time they were first seen; Retell's live transcript carries no timings."""
         nonlocal live_messages
-        now = datetime.now().isoformat()
+        now = utc_iso()
         lines = live_transcript.ordered_from_retell(transcript)
         if reply:
             lines.append({"role": "agent", "text": reply, "at": ""})
@@ -508,7 +967,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         nonlocal callback_requested, user_messages
         transcript = _transcript_as_messages(event.get("transcript"))
         caller_text = _last_user_message(transcript)
-        now = datetime.now().isoformat()
+        now = utc_iso()
 
         if caller_text:
             user_messages = [
@@ -521,7 +980,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         streamed = False
         if event.get("interaction_type") == "reminder_required" and not caller_text:
             reply = "Is there anything else I can help you with?"
-        elif caller_text and intent_analyzer.should_transfer_to_agent(caller_text):
+        elif event.get("interaction_type") == "response_required" and caller_text and intent_analyzer.should_transfer_to_agent(caller_text):
             callback_requested = True
             transfer_service.request_transfer(
                 call_id,
@@ -534,7 +993,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             reply = "I have marked your request for a human callback. Our team will contact you using this number as soon as possible."
         else:
             answer_parts: List[str] = []
-            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id):
+            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required"):
                 if response_id != latest_response_id:
                     _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
                     return
@@ -554,7 +1013,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
             return
 
-        agent_messages.append({"content": reply, "timestamp": datetime.now().isoformat()})
+        agent_messages.append({"content": reply, "timestamp": utc_iso()})
         save_progress(event.get("transcript"), reply)
         transfer_service.append_message(call_id, "assistant", reply)
         if _log_content_enabled():
@@ -601,7 +1060,19 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 caller_number = str(call.get("from_number") or "unknown")
                 transfer_service.register_call(call_id, caller_number, direction=call.get("direction") or "inbound")
                 _trace(f"retell_call_details call={call_id} direction={call.get('direction') or 'inbound'} caller_known={caller_number != 'unknown'}")
+                # While the greeting plays: open the model connection and pre-build the prompt (cold first turns
+                # could otherwise take seconds).
+                asyncio.create_task(asyncio.to_thread(warm_model_connection, services))
+                asyncio.create_task(asyncio.to_thread(_system_prompt, "hello", caller_number, ""))
                 continue
+
+            if interaction_type == "update_only":
+                # The caller is still talking: start the knowledge-search embedding for what they have said so
+                # far, so it is usually ready (cached) when Retell asks for the reply.
+                spoken = _last_user_message(_transcript_as_messages(transcript))
+                if spoken and spoken != prefetched_text and perf_counter() - prefetched_at > 0.3:
+                    prefetched_text, prefetched_at = spoken, perf_counter()
+                    brain_service.prefetch_query_embedding(spoken)
 
             if interaction_type not in {"response_required", "reminder_required"}:
                 if interaction_type not in {"update_only", "call_details"}:
@@ -613,6 +1084,9 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             if not isinstance(response_id, int):
                 continue
             latest_response_id = response_id
+            for older in list(response_tasks):
+                # Retell only plays the newest response; finishing older ones would waste a model call each.
+                older.cancel()
             response_task = asyncio.create_task(handle_response(event, response_id))
             response_tasks.add(response_task)
             response_task.add_done_callback(consume_response_task)

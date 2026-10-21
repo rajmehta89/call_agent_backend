@@ -93,13 +93,15 @@ def sync_retell(base: str, check: bool) -> str:
     headers = {"Authorization": f"Bearer {key}"}
     secret = os.getenv("RETELL_CUSTOM_LLM_SECRET", "").strip()
     wanted = "wss://" + base.split("://", 1)[1] + "/api/retell/llm-websocket" + (f"?token={secret}" if secret else "")
+    # The webhook brings call_ended / call_analyzed (final status, summary); without it Retell calls stay "in progress".
+    webhook = f"{base}/api/retell/webhook"
     agent = httpx.get(f"https://api.retellai.com/get-agent/{agent_id}", headers=headers, timeout=20).json()
-    if (agent.get("response_engine") or {}).get("llm_websocket_url") == wanted:
+    if (agent.get("response_engine") or {}).get("llm_websocket_url") == wanted and agent.get("webhook_url") == webhook:
         return "Retell agent: ok"
     if check:
         return "Retell agent: stale"
     httpx.patch(f"https://api.retellai.com/update-agent/{agent_id}", headers=headers, timeout=20,
-                json={"response_engine": {"type": "custom-llm", "llm_websocket_url": wanted}}).raise_for_status()
+                json={"response_engine": {"type": "custom-llm", "llm_websocket_url": wanted}, "webhook_url": webhook}).raise_for_status()
     httpx.post(f"https://api.retellai.com/publish-agent/{agent_id}", headers=headers, timeout=20).raise_for_status()
     return "Retell agent: updated and published"
 

@@ -8,10 +8,12 @@ the same record completed; it is matched on call_session_id, so a call is always
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from timeutil import utc_now
 from typing import Any, Dict, Iterable, List, Optional
 
 from mongo_client import mongo_client
+import realtime
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ def ordered_from_retell(transcript: Iterable[Dict[str, Any]], started_at: Option
         words = item.get("words") or []
         if started_at and words and isinstance(words[0], dict) and words[0].get("start") is not None:
             try:
-                at = datetime.fromtimestamp(started_at.timestamp() + float(words[0]["start"])).isoformat()
+                at = datetime.fromtimestamp(started_at.timestamp() + float(words[0]["start"]), timezone.utc).isoformat()
             except (TypeError, ValueError):
                 at = ""
         lines.append({"role": "customer" if role == "user" else "agent", "text": text, "at": at})
@@ -57,7 +59,7 @@ def save_live(session_id: str, phone_number: str, provider: str, messages: List[
         if existing and str(existing.get("status", "")).lower() in FINAL_STATUSES:
             logger.debug("live transcript skipped: call %s already %s", session_id, existing.get("status"))
             return
-        now = datetime.now()
+        now = utc_now()
         mongo_client.calls.update_one(
             {"call_session_id": session_id},
             {"$set": {"messages": messages, "status": LIVE_STATUS, "updated_at": now, "phone_number": phone_number},
@@ -66,5 +68,28 @@ def save_live(session_id: str, phone_number: str, provider: str, messages: List[
             upsert=True,
         )
         logger.info("live transcript saved: call %s (%s) %d lines", session_id, provider, len(messages))
+        realtime.publish("call", key=session_id)
     except Exception as error:  # never break a live call because the inbox could not be updated
         logger.warning("live transcript save failed for call %s: %s", session_id, error)
+
+
+def close_orphaned_calls(provider: str = "custom_twilio") -> int:
+    """Finish calls left "in progress" by a server restart. The custom voice pipeline runs inside this server, so at
+    startup none of its calls can still be live; without this they would show as Live in the inbox forever.
+    (Retell calls are not touched: Retell runs them and sends their end itself.)"""
+    if not mongo_client.is_connected():
+        return 0
+    from call_status import schedule_auto_status  # imported here: call_status imports the routers
+    closed = 0
+    for call in mongo_client.calls.find({"status": LIVE_STATUS, "provider": provider}, {"created_at": 1, "updated_at": 1, "call_session_id": 1}):
+        started, last = call.get("created_at"), call.get("updated_at")
+        duration = max(0, int((last - started).total_seconds())) if started and last else 0
+        mongo_client.calls.update_one({"_id": call["_id"]}, {"$set": {
+            "status": "completed", "provider_call_status": "ended", "disconnection_reason": "server_restart",
+            "duration": duration, "updated_at": utc_now()}})
+        schedule_auto_status(str(call["_id"]), "completed")  # AI summary and status from what was said
+        realtime.publish("call", key=call.get("call_session_id") or str(call["_id"]))
+        closed += 1
+    if closed:
+        logger.warning("closed %d %s call(s) left in progress by a server restart", closed, provider)
+    return closed

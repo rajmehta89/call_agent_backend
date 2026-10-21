@@ -24,12 +24,16 @@ aiohttp>=3.10,<4
 websockets>=13,<17
 websocket-client>=1.8,<2
 numpy>=2.0,<3
+fastembed>=0.9,<1  # local query embeddings for fast knowledge search (brain_service.local_embeddings)
 scipy>=1.14,<2
 
 # LLM and telephony
 groq>=0.31,<2
 openai>=2.0,<4
 twilio>=9.3,<10
+
+# Phone number checks for any country (Google libphonenumber)
+phonenumbers>=9.0
 
 # Legacy compatibility only
 piopiy>=1.2.2

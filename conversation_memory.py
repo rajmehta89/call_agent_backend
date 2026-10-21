@@ -41,9 +41,15 @@ def clip_message(text: str) -> str:
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + " …"
 
 
-def bounded_history(history: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+def voice_history_token_budget() -> int:
+    """Phone calls keep the whole conversation (about 15-20 minutes of talk) so the agent never forgets a name,
+    number or email the caller already gave and asks for it again (VOICE_HISTORY_TOKEN_BUDGET)."""
+    return _int_env("VOICE_HISTORY_TOKEN_BUDGET", 5000, 500)
+
+
+def bounded_history(history: Optional[List[Dict[str, str]]], budget: Optional[int] = None) -> List[Dict[str, str]]:
     """Clip each message, then keep the newest messages that fit the token budget."""
-    budget = history_token_budget()
+    budget = budget or history_token_budget()
     kept: List[Dict[str, str]] = []
     used = 0
     for item in reversed(history or []):
@@ -103,15 +109,16 @@ def summarize(existing_summary: str, messages: List[Dict[str, str]]) -> str:
 class ConversationMemory:
     """Per-conversation memory. Call add() after each turn; compaction runs in the background."""
 
-    def __init__(self, keep_recent_messages: int = 6, max_messages: int = 12) -> None:
+    def __init__(self, keep_recent_messages: int = 6, max_messages: int = 12, token_budget: Optional[int] = None) -> None:
         self.summary = ""
         self.messages: List[Dict[str, str]] = []
         self.keep_recent = keep_recent_messages
         self.max_messages = max_messages
+        self.token_budget = token_budget  # None: the shared chat budget (BRAIN_HISTORY_TOKEN_BUDGET)
         self._compacting: Optional[asyncio.Task[None]] = None
 
     def history(self) -> List[Dict[str, str]]:
-        return bounded_history(self.messages)
+        return bounded_history(self.messages, self.token_budget)
 
     def add_assistant(self, text: str) -> None:
         """Record something the agent said unprompted (e.g. the greeting) so replies to it have context."""
@@ -129,7 +136,7 @@ class ConversationMemory:
         used = sum(estimate_tokens(item["content"]) for item in self.messages)
         if len(self.messages) <= self.keep_recent:
             return False
-        return len(self.messages) > self.max_messages or used > history_token_budget() * 0.8
+        return len(self.messages) > self.max_messages or used > (self.token_budget or history_token_budget()) * 0.8
 
     async def _compact(self) -> None:
         older = self.messages[:-self.keep_recent]

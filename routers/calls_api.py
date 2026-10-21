@@ -7,16 +7,20 @@ from fastapi import Depends, APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
+from timeutil import api_time, local_midnight_utc, utc_iso, utc_now
 from bson import ObjectId
 from mongo_client import mongo_client
+import realtime
+from call_status import schedule_auto_status
+from live_transcript import ordered_from_lists
 import re
 
-from auth_service import require_user
+from auth_service import can_assign_conversations, require_permission, require_user
 import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/calls", tags=["calls"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
+router = APIRouter(prefix="/api/calls", tags=["calls"], dependencies=[Depends(require_permission("handle_calls"))])  # dashboard API: sign-in required for every route
 
 # Provider-neutral operational fields.  Keeping these on the call document
 # means the existing history and detail endpoints expose them without a second
@@ -137,7 +141,7 @@ def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call
                 {
                     "$set": {
                         "status": new_status,
-                        "updated_at": datetime.now(),
+                        "updated_at": utc_now(),
                         "status_reason": f"Auto-updated from call: {call_status}"
                     }
                 }
@@ -203,7 +207,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
 
-        now = datetime.now()
+        now = utc_now()
         lead_id, lead = _ensure_inbound_lead(phone_number, lead_id, call_data, now)
         identity = caller_identity(phone_number)
         mongo_client.customers.update_one(
@@ -229,7 +233,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
         call_record = {
             "phone_number": phone_number,
             "lead_id": lead_id,
-            "call_date": datetime.now(),
+            "call_date": utc_now(),
             "direction": call_data.get("direction", "outbound") if call_data else "outbound",
             "status": call_data.get("status", "completed") if call_data else "completed",
             "duration": call_data.get("duration", 0) if call_data else 0,
@@ -245,8 +249,8 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             "transfer_succeeded": bool(call_data.get("transfer_succeeded", False)) if call_data else False,
             "accepted_by": call_data.get("accepted_by") if call_data else None,
             "handled_by": call_data.get("handled_by") or (call_data.get("accepted_by") if call_data else None),
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
+            "created_at": utc_now(),
+            "updated_at": utc_now()
         }
         if call_data:
             call_record.update({field: call_data[field] for field in EXTRA_CALL_FIELDS if field in call_data})
@@ -274,8 +278,9 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     "accepted_by": call_record["accepted_by"],
                     "handled_by": call_record["handled_by"],
                     **{field: call_record.get(field) for field in EXTRA_CALL_FIELDS if field in call_record},
-                    "updated_at": datetime.now(),
-                    "call_date": call_record["call_date"]
+                    "updated_at": utc_now(),
+                    # call_date stays when the call started (set by the first, live save); the final save must not move it.
+                    **({} if existing.get("call_date") else {"call_date": call_record["call_date"]}),
                 }
                 mongo_client.calls.update_one(
                     {"_id": existing["_id"]},
@@ -283,12 +288,15 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                 )
                 updated_record = mongo_client.calls.find_one({"_id": existing["_id"]})
                 updated_record["_id"] = str(updated_record["_id"])
+                realtime.publish("call", key=session_id)
                 logger.info(f"Updated existing call record with session_id: {session_id}")
+                schedule_auto_status(updated_record["_id"], call_record["status"])  # sidebar STATUS from what the caller said
                 return {"success": True, "data": updated_record, "note": "updated_existing_by_session"}
             else:
                 call_record["call_session_id"] = session_id
 
         result = mongo_client.calls.insert_one(call_record)
+        realtime.publish("call")
         call_record["_id"] = str(result.inserted_id)
 
         if lead_id:
@@ -297,8 +305,8 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     {"_id": ObjectId(lead_id)},
                     {
                         "$set": {
-                            "last_call": datetime.now(),
-                            "updated_at": datetime.now()
+                            "last_call": utc_now(),
+                            "updated_at": utc_now()
                         }
                     }
                 )
@@ -308,6 +316,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
 
         if call_data:
             update_lead_status_from_call(phone_number, lead_id, call_data)
+        schedule_auto_status(call_record["_id"], call_record["status"])  # sidebar STATUS from what the caller said
         return {"success": True, "data": call_record}
 
     except Exception as e:
@@ -329,7 +338,7 @@ def update_call_from_twilio(
     if not existing:
         return False
 
-    updates: Dict[str, Any] = {"updated_at": datetime.now()}
+    updates: Dict[str, Any] = {"updated_at": utc_now()}
     if transfer_status:
         updates["transfer_status"] = transfer_status
         if transfer_status in {"connected", "completed"}:
@@ -369,15 +378,56 @@ def update_call_from_twilio(
     if transfer_error:
         updates["transfer_error"] = transfer_error
     mongo_client.calls.update_one({"_id": existing["_id"]}, {"$set": updates})
+    realtime.publish("call", key=existing.get("call_session_id"))  # status changed: inbox lists refresh
     return True
 
-def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) -> Dict[str, Any]:
+# Twilio statuses for a call that never connected, and how the dashboard labels them (inbox "Failed" folder).
+FAILED_TWILIO_STATUSES = {"busy": "failed", "failed": "failed", "no-answer": "missed", "canceled": "failed"}
+FAILED_REASONS = {"busy": "Line busy", "failed": "Call failed", "no-answer": "No answer", "canceled": "Caller hung up before it connected"}
+
+
+def record_failed_call(call_sid: str, caller: str, twilio_status: str, direction: str = "inbound", error_code: Optional[str] = None) -> bool:
+    """Save a call that failed before any voice agent answered it; otherwise nothing records it at all.
+
+    Called from Twilio's status callback when no call record exists for the CallSid yet."""
+    normalized = str(twilio_status or "").lower().replace("_", "-")
+    if not call_sid or normalized not in FAILED_TWILIO_STATUSES:
+        return False
+    reason = FAILED_REASONS[normalized] + (f" (Twilio error {error_code})" if error_code else "")
+    result = log_call(caller or "unknown", None, {
+        "direction": "inbound" if str(direction or "inbound").startswith("inbound") else "outbound",
+        "status": FAILED_TWILIO_STATUSES[normalized],
+        "duration": 0,
+        "summary": f"{reason}. The caller never reached the voice agent.",
+        "provider": "twilio",
+        "provider_call_id": call_sid,
+        "provider_call_status": normalized,
+        "disconnection_reason": reason,
+        "channel_type": "web_call" if str(caller or "").startswith("client:") else "phone_call",
+        "call_session_id": call_sid,
+    })
+    if result.get("success"):
+        logger.info("Recorded failed call %s from %s: %s", call_sid, caller, reason)
+    else:
+        logger.warning("Could not record failed call %s: %s", call_sid, result.get("error"))
+    return bool(result.get("success"))
+
+
+def call_scope(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Calls a user may see: admins see every call; a team member sees the calls of the leads they own (leads.assigned_to)."""
+    if can_assign_conversations(user):
+        return {}
+    lead_ids = [lead["_id"] for lead in mongo_client.leads.find({"assigned_to": str(user.get("_id"))}, {"_id": 1})]
+    return {"lead_id": {"$in": lead_ids + [str(lead_id) for lead_id in lead_ids]}}  # lead_id is stored as a string or an ObjectId
+
+
+def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, scope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Get calls with optional filters"""
     try:
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
 
-        query = {}
+        query = dict(scope or {})
         if filters:
             if filters.get("direction"):
                 query["direction"] = filters["direction"]
@@ -397,6 +447,8 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
                 else:
                     query["call_date"] = {"$lte": datetime.fromisoformat(filters["date_to"])}
 
+        if scope:  # filters such as lead_id must not widen what this user may see
+            query = {"$and": [dict(scope), query]}
         calls = list(mongo_client.calls.find(query).sort("call_date", -1).skip(skip).limit(limit))
 
         lead_ids = list({c.get("lead_id") for c in calls if c.get("lead_id")})
@@ -429,13 +481,13 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
             call["direction"] = call.get("direction", "outbound")
             cd = call.get("call_date")
             if isinstance(cd, datetime):
-                call["call_date"] = cd.isoformat()
+                call["call_date"] = api_time(cd)
             elif not cd:
-                ts = call.get("end_time") or call.get("start_time") or call.get("created_at") or datetime.now()
+                ts = call.get("end_time") or call.get("start_time") or call.get("created_at") or utc_now()
                 if isinstance(ts, datetime):
-                    call["call_date"] = ts.isoformat()
+                    call["call_date"] = api_time(ts)
                 else:
-                    call["call_date"] = datetime.now().isoformat()
+                    call["call_date"] = utc_iso()
             if call.get("phone_number") is not None:
                 call["phone_number"] = str(call["phone_number"])
 
@@ -453,14 +505,14 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0) ->
         logger.error(f"Error getting calls: {e}")
         return {"success": False, "error": str(e)}
 
-def get_call_by_id(call_id: str) -> Dict[str, Any]:
+def get_call_by_id(call_id: str, scope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Get a specific call by ID"""
     try:
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
 
         try:
-            call = mongo_client.calls.find_one({"_id": ObjectId(call_id)})
+            call = mongo_client.calls.find_one({"_id": ObjectId(call_id), **(scope or {})})
         except:
             return {"success": False, "error": f"'{call_id}' is not a valid ObjectId, it must be a 12-byte input or a 24-character hex string"}
 
@@ -483,26 +535,27 @@ def get_call_by_id(call_id: str) -> Dict[str, Any]:
 
 # API Endpoints
 @router.get("/stats")
-async def get_call_stats():
+def get_call_stats(user: Dict[str, Any] = Depends(require_user)):
     """Get comprehensive call statistics"""
     try:
         if not mongo_client.is_connected():
             raise HTTPException(status_code=500, detail="Database not connected")
 
-        total_calls = mongo_client.calls.count_documents({})
-        inbound_calls = mongo_client.calls.count_documents({"direction": "inbound"})
-        outbound_calls = mongo_client.calls.count_documents({"direction": "outbound"})
-        completed_calls = mongo_client.calls.count_documents({"status": "completed"})
-        failed_calls = mongo_client.calls.count_documents({"status": "failed"})
+        scope = call_scope(user)
+        total_calls = mongo_client.calls.count_documents(scope)
+        inbound_calls = mongo_client.calls.count_documents({**scope, "direction": "inbound"})
+        outbound_calls = mongo_client.calls.count_documents({**scope, "direction": "outbound"})
+        completed_calls = mongo_client.calls.count_documents({**scope, "status": "completed"})
+        failed_calls = mongo_client.calls.count_documents({**scope, "status": "failed"})
 
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        calls_today = mongo_client.calls.count_documents({"call_date": {"$gte": today}})
+        today = local_midnight_utc()
+        calls_today = mongo_client.calls.count_documents({**scope, "call_date": {"$gte": today}})
 
-        week_ago = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=7)
-        calls_this_week = mongo_client.calls.count_documents({"call_date": {"$gte": week_ago}})
+        week_ago = local_midnight_utc(days_ago=7)
+        calls_this_week = mongo_client.calls.count_documents({**scope, "call_date": {"$gte": week_ago}})
 
         pipeline = [
-            {"$match": {"duration": {"$exists": True, "$ne": None}}},
+            {"$match": {**scope, "duration": {"$exists": True, "$ne": None}}},
             {"$group": {
                 "_id": None,
                 "total_duration": {"$sum": "$duration"},
@@ -516,14 +569,14 @@ async def get_call_stats():
         status_counts = {
             "completed": completed_calls,
             "failed": failed_calls,
-            "missed": mongo_client.calls.count_documents({"status": "missed"})
+            "missed": mongo_client.calls.count_documents({**scope, "status": "missed"})
         }
 
         interest_counts = {}
         for interest in ["interested", "not_interested", "neutral"]:
-            interest_counts[interest] = mongo_client.calls.count_documents({"interest_analysis.interest_status": interest})
+            interest_counts[interest] = mongo_client.calls.count_documents({**scope, "interest_analysis.interest_status": interest})
 
-        calls_with_analysis = mongo_client.calls.count_documents({"interest_analysis": {"$exists": True, "$ne": None}})
+        calls_with_analysis = mongo_client.calls.count_documents({**scope, "interest_analysis": {"$exists": True, "$ne": None}})
 
         stats = {
             "total_calls": total_calls,
@@ -532,8 +585,8 @@ async def get_call_stats():
             "completed_calls": completed_calls,
             "failed_calls": failed_calls,
             "missed_calls": status_counts["missed"],
-            "human_transfers": mongo_client.calls.count_documents({"transfer_status": {"$in": ["requested", "dialing", "ringing", "connected", "accepted", "completed"]}}),
-            "leads_generated": mongo_client.leads.count_documents({"source": {"$in": ["voice", "call", "inbound_call"]}}),
+            "human_transfers": mongo_client.calls.count_documents({**scope, "transfer_status": {"$in": ["requested", "dialing", "ringing", "connected", "accepted", "completed"]}}),
+            "leads_generated": mongo_client.leads.count_documents({**({} if not scope else {"assigned_to": str(user.get("_id"))}), "source": {"$in": ["voice", "call", "inbound_call"]}}),
             "calls_today": calls_today,
             "calls_this_week": calls_this_week,
             "total_duration": total_duration,
@@ -552,7 +605,7 @@ async def get_call_stats():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("")
-async def get_calls_endpoint(
+def get_calls_endpoint(
         phone_number: Optional[str] = Query(None),
         lead_id: Optional[str] = Query(None),
         status: Optional[str] = Query(None),
@@ -561,7 +614,8 @@ async def get_calls_endpoint(
         date_from: Optional[str] = Query(None),
         date_to: Optional[str] = Query(None),
         limit: int = Query(50),
-        skip: int = Query(0)
+        skip: int = Query(0),
+        user: Dict[str, Any] = Depends(require_user),
 ):
     """Get calls with filters"""
     try:
@@ -581,7 +635,7 @@ async def get_calls_endpoint(
         if date_to:
             filters["date_to"] = date_to
 
-        result = get_calls(filters, limit, skip)
+        result = get_calls(filters, limit, skip, call_scope(user))
 
         if not result.get("success"):
             raise HTTPException(status_code=500, detail=result.get("error", "Failed to get calls"))
@@ -594,10 +648,10 @@ async def get_calls_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/phone/{phone_number}")
-async def get_calls_by_phone_endpoint(phone_number: str):
+def get_calls_by_phone_endpoint(phone_number: str, user: Dict[str, Any] = Depends(require_user)):
     """Get all calls for a specific phone number"""
     try:
-        result = get_calls({"phone_number": phone_number})
+        result = get_calls({"phone_number": phone_number}, scope=call_scope(user))
 
         if not result.get("success"):
             raise HTTPException(status_code=500, detail=result.get("error"))
@@ -610,13 +664,13 @@ async def get_calls_by_phone_endpoint(phone_number: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/lead/{lead_id}/stats")
-async def get_lead_call_stats(lead_id: str):
+def get_lead_call_stats(lead_id: str, user: Dict[str, Any] = Depends(require_user)):
     """Get call statistics for a specific lead"""
     try:
         if not mongo_client.is_connected():
             raise HTTPException(status_code=500, detail="Database not connected")
 
-        calls = list(mongo_client.calls.find({"lead_id": lead_id}))
+        calls = list(mongo_client.calls.find({**call_scope(user), "lead_id": lead_id}))
 
         total_calls = len(calls)
         inbound_calls = len([c for c in calls if c.get("direction") == "inbound"])
@@ -631,7 +685,7 @@ async def get_lead_call_stats(lead_id: str):
         for call in recent_calls:
             call["_id"] = str(call["_id"])
             if isinstance(call.get("call_date"), datetime):
-                call["call_date"] = call["call_date"].isoformat()
+                call["call_date"] = api_time(call["call_date"])
 
         stats = {
             "lead_id": lead_id,
@@ -654,10 +708,10 @@ async def get_lead_call_stats(lead_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{call_id}")
-async def get_call_endpoint(call_id: str):
+def get_call_endpoint(call_id: str, user: Dict[str, Any] = Depends(require_user)):
     """Get a specific call by ID"""
     try:
-        result = get_call_by_id(call_id)
+        result = get_call_by_id(call_id, call_scope(user))
 
         if not result.get("success"):
             if "not found" in result.get("error", "").lower():
@@ -673,21 +727,24 @@ async def get_call_endpoint(call_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{lead_id}/messages")
-async def get_call_messages(lead_id: str):
+def get_call_messages(lead_id: str, user: Dict[str, Any] = Depends(require_user)):
     """Retrieve conversation messages for a specific lead"""
     try:
         if not mongo_client.is_connected():
             raise HTTPException(status_code=500, detail={"success": False, "error": "Database not connected"})
-        calls = list(mongo_client.calls.find({"lead_id": lead_id}).sort("created_at", -1).limit(10))
+        calls = list(mongo_client.calls.find({**call_scope(user), "lead_id": lead_id}).sort("created_at", -1).limit(10))
         messages = []
         for call in calls:
             call_id = str(call["_id"])
-            for idx, msg in enumerate(call.get("transcription", []) + call.get("ai_responses", [])):
+            # Prefer the ordered transcript (live_transcript.py); Retell's final save stamps every line of
+            # transcription / ai_responses with the same time, so those lists alone would list the caller first.
+            ordered = call.get("messages") or ordered_from_lists(call.get("transcription") or [], call.get("ai_responses") or [])
+            for idx, line in enumerate(ordered):
                 messages.append({
                     "id": f"{call_id}-{idx}",
-                    "type": msg["type"],
-                    "content": msg["content"],
-                    "timestamp": msg["timestamp"]
+                    "type": "user" if line.get("role") == "customer" else "bot",
+                    "content": line.get("text", ""),
+                    "timestamp": line.get("at", "")
                 })
         return {"success": True, "data": messages, "total": len(messages)}
     except Exception as e:
@@ -695,7 +752,7 @@ async def get_call_messages(lead_id: str):
         raise HTTPException(status_code=500, detail={"success": False, "error": str(e)})
 
 @router.post("")
-async def log_call_endpoint(request: LogCallRequest):
+def log_call_endpoint(request: LogCallRequest):
     """Log a new call"""
     try:
         phone_number = request.phone_number

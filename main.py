@@ -31,8 +31,17 @@ from logging_setup import bind_call, setup_logging
 setup_logging()
 logger = logging.getLogger("relaydesk.http")
 
-from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, inbox_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
+from datetime import datetime
+
+import fastapi.encoders
+from timeutil import api_time
+
+# Stored datetimes are UTC (timeutil.utc_now); send them with "Z" so every browser shows its own local time.
+fastapi.encoders.ENCODERS_BY_TYPE[datetime] = api_time
+
+from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, inbox_api, overview_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
 from routers.leads_api_mongo import router as leads_router
+import realtime
 
 # Create FastAPI app
 app = FastAPI(
@@ -93,6 +102,7 @@ app.include_router(config_api.router)
 app.include_router(auth_api.router)
 app.include_router(calls_api.router)
 app.include_router(inbox_api.router)
+app.include_router(overview_api.router)
 app.include_router(platform_api.router)
 app.include_router(shopify_api.router)
 app.include_router(twilio_api.router)
@@ -101,6 +111,45 @@ app.include_router(retell_api.router)
 app.include_router(transfer_api.router)
 app.include_router(leads_router)
 app.include_router(voice_provider_api.router)
+app.include_router(realtime.router)
+
+
+@app.on_event("startup")
+async def attach_realtime() -> None:
+    """Live dashboard updates publish from worker threads onto this loop."""
+    import asyncio
+    realtime.attach_loop(asyncio.get_running_loop())
+
+
+@app.on_event("startup")
+async def warm_local_embeddings() -> None:
+    """Warm everything a voice turn needs, in the background, so the first call after a restart is not slow:
+    the local embedding model (and vectors for any new knowledge), the knowledge and settings caches, and the
+    connection to the voice model."""
+    import os
+    import threading
+    from ai_services import AIServices, warm_model_connection
+    from brain_service import brain_service
+    from routers.retell_api import _system_prompt, configure_voice_services
+
+    def warm() -> None:
+        try:
+            import live_transcript
+            live_transcript.close_orphaned_calls()  # custom-pipeline calls cut off by the restart
+            from voice_provider_settings import provider_snapshot
+            provider_snapshot()  # which voice provider is on: read once now, not while a call is starting
+            from voice_turns import regions_where_valid
+            regions_where_valid("0412345678")  # loads every country's number formats now (~0.1 s), not mid-call
+            brain_service.ensure_local_embeddings()
+            _system_prompt("hello", "unknown", "")
+            warm_model_connection(configure_voice_services(AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b")))
+            # Speech-recognition key terms from the knowledge (rebuilt only if the knowledge changed).
+            from voice_keyterms import current_keyterms
+            current_keyterms()
+        except Exception as error:
+            logging.getLogger(__name__).warning("startup warm-up failed: %s", error)
+
+    threading.Thread(target=warm, name="warm-voice", daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
