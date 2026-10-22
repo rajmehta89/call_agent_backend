@@ -52,7 +52,7 @@ class FakeDeepgram:
         await asyncio.sleep(30)
 
 
-def run_call(monkeypatch, script, stt="nova"):
+def run_call(monkeypatch, script, stt="nova", tts=None):
     starts, finished = [], []
 
     async def fake_sentences(services, text, history, caller, summary, bridge=""):
@@ -83,7 +83,7 @@ def run_call(monkeypatch, script, stt="nova"):
     monkeypatch.setattr(custom, "valid_stream_token", lambda *a: True)
     monkeypatch.setattr(custom.websockets, "connect", fake_connect)
     monkeypatch.setattr(custom, "_voice_sentences", fake_sentences)
-    monkeypatch.setattr(custom, "_tts_stream", fake_tts)
+    monkeypatch.setattr(custom, "_tts_stream", tts or fake_tts)
     monkeypatch.setattr(custom, "_voice_services", lambda: Services())
     monkeypatch.setattr(custom, "_system_prompt", lambda *a, **k: "")
     monkeypatch.setattr(custom, "warm_model_connection", lambda *a, **k: None)
@@ -194,3 +194,32 @@ def test_flux_turn_that_never_ends_is_ended_with_force_end_turn(monkeypatch):
     starts, finished = run_call(monkeypatch, script, stt="flux")
     assert FakeDeepgram.sent_controls == ["ForceEndTurn"]
     assert finished == ["eight eight six six six three one four nine one"], (starts, finished)
+
+
+def test_when_elevenlabs_cuts_off_the_call_carries_on_with_the_deepgram_voice(monkeypatch):
+    # From a real call: ElevenLabs ran out of credits mid-call; each reply stopped partway and the caller heard
+    # only fragments. The cut sentence is said again with the Deepgram voice, and so is everything after it.
+    import httpx
+    spoken = []
+
+    async def elevenlabs_out_of_credits(text, engine):
+        yield b"\xff" * 160  # part of the sentence played, then the stream was cut
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+    class FakeDeepgramVoice:
+        async def stream(self, text):
+            spoken.append(text)
+            yield b"\xff" * 160
+
+        async def warm(self):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "test")
+    monkeypatch.setattr(custom, "_DeepgramSpeaker", FakeDeepgramVoice)
+    script = [(1.0, "What do you sell?", True, True)]
+    starts, finished = run_call(monkeypatch, script, tts=elevenlabs_out_of_credits)
+    assert finished == ["What do you sell?"]
+    assert spoken[-1] == "Here is the answer."  # the reply was spoken in full with the other voice

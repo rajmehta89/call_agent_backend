@@ -19,6 +19,8 @@ from mongo_client import mongo_client
 from qa_engine import DynamicQA
 from response_renderer import render_response
 from shopify_service import phones_match, shopify_service
+import meaning
+import store_intent
 import logging
 
 logger = logging.getLogger(__name__)
@@ -747,7 +749,18 @@ class BrainService:
         logger.info("added local embeddings to %d knowledge chunks", len(vectors))
         return len(vectors)
 
-    def _local_retrieve(self, user_input: str, query_tokens: set, limit: int) -> Optional[List[Dict[str, Any]]]:
+    @staticmethod
+    def knowledge_meaning_share() -> float:
+        """KNOWLEDGE_MEANING_PERCENT: how much of a knowledge passage's score is meaning (the rest is shared words).
+        Measured (scripts/tune_knowledge_search.py, 21 caller questions + 6 off-topic, 2026-10-22): 100% meaning puts the
+        right passage first 15/21 and never answers an off-topic question (0/6); any share of shared words let 5/6
+        off-topic questions ("a restaurant in Mumbai") pull business passages in, just for sharing a word."""
+        try:
+            return min(max(float(os.getenv("KNOWLEDGE_MEANING_PERCENT", "100")), 0.0), 100.0) / 100.0
+        except ValueError:
+            return 1.0
+
+    def _local_retrieve(self, user_input: str, query_tokens: set, limit: int, meaning_share: Optional[float] = None) -> Optional[List[Dict[str, Any]]]:
         """Fast path: local query vector + in-memory cosine over the cached chunks. None means "not available here"
         (model missing, or some chunks have no local vector yet), so the caller uses the network path instead."""
         if _local_embedder() is None:
@@ -762,6 +775,7 @@ class BrainService:
         if not query:
             return None
         query_vector = query[0]
+        share = self.knowledge_meaning_share() if meaning_share is None else meaning_share
         try:
             vector_only_min = float(os.getenv("LOCAL_VECTOR_ONLY_MIN", "0.55"))  # bge-small: on-topic 0.52-0.68, off-topic <= 0.50
         except ValueError:
@@ -769,12 +783,18 @@ class BrainService:
         scored: List[tuple[float, Dict[str, Any]]] = []
         for item in documents:
             text = str(item.get("text", ""))
-            lexical = len(query_tokens.intersection(set(re.findall(r"[a-z0-9]{3,}", text.lower())))) / max(len(query_tokens), 1)
             vector_score = sum(left * right for left, right in zip(query_vector, item["embedding_local"]))  # both normalised
+            if share >= 1.0:
+                # By meaning alone: a passage must be close enough in meaning, or an off-topic question gets answered.
+                if vector_score < vector_only_min:
+                    continue
+                scored.append((vector_score, item))
+                continue
+            lexical = len(query_tokens.intersection(set(re.findall(r"[a-z0-9]{3,}", text.lower())))) / max(len(query_tokens), 1)
             # Same rule as the network path: a loose semantic match alone must not make an off-topic question answerable.
             if lexical <= 0 and vector_score < vector_only_min:
                 continue
-            scored.append((0.75 * vector_score + 0.25 * lexical, item))
+            scored.append((share * vector_score + (1 - share) * lexical, item))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         minimum = self._minimum_relevance()
         return [{"source": item.get("source_name", "Knowledge"), "source_type": item.get("source_type", "settings"), "text": item.get("text", ""), "score": round(score, 3)} for score, item in scored if score >= minimum][:limit]
@@ -798,7 +818,7 @@ class BrainService:
         }
         for token in tuple(query_tokens):
             query_tokens.update(query_aliases.get(token, set()))
-        if not query_tokens:
+        if not query_tokens and self.knowledge_meaning_share() < 1.0:
             return []
         local = self._local_retrieve(user_input.strip(), query_tokens, limit)
         if local is not None:
@@ -819,11 +839,17 @@ class BrainService:
                 vector_norm = sum(value * value for value in vector) ** 0.5
                 if vector_norm and query_norm:
                     vector_score = sum(left * right for left, right in zip(query_vector, vector)) / (query_norm * vector_norm)
+            share = self.knowledge_meaning_share()
+            if share >= 1.0:  # by meaning alone (see knowledge_meaning_share)
+                if vector_score < self._vector_only_min_relevance():
+                    continue
+                scored.append((vector_score, item))
+                continue
             # Do not let a generic semantic match (for example, “restaurant in Mumbai”)
             # turn a shared location word into an answerable business question.
             if lexical <= 0 and vector_score < self._vector_only_min_relevance():
                 continue
-            score = (0.75 * vector_score + 0.25 * lexical) if vector_score else lexical
+            score = (share * vector_score + (1 - share) * lexical) if vector_score else lexical
             scored.append((score, item))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         minimum = self._minimum_relevance()
@@ -882,6 +908,9 @@ class BrainService:
         )
 
     def customer_context(self, phone: Optional[str]) -> str:
+        if phone and shopify_service.configured and self.tools().get("get_customer_orders"):
+            # Asked when a call starts: look up the caller's store orders now, so "where's my order?" needs no wait.
+            shopify_service.prefetch_orders_for_phone(phone)
         if not phone or not mongo_client.is_connected():
             return ""
         # Asked on every voice turn for the same caller; a few seconds' staleness is fine.
@@ -897,11 +926,21 @@ class BrainService:
             parts.append(f"Lead status: {lead.get('status', 'new')}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
         return "\n".join(parts)
 
-    ORDER_NUMBER = re.compile(r"(?:order|#)\s*(?:number|no\.?|num|id)?\s*(?:is|was)?\s*#?\s*(\d{3,})", re.I)
+    # Order names may carry the store's own letters ("DFO001001", "dfo 001001") as well as "#1001" or plain digits.
+    ORDER_NUMBER = re.compile(r"(?:order|#)\s*(?:number|no\.?|num|id)?\s*(?:is|was)?\s*#?\s*((?:[a-z]{1,6}[\s-]?)?\d{3,})", re.I)
     EMAIL = re.compile(r"[\w.+-]+\s*(?:@|\bat\b)\s*[\w-]+\s*(?:\.|\bdot\b)\s*[\w.]+", re.I)
-    ORDER_TERMS = ("my order", "order status", "where is my", "where's my", "tracking", "track my", "shipped", "dispatched", "delivered", "delivery status", "refund status", "not arrived", "hasn't arrived", "haven't received")
-    POLICY_TERMS = ("return", "refund", "exchange", "shipping policy", "delivery policy", "privacy", "terms of service", "warranty", "cancel")
-    PRODUCT_TERMS = ("product", "price", "cost", "stock", "inventory", "available", "availability", "variant", "buy", "purchase", "sell", "carry", "do you have", "size", "colour", "color", "collection", "catalog", "how much")
+    ORDER_TERMS = ("my order", "order status", "where is my", "where's my", "tracking", "track my", "shipped", "dispatched", "delivered", "delivery status", "refund status", "not arrived", "hasn't arrived", "haven't received",
+                   "my orders", "i ordered", "i bought", "what did i buy", "what i bought", "my purchase", "my parcel", "my package", "my delivery",
+                   "when will it arrive", "when will it come", "when will my", "has it shipped", "has it been sent", "status of my")
+    POLICY_TERMS = ("return", "refund", "exchange", "shipping", "delivery", "deliver", "postage", "freight", "privacy", "terms of service",
+                    "terms and conditions", "warranty", "guarantee", "cancel")
+    PRODUCT_POLICY_TERMS = ("warranty", "guarantee")  # about a named product: answered from its own specifications
+    PRODUCT_TERMS = ("product", "price", "pricing", "priced", "cost", "stock", "inventory", "available", "availability", "variant", "buy", "purchase", "sell", "carry",
+                     "do you have", "size", "colour", "color", "collection", "catalog", "catalogue", "how much", "cheap", "cheapest", "expensive", "budget",
+                     "affordable", "on sale", "discount", "range", "options", "models", "list")
+    # A follow-up about the product already being discussed ("the smaller one", "in black?", "which is best?").
+    FOLLOW_UP_TERMS = ("small", "smaller", "big", "bigger", "large", "larger", "compact", "one", "ones", "black", "white", "chrome", "gold",
+                       "matte", "best", "recommend", "which", "difference", "compare", "warranty", "material", "dimension", "measure", "wide", "deep", "tall", "long")
 
     @staticmethod
     def _spoken_email(text: str) -> str:
@@ -923,26 +962,104 @@ class BrainService:
                 return (f"Order {order['name']} exists, but the caller is not verified. Do not share any order details. "
                         "Ask for the email address used on the order.")
             return "Verified order (share status, items and tracking only; never addresses or payment details):\n" + shopify_service.describe_order(order)
-        if customer_phone and self.tools().get("get_customer_orders") and shopify_service.has_scope("read_customers"):
+        if customer_phone and self.tools().get("get_customer_orders"):
             orders = shopify_service.orders_for_phone(customer_phone)
             if orders:
-                return ("Orders linked to the caller's phone number (verified by caller ID; never share addresses or payment details):\n"
+                return (f"The caller's own orders, found by their caller ID ({len(orders)}, newest first; verified, so share status, items and "
+                        "tracking; never addresses or payment details). If they have more than one, ask which one they mean unless it is clear. "
+                        "When they talk about something they bought without naming it (\"the thing I got\", \"it's leaking\"), it is most likely "
+                        "an item in their most recent order: name that item and confirm it with them rather than asking what they bought:\n"
                         + "\n".join(shopify_service.describe_order(order) for order in orders))
-        return "No order number given yet. Ask the caller for their order number."
+        for email in emails:
+            orders = shopify_service.orders_for_email(email)
+            if orders:
+                return ("Orders placed with the email the caller gave (verified; share status, items and tracking only, never addresses or "
+                        "payment details):\n" + "\n".join(shopify_service.describe_order(order) for order in orders))
+        if emails:
+            return "No recent order uses the email the caller gave. Ask for the order number, or check the email."
+        return "No order is linked to the number the caller is calling from. Ask for their order number, or the email used on the order."
 
     def _policy_context(self, user_input: str) -> str:
         try:
             policies = shopify_service.policies()
         except Exception:
             return ""
-        wanted = [p for p in policies if any(word in f"{p['type']} {p['title']}".lower() for word in re.findall(r"[a-z]+", user_input.lower()))] or policies
+        # Which kind of policy the question is about, by meaning ("can I send it back?" -> refunds), using Shopify's own
+        # policy types (the same in every store); then the closest other one in meaning as well.
+        from turn_meaning import POLICY_KIND
+        kinds = POLICY_KIND.close(user_input)
+        ranked = meaning.most_similar(user_input, [f"{p['title']}. {p['text'][:400]}" for p in policies])
+        if kinds is not None and ranked:
+            by_kind = [p for kind in kinds for p in policies if p.get("type") == kind]
+            by_meaning = [policies[index] for index, _ in ranked]
+            wanted = list({id(p): p for p in [*by_kind, *by_meaning]}.values())
+        else:  # the meaning model is unavailable: match words in the policy names
+            wanted = [p for p in policies if any(word in f"{p['type']} {p['title']}".lower() for word in re.findall(r"[a-z]+", user_input.lower()))] or policies
         return "Store policies from Shopify (summarise the relevant part; do not read it all out):\n" + "\n".join(
             f"[{p['title']}] {p['text'][:700]}" for p in wanted[:2]
         ) if wanted else ""
 
     def _shopify_context(self, user_input: str, customer_phone: Optional[str] = None, conversation_text: str = "") -> tuple[str, Optional[str]]:
+        """The live store data this turn needs, chosen by what the caller means (store_intent), not by keywords:
+        their order, products, store policies, or two of these when the meaning is a close call."""
         if not shopify_service.configured:
             return "", None
+        conversation_text = conversation_text or user_input
+        earlier = conversation_text[: -len(user_input)] if conversation_text.endswith(user_input) else conversation_text
+        kinds = store_intent.wanted(user_input, " ".join(earlier.split()[-25:]))
+        if kinds is None:  # the meaning model is unavailable: match words instead
+            return self._keyword_store_context(user_input, customer_phone, conversation_text)
+        tools = self.tools()
+        try:
+            # An order number, or an email given after one, is something to look up whatever the wording.
+            order_named = bool(self.ORDER_NUMBER.search(user_input) or (self.EMAIL.search(user_input) and self.ORDER_NUMBER.search(conversation_text)))
+            if order_named and "order" not in kinds:
+                kinds = ["order", *kinds]
+            found: List[tuple] = []
+            for kind in kinds:
+                if kind == "order" and tools.get("get_order"):
+                    context = self._order_context(conversation_text, customer_phone)
+                    # As the second guess, only when it found something (not "ask for the order number").
+                    if order_named or kind == kinds[0] or not context.startswith(("No order", "Order lookups")):
+                        found.append((context, "get_order"))
+                elif kind == "product" and tools.get("search_shopify_products"):
+                    found.append((shopify_service.product_context(self._product_query(user_input, conversation_text),
+                                                                  include_stock=bool(tools.get("check_inventory")), question=user_input), "search_shopify_products"))
+                elif kind == "policy" and tools.get("get_store_policy"):
+                    context = self._policy_context(user_input)
+                    if context:
+                        found.append((context, "get_store_policy"))
+            if found:
+                return "\n\n".join(context for context, _ in found), found[0][1]
+            return self._caller_orders_context(customer_phone, tools)
+        except Exception as exc:
+            return f"The live store lookup failed just now ({exc}). Say you could not check the store and offer a follow-up.", "shopify_error"
+
+    @staticmethod
+    def _product_query(user_input: str, conversation_text: str) -> str:
+        """What to search the catalogue for: this turn, plus the things the caller named earlier when this turn is a
+        follow-up that names none ("the smaller one", "what's the pricing?"; also when speech recognition misheard it)."""
+        if shopify_service.catalog_nouns(user_input):
+            return user_input
+        named_before = shopify_service.catalog_nouns(conversation_text)
+        return f"{' '.join(named_before[-3:])} {user_input}" if named_before else user_input
+
+    def _caller_orders_context(self, customer_phone: Optional[str], tools: Dict[str, bool]) -> tuple[str, Optional[str]]:
+        """Whatever they ask, the AI knows this caller's own orders (found by caller ID when the call started, so no
+        wait), and can tell from their meaning when they are talking about something they bought."""
+        if customer_phone and tools.get("get_customer_orders") and tools.get("get_order"):
+            orders = shopify_service.cached_orders_for_phone(customer_phone)
+            if orders:
+                return ("This caller's own recent orders, recognised by caller ID (verified). Use them only when the caller is talking "
+                        "about something they bought, a delivery, a return or a problem with a purchase; do not bring them up yourself. "
+                        "When they talk about something they bought without naming it (\"the thing I got\", \"it's leaking\"), it is most "
+                        "likely an item in their most recent order: name that item and confirm it with them (\"Is it the ... you ordered "
+                        "on ...?\") rather than asking what they bought. Share status, items and tracking; never addresses or payment details:\n"
+                        + "\n".join(shopify_service.describe_order(order) for order in orders[:5])), "caller_orders"
+        return "", None
+
+    def _keyword_store_context(self, user_input: str, customer_phone: Optional[str] = None, conversation_text: str = "") -> tuple[str, Optional[str]]:
+        """Fallback when the local meaning model cannot load: the same choice made from words."""
         lowered = user_input.lower()
         tools = self.tools()
         conversation_text = conversation_text or user_input
@@ -950,12 +1067,34 @@ class BrainService:
             if tools.get("get_order") and (self.ORDER_NUMBER.search(user_input) or any(term in lowered for term in self.ORDER_TERMS)
                                            or (self.EMAIL.search(user_input) and self.ORDER_NUMBER.search(conversation_text))):
                 return self._order_context(conversation_text, customer_phone), "get_order"
-            if tools.get("get_store_policy") and any(term in lowered for term in self.POLICY_TERMS):
+            # What the caller is shopping for, from this turn or, for a follow-up ("the smaller one", "what's the
+            # pricing?"), from what they said earlier in the call. Speech recognition can mishear the product
+            # ("business" for "basins"), so the earlier turns also keep the search on track.
+            named_now = shopify_service.catalog_nouns(user_input)
+            named_before = shopify_service.catalog_nouns(conversation_text)
+            follow_up = bool(named_before) and not named_now and any(term in lowered for term in (*self.PRODUCT_TERMS, *self.FOLLOW_UP_TERMS))
+            names_product = tools.get("search_shopify_products") and (bool(named_now) or follow_up or any(term in lowered for term in self.PRODUCT_TERMS))
+            # A warranty or guarantee on a named product is in that product's own specifications, not the store policies.
+            about_the_product = names_product and any(term in lowered for term in self.PRODUCT_POLICY_TERMS)
+            if tools.get("get_store_policy") and not about_the_product and any(term in lowered for term in self.POLICY_TERMS):
                 context = self._policy_context(user_input)
                 if context:
                     return context, "get_store_policy"
-            if tools.get("search_shopify_products") and any(term in lowered for term in self.PRODUCT_TERMS):
-                return shopify_service.product_context(user_input, include_stock=bool(tools.get("check_inventory"))), "search_shopify_products"
+            # A product question in any words: the usual buying words, or naming something this store sells.
+            if names_product:
+                query = user_input if named_now or not named_before else f"{' '.join(named_before[-3:])} {user_input}"
+                return shopify_service.product_context(query, include_stock=bool(tools.get("check_inventory"))), "search_shopify_products"
+            # Whatever they ask, the AI knows this caller's own orders (found by caller ID when the call started, so no
+            # wait), and can tell from their meaning when they are talking about something they bought.
+            if customer_phone and tools.get("get_customer_orders") and tools.get("get_order"):
+                orders = shopify_service.cached_orders_for_phone(customer_phone)
+                if orders:
+                    return ("This caller's own recent orders, recognised by caller ID (verified). Use them only when the caller is talking "
+                            "about something they bought, a delivery, a return or a problem with a purchase; do not bring them up yourself. "
+                            "When they talk about something they bought without naming it (\"the thing I got\", \"it's leaking\"), it is most "
+                            "likely an item in their most recent order: name that item and confirm it with them (\"Is it the ... you ordered "
+                            "on ...?\") rather than asking what they bought. Share status, items and tracking; never addresses or payment details:\n"
+                            + "\n".join(shopify_service.describe_order(order) for order in orders[:5])), "caller_orders"
         except Exception as exc:
             return f"The live store lookup failed just now ({exc}). Say you could not check the store and offer a follow-up.", "shopify_error"
         return "", None

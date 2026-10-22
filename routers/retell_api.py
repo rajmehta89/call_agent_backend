@@ -21,7 +21,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
-from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE
+from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
@@ -81,7 +81,8 @@ VOICE_TURN_CHECKLIST = (
     "and then one detail per reply. Otherwise do not ask for their details at all. (4) If they ask whether something is booked "
     "or confirmed, start with 'Not yet'. (5) Never ask for anything they already gave in this conversation. "
     "(6) State only facts from the business knowledge. (7) If you repeat a phone number or email the caller gave, copy it "
-    "exactly as it was confirmed earlier in the conversation, digit by digit; if unsure, say 'the number you gave' instead."
+    "exactly as it was confirmed earlier in the conversation, digit by digit; if unsure, say 'the number you gave' instead. "
+    "(8) You already greeted the caller: never start a reply with Hi, Hello, Hi there, Hey or Welcome."
 )
 
 
@@ -345,7 +346,17 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         phone = caller_number if caller_number != "unknown" else None
         # The caller lookup and the knowledge search are both network reads: run them side by side.
         caller_lookup = _PROMPT_POOL.submit(brain_service.customer_context, phone) if phone else None
+        # Live store data (products, stock, orders, policies) when the store is connected and the caller asks for it.
+        store_lookup = _PROMPT_POOL.submit(_store_facts, caller_text, phone, history) if with_knowledge else None
         knowledge = conversation_knowledge(caller_text, history) if with_knowledge else NO_FACTS_NEEDED
+        if store_lookup is not None:
+            try:
+                store = store_lookup.result(timeout=STORE_LOOKUP_SECONDS)
+            except Exception as error:
+                logger.warning("voice: store lookup skipped (%s)", str(error) or "too slow")
+                store = ""
+            if store:
+                knowledge = [{"text": store}, *knowledge]
         if caller_lookup is not None:
             caller_lookup.result(timeout=5)
         business = agent_config.get_system_prompt().strip()
@@ -357,6 +368,20 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
     if custom:
         return _business_voice_prompt(custom, caller, phone, knowledge, summary)
     return _voice_prompt(business, channel, caller, phone, knowledge, summary)
+
+
+STORE_LOOKUP_SECONDS = float(os.getenv("VOICE_STORE_LOOKUP_SECONDS", "2.5"))  # never hold a reply longer for Shopify
+
+
+def _store_facts(caller_text: str, phone: Optional[str], history: Optional[List[Dict[str, str]]]) -> str:
+    """What the connected Shopify store says about this question, as one fact block ("" when not connected or not a
+    store question). The earlier turns go along so an order number said before an email still verifies the caller."""
+    earlier = " ".join(str(item.get("content") or "") for item in (history or [])[-8:] if item.get("role") == "user")
+    context, tool = brain_service._shopify_context(caller_text, phone, f"{earlier} {caller_text}".strip())
+    if not context:
+        return ""
+    logger.info("voice: store lookup %s for %r", tool, caller_text[:80])
+    return f"Live store data from Shopify, current right now (use it as fact):\n{context}"
 
 
 KNOWLEDGE_PLACEHOLDER = "{{business_knowledge}}"
@@ -433,7 +458,9 @@ VOICE_CONVERSATION_RULES = (
     "(10) If the caller says 'hello?' or 'are you there?' in the middle of the call, they did not hear you: say you're here "
     "and briefly repeat what you last asked or said. (11) If the caller is vague or unsure what to ask ('so what?', 'yes' "
     "with nothing to act on, 'what can you do?'), do not just say you're here to help: say in one sentence what the business "
-    "can help with (from the knowledge) and ask one concrete question about what they need."
+    "can help with (from the knowledge) and ask one concrete question about what they need. (12) You already greeted the "
+    "caller at the start of the call: never greet again. Do not start a reply with Hi, Hello, Hi there, Hey or Welcome, even "
+    "when the caller opens with 'hi'; go straight to answering what they asked."
 )
 
 
@@ -727,19 +754,28 @@ async def _stream_reply(
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
     bridge = ""
+    prompt_task = None
     if not reminder and bridges_enabled() and turn_model is None:
         # Said at once ("Sure, let me check."), before any database or model work: Retell speaks it while the
         # knowledge search and the model run (~1.5 s).
         said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
         recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
-        bridge = bridge_phrase(caller_text, recent)
+        bridge = bridge_phrase(caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
         if bridge:
-            await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
+            # The knowledge search and store lookup start now, while the bridge is chosen and spoken.
+            prompt_task = asyncio.ensure_future(asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, True))
+            if bridge in LOOKUP_BRIDGES:
+                bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), bridge, call_id, response_id)
+            else:
+                await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
             yield bridge + " "
     places = "" if reminder else place_note(caller_text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(transcript))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    system_prompt = await asyncio.to_thread(_system_prompt, caller_text, caller_number, "", transcript, turn_model is None or bool(places))
+    if prompt_task is not None:
+        system_prompt = await prompt_task  # built with the knowledge, as a bridged turn always uses the main model
+    else:
+        system_prompt = await asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, turn_model is None or bool(places))
     retrieval_ms = (perf_counter() - prompt_started) * 1000
     reminder_text = voice_turn_reminder()
     messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
@@ -747,6 +783,9 @@ async def _stream_reply(
         messages.append({"role": "system", "content": details_note})
     if places:
         messages.append({"role": "system", "content": places})
+    offered = "" if reminder else yes_to_offer_note(caller_text, last_agent_text(transcript))
+    if offered:
+        messages.append({"role": "system", "content": offered})
     misheard = "" if reminder else name_note(caller_text, business_name())
     if misheard:
         messages.append({"role": "system", "content": misheard})
@@ -774,7 +813,8 @@ async def _stream_reply(
         )
         first_token_logged = False
         guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
-        numbers = NumberSpeaker(caller_number_digits(transcript), known_numbers(brain_service.knowledge_text()))
+        caller_digits = caller_number_digits(transcript)
+        numbers = NumberSpeaker(caller_digits, reply_known_numbers(brain_service.knowledge_text(), system_prompt, caller_digits))
         while True:
             chunk = await asyncio.to_thread(next, iterator, None)
             if chunk is None:
@@ -809,6 +849,33 @@ async def _stream_reply(
                 close()
             except Exception:
                 pass
+
+
+async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, fallback: str, call_id: str, response_id: int) -> str:
+    """What to say while the store lookup runs, phrased for this question by the small fast model ("Let me check the
+    Lydia mixer for you."): no facts, no reasoning, just the line. Never said before bridge_delay_seconds (if the caller
+    carries on, Retell cancels this reply first); slower than bridge_model_seconds or unsafe, the fixed phrase."""
+    started = perf_counter()
+    model = fast_voice_model()
+    client = getattr(services, "openai_client", None)
+    line = ""
+    if model and client is not None:
+        def ask() -> str:
+            response = client.chat.completions.create(
+                model=model, messages=lookup_bridge_messages(caller_text, agent_text), max_tokens=24, temperature=0.5,
+                extra_body=services._openrouter_extra_body(model), timeout=bridge_model_seconds(),
+            )
+            return response.choices[0].message.content or ""
+        try:
+            line = clean_lookup_bridge(await asyncio.wait_for(asyncio.to_thread(ask), timeout=bridge_model_seconds()))
+        except Exception as error:
+            logger.info("voice: lookup bridge from %s skipped (%s)", model, type(error).__name__)
+    waited = perf_counter() - started
+    if waited < bridge_delay_seconds():
+        await asyncio.sleep(bridge_delay_seconds() - waited)
+    _trace(f"retell_lookup_bridge call={call_id} response_id={response_id} source={'model' if line else 'fixed'} "
+           f"ms={waited * 1000:.0f} said={(line or fallback)!r}")
+    return line or fallback
 
 
 @router.get("/config", dependencies=[Depends(require_user)])
@@ -978,6 +1045,12 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             transfer_service.append_message(call_id, "user", caller_text)
 
         streamed = False
+        if event.get("interaction_type") == "response_required" and caller_text and call_is_over(caller_text, last_agent_text(transcript)):
+            # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
+            _trace(f"retell_call_over call={call_id} response_id={response_id} caller={caller_text!r}")
+            await send_event({"response_type": "response", "response_id": response_id, "content": "",
+                              "content_complete": True, "end_call": True})
+            return
         if event.get("interaction_type") == "reminder_required" and not caller_text:
             reply = "Is there anything else I can help you with?"
         elif event.get("interaction_type") == "response_required" and caller_text and intent_analyzer.should_transfer_to_agent(caller_text):

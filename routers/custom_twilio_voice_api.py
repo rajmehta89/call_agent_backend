@@ -28,7 +28,7 @@ from auth_service import require_user
 from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE
+from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
 import live_transcript
 from logging_setup import bind_call, timed
@@ -400,7 +400,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     places = place_note(text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(history))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    system = await asyncio.to_thread(_system_prompt, text, phone, summary, history, turn_model is None or bool(places))
+    system = await asyncio.to_thread(_system_prompt, search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places))
     prompt_ms = (perf_counter() - started) * 1000
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()
@@ -410,6 +410,9 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         messages.append({"role": "system", "content": details_note})
     if places:
         messages.append({"role": "system", "content": places})
+    offered = yes_to_offer_note(text, last_agent_text(history))
+    if offered:
+        messages.append({"role": "system", "content": offered})
     misheard = name_note(text, business_name())
     if misheard:
         messages.append({"role": "system", "content": misheard})
@@ -418,7 +421,8 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     elif turn_model is not None and not places:
         messages.append({"role": "system", "content": FAST_TURN_NOTE})
     guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
-    numbers = NumberSpeaker(caller_number_digits(conversation), known_numbers(brain_service.knowledge_text()))
+    caller_digits = caller_number_digits(conversation)
+    numbers = NumberSpeaker(caller_digits, reply_known_numbers(brain_service.knowledge_text(), system, caller_digits))
     pending = ""
     yielded = False  # the first chunk may end at a comma (see _next_chunk)
     iterator = None
@@ -456,6 +460,15 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                 pass
     if pending.strip():
         yield pending.strip()
+
+
+def _hang_up(call_sid: str) -> None:
+    """End the phone call (the caller's line) through Twilio."""
+    from routers.twilio_api import _get_twilio_client
+    client = _get_twilio_client()
+    if client is None or not call_sid:
+        raise RuntimeError("Twilio is not configured")
+    client.calls(call_sid).update(status="completed")
 
 
 def _log_voice_activity(request: str, reply: str, caller: str, seconds: float) -> None:
@@ -536,6 +549,28 @@ class _async_timed:
         return bool(self._timer.__exit__(*exc_info))
 
 
+_RETELL_HTTP: Optional[httpx.AsyncClient] = None
+
+
+def _retell_client() -> httpx.AsyncClient:
+    """One kept-open connection to Retell's API for every call: a new connection per call spent ~0.5 s on the
+    secure handshake before the caller heard anything."""
+    global _RETELL_HTTP
+    if _RETELL_HTTP is None or _RETELL_HTTP.is_closed:
+        _RETELL_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(10.0), limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=300))
+    return _RETELL_HTTP
+
+
+async def warm_retell_connection() -> None:
+    """Open the Retell connection before the first call (any reply will do; the connection is what is kept)."""
+    if not os.getenv("RETELL_API_KEY"):
+        return
+    try:
+        await _retell_client().get("https://api.retellai.com/", timeout=5)
+    except Exception as exc:
+        logger.debug("retell connection warm-up skipped: %s", exc)
+
+
 async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     """Register the call with Retell, then bridge Twilio to Retell over SIP."""
     payload: Dict[str, Any] = {"agent_id": os.getenv("RETELL_AGENT_ID", "").strip(), "direction": "inbound"}
@@ -543,8 +578,8 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
         payload["from_number"] = form["From"]
     if str(form.get("To") or "").startswith("+"):
         payload["to_number"] = form["To"]
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client, _async_timed("Retell register-phone-call"):
-        response = await client.post(
+    async with _async_timed("Retell register-phone-call"):
+        response = await _retell_client().post(
             "https://api.retellai.com/v2/register-phone-call",
             headers={"Authorization": f"Bearer {os.getenv('RETELL_API_KEY', '').strip()}"},
             json=payload,
@@ -679,6 +714,25 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             pending_mark = ""
             await send_twilio({"event": "clear", "streamSid": stream_sid})
 
+    async def end_call_after_playback() -> None:
+        """Hang up once the goodbye already sent to Twilio has finished playing (its playback mark came back)."""
+        for _ in range(50):  # at most ~5 s
+            if not pending_mark:
+                break
+            await asyncio.sleep(0.1)
+        try:
+            await asyncio.to_thread(_hang_up, call_sid)
+        except Exception as error:
+            logger.warning("custom voice: could not end call %s: %s", call_sid, error)
+
+    async def use_deepgram_voice(error: Exception) -> None:
+        nonlocal engine, speaker
+        detail = error.response.text[:160] if isinstance(error, httpx.HTTPStatusError) else str(error)
+        logger.warning("ElevenLabs voice failed (%s: %s); this call continues with the Deepgram voice", type(error).__name__, detail)
+        engine, speaker = "deepgram", _DeepgramSpeaker()
+        # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
+        asyncio.create_task(_warm_audio_cache(ALL_BRIDGES if bridges_enabled() else (), engine))
+
     async def speak(text: str, cache_key: str = "") -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
         nonlocal pending_mark, mark_count
@@ -692,17 +746,25 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             first_audio = perf_counter() - started
         else:
             chunks: List[bytes] = []
-            # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
-            # once, which releases the live Deepgram line instead of holding it until garbage collection.
-            audio = speaker.stream(text) if speaker else _tts_stream(text, engine)
-            async with contextlib.aclosing(audio):
-                async for chunk in audio:
-                    if not active:
-                        return first_audio
-                    if not first_audio:
-                        first_audio = perf_counter() - started
-                    chunks.append(chunk)  # the cache keeps the original audio; it is levelled when played
-                    await send_audio(leveller.process(chunk) if leveller else chunk)
+            try:
+                # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
+                # once, which releases the live Deepgram line instead of holding it until garbage collection.
+                audio = speaker.stream(text) if speaker else _tts_stream(text, engine)
+                async with contextlib.aclosing(audio):
+                    async for chunk in audio:
+                        if not active:
+                            return first_audio
+                        if not first_audio:
+                            first_audio = perf_counter() - started
+                        chunks.append(chunk)  # the cache keeps the original audio; it is levelled when played
+                        await send_audio(leveller.process(chunk) if leveller else chunk)
+            except (httpx.HTTPError, RuntimeError) as error:
+                if engine != "elevenlabs" or not os.getenv("DEEPGRAM_API_KEY", "").strip():
+                    raise
+                # ElevenLabs refused or cut off the sentence (out of credits, a dropped stream): the rest of the call
+                # speaks with the Deepgram voice, starting with this whole sentence again, instead of going silent.
+                await use_deepgram_voice(error)
+                return await speak(text)
             if cache_key:
                 _cached_audio[cache_key] = b"".join(chunks)
         mark_count += 1
@@ -734,7 +796,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if bridges_enabled() and choose_voice_model(text, last_agent_text(history)) is None:
             # This turn needs the knowledge search and the main model (~1.5 s): a short, fitting phrase ("Sure, let me
             # check.") is said while they run, so the caller hears someone is there. Only recorded phrases (instant).
-            candidate = bridge_phrase(text, recent_bridges[-3:])
+            candidate = bridge_phrase(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
             if candidate and _audio_cache_key(candidate, engine) in _cached_audio:
                 bridge = candidate
         sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge).__aiter__()
@@ -933,6 +995,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         prepared, early_reply, heard_text = early_reply, None, ""
         if not text:
             drop_reply(prepared)
+            return
+        if not unanswered_text and not (reply_task and not reply_task.done()) and call_is_over(text, last_agent_text(memory.history())):
+            # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
+            drop_reply(prepared)
+            transcript.append({"content": text, "timestamp": utc_iso()})
+            save_progress()
+            logger.info("custom voice: both said goodbye, ending call=%s: %s", call_sid, text[:120])
+            asyncio.create_task(end_call_after_playback())
             return
         if prepared and not _same_words(prepared["text"], text):
             drop_reply(prepared)

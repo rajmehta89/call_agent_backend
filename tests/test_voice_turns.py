@@ -113,7 +113,7 @@ def test_spoken_email():
 
 def test_email_checks():
     note, problem = contact_check("my email is raj at gmail dot com")
-    assert not problem and "raj at gmail dot com" in note
+    assert not problem and "r a j at gmail dot com" in note  # short name parts are spelled out so the caller can check them
     note, problem = contact_check("my email is raj at gmail")
     assert problem and "NOT a complete email" in note
 
@@ -230,8 +230,10 @@ def test_provider_choice_is_kept_in_memory(monkeypatch):
 
 
 
-def test_acknowledgements_fit_the_situation_or_stay_silent():
+def test_acknowledgements_fit_the_situation_or_stay_silent(monkeypatch):
+    import voice_turns
     from voice_turns import CLARIFY_BRIDGES, DETAIL_BRIDGES, PROBLEM_BRIDGES, SEARCH_BRIDGES
+    monkeypatch.setattr(voice_turns, "store_lookup_runs", lambda text, earlier="": False)
     # Simple questions, answers to the agent and short replies: no filler (a random one sounded out of place).
     assert bridge_phrase("Yeah. So what is Home DFO is for?") == ""
     assert bridge_phrase("What finishes do your taps come in?") == ""
@@ -248,15 +250,30 @@ def test_acknowledgements_fit_the_situation_or_stay_silent():
     assert bridge_phrase("What do you mean by what room?") in CLARIFY_BRIDGES
 
 
-def test_acknowledgements_never_repeat_the_last_few_and_never_claim_to_check():
-    from voice_turns import ALL_BRIDGES
+def test_a_question_the_live_store_answers_gets_a_short_let_me_check(monkeypatch):
+    import voice_turns
+    from voice_turns import LOOKUP_BRIDGES
+    seen = []
+    monkeypatch.setattr(voice_turns, "store_lookup_runs", lambda text, earlier="": seen.append(earlier) or True)
+    # From a real call: ~2-3.6 s of silence before each of these answers.
+    assert bridge_phrase("Yeah. So how much is the Lydia wall mixer with diverter?") in LOOKUP_BRIDGES
+    assert bridge_phrase("And what is the warranty on it?", earlier="How much is the Lydia wall mixer?") in LOOKUP_BRIDGES
+    assert seen[-1] == "How much is the Lydia wall mixer?"  # follow-ups are judged with what was said before
+    monkeypatch.setattr(voice_turns, "store_lookup_runs", lambda text, earlier="": False)
+    assert bridge_phrase("What finishes do your taps come in?") == ""  # answered from the knowledge: no lookup to cover
+
+
+def test_acknowledgements_never_repeat_the_last_few_and_only_lookups_say_check():
+    from voice_turns import ALL_BRIDGES, LOOKUP_BRIDGES
     recent = []
     for _ in range(4):
         phrase = bridge_phrase("I just bought a new home and I'm doing it up.", recent[-3:])
         assert phrase not in recent[-3:]
         if phrase:
             recent.append(phrase)
-    assert not any("check" in phrase.lower() or "question" in phrase.lower() for phrase in ALL_BRIDGES)
+    # "Let me check" is only true when a store lookup runs, so only those phrases may say it.
+    others = [phrase for phrase in ALL_BRIDGES if phrase not in LOOKUP_BRIDGES]
+    assert not any("check" in phrase.lower() or "look" in phrase.lower() or "question" in phrase.lower() for phrase in others)
 
 
 def test_a_scrambled_readback_of_the_callers_number_is_replaced_by_their_exact_digits():
@@ -325,3 +342,79 @@ def test_with_caller_id_the_agent_never_asks_for_the_phone_number():
     line = caller_country_line("+61412345678")
     assert "never ask for their phone number" in line and "ask only for their name" in line
     assert "ONLY if there is no caller ID" in FAST_TURN_NOTE
+
+
+def test_the_small_models_lookup_line_is_said_only_when_it_states_nothing():
+    from voice_turns import clean_lookup_bridge
+    assert clean_lookup_bridge('"Let me check the Lydia mixer for you."') == "Let me check the Lydia mixer for you."
+    assert clean_lookup_bridge("One sec, I'll look up the warranty on that") == "One sec, I'll look up the warranty on that."
+    # A guess said before the real answer, an answer, a question or no "checking" at all: the fixed phrase instead.
+    assert clean_lookup_bridge("Let me check, it's 140 dollars.") == ""
+    assert clean_lookup_bridge("Yes, it comes in black.") == ""
+    assert clean_lookup_bridge("Shall I look that up for you?") == ""
+    assert clean_lookup_bridge("Great choice, the Lydia is lovely.") == ""
+
+
+def test_after_both_goodbyes_the_call_ends_instead_of_another_goodbye():
+    from voice_turns import call_is_over
+    # From a real call: "Okay. / Thank you. / Bye. / Okay." got four goodbyes in a row.
+    goodbye = "You're welcome, Raj. Have a great day, and we'll be in touch soon. Goodbye."
+    assert call_is_over("Okay. Thank you.", goodbye)
+    assert call_is_over("Okay. Thank you. Bye. Okay.", goodbye)
+    # Not before we said goodbye, and never when the caller still wants something.
+    assert not call_is_over("Okay. Thank you.", "Would you like details on sizes?")
+    assert not call_is_over("Oh wait, how much is delivery?", goodbye)
+    assert not call_is_over("Okay. Thank you.", "Is there anything else I can help with, or shall I say goodbye?")
+
+
+def test_a_yes_to_our_offer_asks_for_what_was_offered_not_a_repeat():
+    from voice_turns import yes_to_offer_note
+    last = ("We have the freestanding oval bath in 1500 mm and 1700 mm sizes. "
+            "Would you like details on colours or prices for those?")
+    note = yes_to_offer_note("Yeah.", last)
+    assert "colours or prices" in note and "Do not repeat" in note
+    assert yes_to_offer_note("No.", last) == ""                       # a no is not a yes to the offer
+    assert yes_to_offer_note("Yeah.", "We have it in two sizes.") == ""  # we offered nothing
+    assert yes_to_offer_note("How much is it?", last) == ""            # a new question, answered as one
+
+
+def test_the_question_we_asked_is_judged_not_the_facts_before_it():
+    from voice_turns import agent_question
+    reply = "You can pick up your order from our Campbellfield store within 14 days. Would you like details on collection?"
+    assert agent_question(reply) == "Would you like details on collection?"
+    assert agent_question("We have it in two sizes.") == "We have it in two sizes."
+
+
+def test_a_place_the_knowledge_does_not_name_is_never_confirmed(monkeypatch):
+    import voice_turns
+    knowledge = "We deliver to most of Australia. Pick up from our Campbellfield store."
+    monkeypatch.setattr(voice_turns, "detail_asked", lambda agent_text: "order")  # what the meaning model said in the call
+    # From a real call: after an answer about picking up an order, "do deliver out to Geelong" got "including Geelong".
+    assert "Geelong" in voice_turns.place_note("No. Like, do deliver out to Geelong.", knowledge, "Would you like details on collection?")
+    monkeypatch.setattr(voice_turns, "detail_asked", lambda agent_text: "address")
+    assert "Geelong" in voice_turns.place_note("Geelong.", knowledge, "Are you looking for delivery to a specific area?")
+    assert voice_turns.place_note("Campbellfield.", knowledge, "Are you looking for delivery to a specific area?") == ""
+    monkeypatch.setattr(voice_turns, "detail_asked", lambda agent_text: "phone")
+    assert voice_turns.place_note("It's an Indian number, double eight six six.", knowledge, "What's the best number?") == ""
+
+
+@pytest.mark.parametrize("said, email", [
+    # From a real call: rejected three times before (the provider said as "g mail", "at the rate" heard as "at direct",
+    # and the name part said without "my email is").
+    ("Yeah. It is Raj m. Two six seven seven four seven at g mail dot com.", "rajm267747@gmail.com"),
+    ("Yeah. So it is raj m two six seven seven four seven at direct g mail dot com.", "rajm267747@gmail.com"),
+    ("it is john dot smith at outlook dot com dot au", "john.smith@outlook.com.au"),
+    ("r a j at the rate gmail dot com", "raj@gmail.com"),
+    ("yeah it is priya dash sharma at hot mail dot com", "priya-sharma@hotmail.com"),
+    ("my email is j o h n at g mail dot com", "john@gmail.com"),
+    ("sure, info at home dfo dot com dot au thanks", "info@homedfo.com.au"),
+])
+def test_an_email_said_in_pieces_is_rebuilt(said, email):
+    from voice_turns import spoken_email
+    assert spoken_email(said) == email
+
+
+def test_a_complete_spoken_email_is_read_back_not_asked_again():
+    from voice_turns import contact_check
+    note, problem = contact_check("Yeah. It is Raj m. Two six seven seven four seven at g mail dot com.", "Could you please provide your email address?")
+    assert not problem and "rajm267747@gmail.com" in note.replace(" ", "") or "r a j m" in note

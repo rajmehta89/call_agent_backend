@@ -23,6 +23,9 @@ router = APIRouter(prefix="/api/overview", tags=["overview"], dependencies=[Depe
 
 DAYS = 14
 FINISHED_OK = {"completed", "ended"}
+# Statuses where the team has to act (the sidebar's Tasks): callbacks, times to arrange, follow-ups, servicing, payments.
+TASK_STAGES = ("outreach", "scheduling", "follow_up", "servicing", "payment_collection")
+OLDEST_DAY = 365  # how far back the day picker can go
 
 
 def _change(now: float, before: float) -> float | None:
@@ -35,8 +38,27 @@ def _thread_row(thread: Dict[str, Any], kind: str, text: str) -> Dict[str, Any]:
             "assigned_to_name": thread.get("assigned_to_name"), "stage": thread.get("stage")}
 
 
+def _day_stats(scope: Dict[str, Any], lead_scope: Dict[str, Any], threads: List[Dict[str, Any]], start: datetime, end: datetime) -> Dict[str, Any]:
+    """The numbers for one local day [start, end) in UTC: calls, answered, missed, average length, talk time, new leads,
+    and conversations that became follow-ups that day."""
+    rows = list(mongo_client.calls.find({**scope, "direction": {"$ne": "outbound"}, "call_date": {"$gte": start, "$lt": end}}, {"status": 1, "duration": 1}))
+    answered = [row for row in rows if str(row.get("status", "")).lower() in FINISHED_OK]
+    missed = sum(1 for row in rows if str(row.get("status", "")).lower() in inbox_api.FAILED_STATUSES)
+    lengths = [float(row.get("duration") or 0) for row in answered if row.get("duration")]
+    keys = {thread["key"] for thread in threads}
+    follow_ups = 0
+    for state in mongo_client.inbox_threads.find({"stage_history": {"$elemMatch": {"to": {"$in": list(TASK_STAGES)}, "at": {"$gte": start, "$lt": end}}}}, {"_id": 1}):
+        follow_ups += state["_id"] in keys
+    return {"calls": len(rows), "answered": len(answered), "missed": missed,
+            "avg_duration": round(sum(lengths) / len(lengths), 1) if lengths else 0, "talk_seconds": round(sum(lengths)),
+            "new_leads": mongo_client.leads.count_documents({**lead_scope, "created_at": {"$gte": start, "$lt": end}}),
+            "follow_ups": follow_ups}
+
+
 @router.get("")
-def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str, Any] = Depends(require_user)):
+def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), day: str = Query("", max_length=10),
+             user: Dict[str, Any] = Depends(require_user)):
+    """`day`: the local date (YYYY-MM-DD) the day stats and the day's calls are for; today when empty."""
     if not mongo_client.is_connected():
         raise HTTPException(status_code=503, detail="Database not connected")
     is_admin = inbox_api._can_assign(user)
@@ -45,6 +67,13 @@ def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str,
     now = utc_now()
     local_today = (now + shift).replace(hour=0, minute=0, second=0, microsecond=0)
     day_start = lambda days_ago: local_today - timedelta(days=days_ago) - shift  # local midnight, as UTC
+    try:
+        chosen = datetime.strptime(day, "%Y-%m-%d") if day else local_today
+    except ValueError:
+        raise HTTPException(status_code=400, detail="day must be YYYY-MM-DD")
+    days_ago = (local_today.date() - chosen.date()).days
+    if days_ago < 0 or days_ago > OLDEST_DAY:
+        raise HTTPException(status_code=400, detail=f"day must be between {OLDEST_DAY} days ago and today")
 
     # Calls in the last 28 days (two 14-day windows for the comparisons), scoped to what this person may see.
     scope = call_scope(user)
@@ -64,7 +93,6 @@ def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str,
     durations = lambda rows: [float(row.get("duration") or 0) for row in rows if row.get("duration")]
     avg = lambda values: round(sum(values) / len(values), 1) if values else 0
     answered = lambda rows: sum(1 for row in rows if str(row.get("status", "")).lower() in FINISHED_OK)
-    hours = Counter(int(((call["call_date"] + shift).hour)) for call in window(DAYS * 2 - 1, DAYS * 2))
 
     # Conversations: everything for admins; a team member's own.
     threads = [thread for thread in inbox_api._threads() if is_admin or thread.get("assigned_to") == me]
@@ -76,26 +104,30 @@ def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str,
     mentions = mongo_client.team_messages.count_documents({**inbox_api._mention_query(user), "read_by": {"$ne": me}})
     attention = (live + failed + unassigned)[:8]
 
-    recent_calls = list(mongo_client.calls.find({**scope, "direction": {"$ne": "outbound"}}, inbox_api.LIST_FIELDS).sort("call_date", -1).limit(6))
-    recent = [{"id": str(call["_id"]), "key": inbox_api._thread_key(call), "at": call.get("call_date"), "status": call.get("status"),
-               "duration": call.get("duration") or 0, "provider": call.get("provider"), "summary": call.get("call_summary") or "",
-               "name": next((thread["name"] for thread in threads if thread["key"] == inbox_api._thread_key(call)), inbox_api._thread_key(call)),
-               "failed": str(call.get("status", "")).lower() in inbox_api.FAILED_STATUSES} for call in recent_calls]
-
-    stage_counts = Counter(thread.get("stage") for thread in open_threads)
-    pipeline = [{"id": stage, "label": label, "count": stage_counts.get(stage, 0)} for stage, label in inbox_api.STAGES]
-
-    team: List[Dict[str, Any]] = []
-    if is_admin:
-        lead_counts = Counter(lead.get("assigned_to") for lead in mongo_client.leads.find({"assigned_to": {"$exists": True}}, {"assigned_to": 1}))
-        for member in inbox_api._members(user):
-            if not member.get("assignable"):
-                continue
-            mine = [thread for thread in open_threads if thread.get("assigned_to") == member["id"]]
-            team.append({"id": member["id"], "name": member["name"], "open": len(mine), "live": sum(1 for thread in mine if thread.get("live")),
-                         "leads": lead_counts.get(member["id"], 0)})
-
+    names = {thread["key"]: thread["name"] for thread in threads}
     lead_scope = {} if is_admin else {"assigned_to": me}
+
+    # The chosen day: its numbers (and the day before, to compare) and its calls, newest first.
+    chosen_start = day_start(days_ago)
+    chosen_end = chosen_start + timedelta(days=1)
+    day_stats = _day_stats(scope, lead_scope, threads, chosen_start, chosen_end)
+    previous_stats = _day_stats(scope, lead_scope, threads, chosen_start - timedelta(days=1), chosen_start)
+    day_calls = list(mongo_client.calls.find({**scope, "direction": {"$ne": "outbound"}, "call_date": {"$gte": chosen_start, "$lt": chosen_end}},
+                                             inbox_api.LIST_FIELDS).sort("call_date", -1).limit(50))
+    calls_of_day = [{"id": str(call["_id"]), "key": inbox_api._thread_key(call), "at": call.get("call_date"), "status": call.get("status"),
+                     "duration": call.get("duration") or 0, "summary": call.get("call_summary") or "",
+                     "name": names.get(inbox_api._thread_key(call), inbox_api._thread_key(call)),
+                     "failed": str(call.get("status", "")).lower() in inbox_api.FAILED_STATUSES} for call in day_calls]
+
+    # Follow-ups: open conversations where the team has to act, most recently filed first, with the AI's reason.
+    task_threads = sorted((thread for thread in open_threads if thread.get("stage") in TASK_STAGES),
+                          key=lambda thread: thread.get("stage_at") or thread.get("last_at") or datetime.min, reverse=True)
+    follow_ups = [{"key": thread["key"], "name": thread["name"], "phone": thread.get("phone"), "stage": thread.get("stage"),
+                   "stage_label": inbox_api.STAGE_LABELS.get(thread.get("stage"), thread.get("stage")),
+                   "reason": thread.get("stage_reason") or thread.get("summary") or thread.get("preview") or "",
+                   "at": thread.get("stage_at") or thread.get("last_at"), "assigned_to_name": thread.get("assigned_to_name")}
+                  for thread in task_threads[:12]]
+
     leads_new = mongo_client.leads.count_documents({**lead_scope, "created_at": {"$gte": day_start(6)}})
     providers = provider_snapshot()
     active_provider = next((name for name, info in providers.items() if info.get("enabled")), None)
@@ -104,7 +136,8 @@ def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str,
         "scope": "workspace" if is_admin else "mine",
         "kpis": {
             "calls_today": by_day[local_today.date()], "calls_yesterday": by_day[(local_today - timedelta(days=1)).date()],
-            "calls_7d": len(this_week), "calls_7d_change": _change(len(this_week), len(last_week)),
+            "calls_7d": len(this_week), "calls_7d_change": _change(len(this_week), len(last_week)), "calls_prev_7d": len(last_week),
+            "avg_duration_prev_7d": avg(durations(last_week)),
             "avg_duration_7d": avg(durations(this_week)), "avg_duration_change": _change(avg(durations(this_week)), avg(durations(last_week))),
             "answered_rate_7d": round(answered(this_week) / len(this_week) * 100) if this_week else None,
             "failed_7d": sum(1 for row in this_week if str(row.get("status", "")).lower() in inbox_api.FAILED_STATUSES),
@@ -112,11 +145,11 @@ def overview(tz_offset: int = Query(0, ge=-14 * 60, le=14 * 60), user: Dict[str,
             "leads_new_7d": leads_new, "leads_total": mongo_client.leads.count_documents(lead_scope),
         },
         "daily": daily,
-        "hours": [hours.get(hour, 0) for hour in range(24)],
+        "day": {"date": chosen.date().isoformat(), "days_ago": days_ago, "oldest_days_ago": OLDEST_DAY,
+                "stats": day_stats, "previous": previous_stats, "calls": calls_of_day},
+        "follow_ups": follow_ups,
+        "follow_ups_total": len(task_threads),
         "attention": attention,
-        "recent": recent,
-        "pipeline": pipeline,
-        "team": team,
         "voice": {"active_provider": providers[active_provider]["name"] if active_provider else "Default Twilio AI agent",
                   "ready": bool(providers[active_provider].get("ready")) if active_provider else True},
     }

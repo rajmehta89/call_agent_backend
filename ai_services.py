@@ -78,8 +78,14 @@ def _shared_openai_client(api_key: str, base_url: Optional[str]) -> OpenAI:
 def warm_model_connection(services: "AIServices") -> None:
     """Open the connection to the model provider ahead of the first question (cheap request, no model cost)."""
     try:
-        if services.openai_client is not None:
-            services.openai_client.with_options(timeout=10).models.retrieve(services.config.OPENROUTER_MODEL if services.provider == "openrouter" else services.config.OPENAI_MODEL)
+        if services.openai_client is None:
+            return
+        client = services.openai_client.with_options(timeout=10)
+        if services.provider == "openrouter":
+            # OpenRouter has no /models/{id} (it answered 404, so no call was ever warmed): its key-info page is free.
+            client.get("/key", cast_to=httpx.Response)
+        else:
+            client.models.retrieve(services.config.OPENAI_MODEL)
     except Exception as error:
         logger.debug("model connection warm-up skipped: %s", error)
 

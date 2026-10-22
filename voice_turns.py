@@ -48,12 +48,76 @@ def is_acknowledgement(caller_text: str) -> bool:
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
-    """The fast model for this turn, or None for the main model. Only turns that need no knowledge go fast: an
-    acknowledgement or goodbye, or the detail the agent just asked for. Anything else the caller tells us ("I'm doing
-    up a small bathroom") gets the main model and the knowledge, like a question does."""
+    """The fast model for this turn, or None for the main model, decided by what the caller MEANS (turn_meaning):
+    only a goodbye, a plain "okay" that answers no question of ours, or the detail we just asked for (name, number,
+    email, a time, an address) goes fast. Everything else, including anything about an order (looked up in the store),
+    gets the main model and the knowledge."""
     fast = fast_voice_model()
-    if not fast or needs_facts(caller_text):
+    if not fast:
         return None
+    is_simple = _simple_turn(caller_text, agent_text)
+    if is_simple is None:  # the meaning model is unavailable: decide from words
+        return _keyword_choose_voice_model(caller_text, agent_text)
+    return fast if is_simple else None
+
+
+DETAILS_WE_ASK_FOR = ("name", "phone", "email", "time", "address")
+
+
+def main_sentence(caller_text: str) -> str:
+    """The caller's point: their last sentence of three words or more ("Yeah. So what is your business for?" -> the
+    question), or everything when it is one short sentence."""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", caller_text or "") if part.strip()]
+    full = [sentence for sentence in sentences if len(sentence.split()) >= 3]
+    return full[-1] if full else (caller_text or "").strip()
+
+
+def kind_of_turn_text(caller_text: str) -> str:
+    """The caller's point (main_sentence) with what they talk about made generic, so the decision is about the KIND of
+    thing they said: the store's own product words become "a product" ("Can someone call me back about a vanity?" is a
+    callback request, not a product search) and the business's name becomes "your company". Both lists come from the
+    business's data (the Shopify catalogue, the knowledge key terms), nothing is written here."""
+    text = main_sentence(caller_text)
+    try:
+        from voice_keyterms import business_name
+        name = business_name()
+        if name and len(name) > 2:
+            text = re.sub(re.escape(name), "your company", text, flags=re.I)
+        from shopify_service import shopify_service
+        kinds = shopify_service.product_kinds() if shopify_service.configured else frozenset()
+        if kinds:
+            singular = lambda word: word[:-1] if word.endswith("s") and not word.endswith("ss") else word
+            text = re.sub(r"[A-Za-z]{4,}", lambda match: "product" if singular(match.group(0).lower()) in kinds else match.group(0), text)
+    except Exception:
+        pass
+    return text
+
+
+def _simple_turn(caller_text: str, agent_text: str = "") -> Optional[bool]:
+    """True when the turn needs no knowledge (see choose_voice_model); None when the meaning model is unavailable."""
+    from turn_meaning import AGENT_ASKED, CALLER_TURN
+    import store_intent
+    kind = CALLER_TURN.best(kind_of_turn_text(caller_text))
+    if kind is None:
+        return None
+    asked = AGENT_ASKED.best(agent_text) if (agent_text or "").strip() else ""
+    if asked in ("order", "order_email") or "order" in (store_intent.wanted(caller_text) or []):
+        return False  # an order number, or the email on an order, is looked up in the store
+    if kind == "closing":
+        return True
+    if kind == "acknowledge":
+        # "Yeah." answering our own question needs real understanding of what was asked: the main model.
+        return not (agent_text or "").strip().endswith("?")
+    if kind == "detail":
+        return asked in DETAILS_WE_ASK_FOR
+    return False
+
+
+def _keyword_choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
+    """Fallback for choose_voice_model when the local meaning model cannot load."""
+    fast = fast_voice_model()
+    if not fast or needs_facts(caller_text) or _ORDER_TALK.search(f"{caller_text} {agent_text or ''}"):
+        return None  # an order number or email for an order is looked up in the store: main model, with the lookup
     if _ASKED_FOR_DETAILS.search(agent_text or ""):
         return fast  # the name, number or email the agent just asked for
     if is_acknowledgement(caller_text):
@@ -65,6 +129,55 @@ def choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
     return None
 
 
+_FAREWELL = re.compile(r"\b(?:good)?bye\b|\bhave a (?:great|good|lovely|nice|wonderful) (?:day|one|evening|night|weekend|afternoon)\b|"
+                       r"\btake care\b", re.I)
+
+
+_AFFIRM = re.compile(r"^\W*(?:yes|yeah|yep|yup|sure|ok|okay|alright|please|go ahead|sounds good)\b", re.I)
+
+
+def yes_to_offer_note(caller_text: str, agent_text: str) -> str:
+    """A note for this turn when the caller said yes to what we offered ("Would you like the sizes or the stock?"
+    "Yeah."). From real calls: the model answered such a "Yeah" by repeating its previous answer almost word for word."""
+    question = agent_question(agent_text)
+    if not question.endswith("?") or not is_acknowledgement(caller_text) or not _AFFIRM.match(caller_text):
+        return ""
+    if detail_asked(agent_text) not in ("", "order"):
+        return ""  # "Can I take your name?" "Yes." is handled by the details rules
+    return (f"The caller just said yes to your question \"{question}\". Do that now: give the new information you offered "
+            "(if you offered two things, cover both briefly). Do not repeat or rephrase your previous answer.")
+
+
+def search_text(caller_text: str, messages: List[Dict[str, str]]) -> str:
+    """The words the knowledge and store search use for this turn. A yes to our offer ("Yeah." to "Would you like the
+    colours or prices for those?") is searched as the offer plus the caller's earlier question, so the facts offered
+    are found: searching "Yeah." found nothing, and the agent said to check the website for prices the store has."""
+    agent_text = last_agent_text(messages)
+    if not yes_to_offer_note(caller_text, agent_text):
+        return caller_text
+    earlier = earlier_caller_texts(messages, caller_text)
+    return " ".join(part for part in (earlier[-1] if earlier else "", agent_question(agent_text)) if part)
+
+
+def agent_said_goodbye(agent_text: str) -> bool:
+    """Our own last reply was a farewell ("Have a great day, Raj. Goodbye."), not a question."""
+    text = (agent_text or "").strip()
+    return bool(text) and "?" not in text and bool(_FAREWELL.search(text))
+
+
+def call_is_over(caller_text: str, agent_text: str) -> bool:
+    """Both sides have said goodbye: we already said it and the caller only says okay, thanks or bye back. From a
+    real call: "Okay. / Thank you. / Bye. / Okay." got four goodbyes in a row, one per fragment. Anything that could
+    be more than a goodbye (a question, a new request) keeps the call going."""
+    if not agent_said_goodbye(agent_text) or needs_facts(caller_text):
+        return False
+    if is_acknowledgement(caller_text):
+        return True
+    from turn_meaning import CALLER_TURN
+    return CALLER_TURN.best(kind_of_turn_text(caller_text)) == "closing"
+
+
+_ORDER_TALK = re.compile(r"\border(?:s|ed)?\b", re.I)
 _CLOSING = re.compile(r"\b(?:bye|goodbye|thanks|thank|cheers|that's all|thats all|nothing else)\b", re.I)
 
 
@@ -81,6 +194,13 @@ _NUMBER_RUN = re.compile(rf"\(?{_TOKEN}\)?(?:{_SEPARATOR}\(?{_TOKEN}\)?)+", re.I
 _MIN_DIGITS = 8
 # The same, with a leading "+" (a country code written as "+91"), so the "+" is replaced along with the number.
 _PLUS_NUMBER_RUN = re.compile(r"(?:\+\s*)?" + _NUMBER_RUN.pattern, re.I)
+
+
+def reply_known_numbers(knowledge_text: str, prompt: str, caller_digits: str) -> frozenset:
+    """Numbers a reply may read out as written: the knowledge's, plus those in this turn's prompt (live store data such
+    as a tracking number or order total). The caller's own number is left out, so a misread of it is still corrected."""
+    tail = (caller_digits or "")[-8:]
+    return frozenset(number for number in known_numbers(f"{knowledge_text}\n{prompt}") if not tail or tail not in number)
 
 
 def known_numbers(knowledge_text: str) -> frozenset:
@@ -159,16 +279,24 @@ class NumberSpeaker:
         def replace(match: re.Match) -> str:
             digits = _run_digits(match.group(0))
             known = any(digits in number or number in digits for number in self.known_numbers if len(number) >= _MIN_DIGITS)
-            # A phone-length number that is not the business's own can only be the caller's number being read back:
-            # always say the caller's exact digits (a model once read "8866631491" back as "8866663149").
-            if (len(digits) >= _MIN_DIGITS and not known) or (len(digits) >= _MIN_DIGITS - 2 and _close(digits, self.caller_digits)):
+            if len(digits) >= _MIN_DIGITS - 2 and self.caller_digits and _close(digits, self.caller_digits):
                 return say_digits(self.caller_digits)
+            if len(digits) >= _MIN_DIGITS and not known:
+                # Nearly one of the business's own numbers (a model once said the shop's "(04) 2221 3831" as
+                # "0422 221 383"): say that number exactly as written in the knowledge.
+                near = next((number for number in self.known_numbers if len(number) >= _MIN_DIGITS and _close(digits, number)), None)
+                if near:
+                    return say_digits(near)
+                # Any other phone-length number can only be the caller's number being read back: always say the
+                # caller's exact digits (a model once read "8866631491" back as "8866663149").
+                if self.caller_digits:
+                    return say_digits(self.caller_digits)
             return match.group(0)
         return _PLUS_NUMBER_RUN.sub(replace, text)
 
     def feed(self, chunk: str) -> str:
-        if not self.caller_digits:
-            return chunk
+        if not self.caller_digits and not self.known_numbers:
+            return chunk  # nothing to protect (no caller number, no business numbers)
         self.pending += chunk
         # Hold back from the last digit token onwards while the number may still be going.
         # (A "+" goes with the number after it: "+91 ...".)
@@ -181,7 +309,7 @@ class NumberSpeaker:
 
     def flush(self) -> str:
         out, self.pending = self.pending, ""
-        return self._rewrite(out) if out and self.caller_digits else out
+        return self._rewrite(out) if out and (self.caller_digits or self.known_numbers) else out
 
 
 # ---- checking the caller's details -----------------------------------------------------------------------------
@@ -309,32 +437,72 @@ def _format_hint(region: str) -> tuple[str, int]:
     return f"{country} phone numbers look like {national}", len(re.sub(r"\D", "", national))
 
 
+# Words that come before the name part of a spoken email ("yeah, it is raj m 267747 at gmail dot com"), never in it.
+_EMAIL_LEAD_IN = {"is", "it's", "its", "it", "email", "e-mail", "mail", "address", "my", "the", "so", "yeah", "yes", "yep", "okay",
+                  "ok", "um", "uh", "and", "that's", "thats", "id", "me", "at", "on", "use", "please", "sure", "right", "well"}
+
+
 def spoken_email(text: str) -> str:
-    """The email address in what a caller said, rebuilt from speech ('raj at gmail dot com', 'r a j at the rate
-    gmail dot com', 'raj_m@gmail.com'), or '' when none was said."""
+    """The email address in what a caller said, rebuilt from speech, or '' when none was said. Callers say it in
+    pieces: the name part ("raj m two six seven seven four seven"), "at" (or "at the rate", which speech recognition may
+    hear as "at direct"), the provider (sometimes split: "g mail", "out look") and the ending ("dot com dot au")."""
     if not _EMAIL_CONTEXT.search(text):
         return ""
     spoken = f" {text.lower()} "
     # Digits said as words: "rajm two six seven" -> "rajm 2 6 7" ("oh" is left alone: too often a real word).
     spoken = re.sub(r"\b(zero|one|two|three|four|five|six|seven|eight|nine)\b", lambda m: _DIGIT_WORDS[m.group(1)], spoken)
-    spoken = re.sub(r"(?<![a-z0-9'’])([a-z0-9])\s+(?=[a-z0-9]\b)", r"\1", spoken)  # spelled out: "r a j" -> "raj"
-    # "at the rate" (Indian English for @), also as speech recognition hears it before a mail provider ("at direct gmail").
-    spoken = re.sub(r"\s+at\s+(?:the\s+rate(?:\s+of)?|direct|the\s+red|rate)\s+(?=[a-z0-9-]+\s*(?:\.|dot\b))", "@", spoken)
-    spoken = re.sub(r"\s+at\s+", "@", spoken)
-    spoken = re.sub(r"\s*\b(?:dot|period)\b\s*", ".", spoken)
-    spoken = re.sub(r"\s*\bunderscore\b\s*", "_", spoken)
-    spoken = re.sub(r"\s*\b(?:dash|hyphen)\b\s*", "-", spoken)
-    # The name part: everything said after "my email is" (callers say it in pieces: "raj m 267747"), else the last word.
-    intro = re.search(r"\be-?mail(?:\s+address)?\s+(?:is|it's|its)?\s*([a-z0-9._%+\- ]+?)\s*@([a-z0-9.\-]*)", spoken)
-    if intro:
-        return f"{intro.group(1).replace(' ', '')}@{intro.group(2)}".strip(".")
-    match = re.search(r"([a-z0-9._%+\-]+)@([a-z0-9.\-]*)", spoken)
-    return f"{match.group(1)}@{match.group(2)}".strip(".") if match else ""
+    # "at the rate (of)" (Indian English for @), also as speech recognition hears it ("at direct", "at the red", "at rate").
+    spoken = re.sub(r"\s+at\s+(?:the\s+rate(?:\s+of)?|direct|the\s+red|rate)\s+", " @ ", spoken)
+    spoken = re.sub(r"\s+at\s+", " @ ", spoken)
+    spoken = re.sub(r"\s*\b(?:dot|period)\b\s*", " . ", spoken)
+    spoken = re.sub(r"\s*\bunderscore\b\s*", " _ ", spoken)
+    spoken = re.sub(r"\s*\b(?:dash|hyphen)\b\s*", " - ", spoken)
+    spoken = spoken.replace("@", " @ ")
+    tokens = [token.strip(",;:!?") for token in spoken.split()]
+    tokens = [token for token in tokens if token]
+    if "@" not in tokens:
+        return ""
+    at = len(tokens) - 1 - tokens[::-1].index("@")  # the last "at": the one before the provider
+    # The name part: the pieces just before "@", back to the words that introduce it.
+    name: List[str] = []
+    for token in reversed(tokens[:at]):
+        if token == ".":  # a spoken "dot" inside the name ("john dot smith")
+            name.insert(0, ".")
+            continue
+        piece = token.strip(".")  # "m." : a full stop speech recognition put after a piece
+        if not piece:
+            continue
+        if piece in _EMAIL_LEAD_IN or not re.fullmatch(r"[a-z0-9._%+\-]+", piece):
+            break
+        name.insert(0, piece)
+    # The provider and ending: the pieces after "@" up to the last ending ("gmail . com", "g mail . com . au").
+    domain: List[str] = []
+    for index, token in enumerate(tokens[at + 1:]):
+        if not re.fullmatch(r"[a-z0-9.\-]+", token):
+            break
+        domain.append(token)
+        rest = tokens[at + 2 + index:]
+        if "." in domain and token != "." and not (rest and rest[0] == "."):
+            break  # an ending was said and no further "dot" follows: the address is complete
+    local, host = "".join(name).strip("."), "".join(domain).strip(".")
+    return f"{local}@{host}" if local or host else ""
 
 
 def say_email(email: str) -> str:
-    """'raj.m@gmail.com' -> 'raj dot m at gmail dot com' (how to read it back)."""
-    return email.replace(".", " dot ").replace("@", " at ").replace("_", " underscore ").replace("-", " dash ")
+    """How to read an email back so the caller can check it by ear: 'rajm267747@gmail.com' -> 'r a j m, two six seven
+    seven four seven, at gmail dot com'. In the name part, digits are said one by one and short letter groups are
+    spelled (a whole word like 'john' stays a word); the provider and ending are said as words."""
+    local, _, host = email.partition("@")
+    pieces = []
+    for chunk in re.findall(r"[a-z]+|\d+|[._\-]", local.lower()):
+        if chunk.isdigit():
+            pieces.append(" ".join(_SPOKEN[int(digit)] for digit in chunk) + ",")
+        elif chunk in "._-":
+            pieces.append({".": "dot", "_": "underscore", "-": "dash"}[chunk])
+        else:
+            pieces.append(" ".join(chunk) + "," if len(chunk) <= 4 else chunk)
+    spoken_host = host.replace(".", " dot ").replace("-", " dash ")
+    return re.sub(r"\s+", " ", f"{' '.join(pieces)} at {spoken_host}").replace(", at", " at").strip()
 
 
 def said_number(text: str, min_digits: int = _MIN_DIGITS) -> str:
@@ -355,6 +523,43 @@ def earlier_caller_texts(messages: List[Dict[str, str]], current: str) -> List[s
     return texts
 
 
+def about_phone(caller_text: str, agent_text: str = "") -> bool:
+    """Whether the caller is giving a phone number (not an order number, postcode, price or size), by meaning: what
+    they said, or our question just before ("What's the best number to reach you?")."""
+    from turn_meaning import AGENT_ASKED, CONTACT
+    said = CONTACT.best(caller_text)
+    asked = AGENT_ASKED.best(agent_text) if (agent_text or "").strip() else ""
+    if said is None or asked is None:  # the meaning model is unavailable: decide from words
+        return bool(_PHONE_CONTEXT.search(caller_text) or _PHONE_CONTEXT.search(agent_text or ""))
+    return said == "phone" or (asked == "phone" and said != "email")
+
+
+def agent_question(agent_text: str) -> str:
+    """What our last reply asked: its last question, or the whole reply when it asked none. "You can pick up your order
+    from our store. Would you like details on collection?" asked about collection, not for an order number."""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", agent_text or "") if part.strip()]
+    questions = [sentence for sentence in sentences if sentence.endswith("?")]
+    return questions[-1] if questions else (agent_text or "").strip()
+
+
+def detail_asked(agent_text: str) -> str:
+    """Which of the caller's details our last reply asked for ("" for none): name, phone, email, time, address, order,
+    order_email. None of the meaning model's answer is trusted when it is unavailable: then words decide ("detail")."""
+    question = agent_question(agent_text)
+    if not question:
+        return ""
+    from turn_meaning import AGENT_ASKED
+    asked = AGENT_ASKED.best(question)
+    if asked is None:
+        return "detail" if _ASKED_FOR_DETAILS.search(question) else ""
+    return asked if asked in (*DETAILS_WE_ASK_FOR, "order", "order_email") else ""
+
+
+def asked_for_a_detail(agent_text: str) -> bool:
+    """Whether our last reply asked the caller for one of their details (name, number, email, a time, an address)."""
+    return bool(detail_asked(agent_text))
+
+
 def contact_check(caller_text: str, agent_text: str = "", earlier: List[str] = (), region: str = "") -> tuple[str, bool]:
     """Check a phone number or email the caller just gave. Returns (note for the model, problem found).
     The note tells the model the exact details to read back, or that what was heard is not valid and must be asked
@@ -362,7 +567,7 @@ def contact_check(caller_text: str, agent_text: str = "", earlier: List[str] = (
     notes: List[str] = []
     problem = False
     digits = said_number(caller_text, min_digits=6)
-    if digits and (_PHONE_CONTEXT.search(caller_text) or _PHONE_CONTEXT.search(agent_text)):
+    if digits and about_phone(caller_text, agent_text):
         # Calls come from anywhere. The caller's country, best evidence first: their caller ID (`region`), a country
         # they named ("it's an Indian number"), then the business's own country as the likeliest for a local caller.
         known_country = region or mentioned_region([*earlier, caller_text])
@@ -426,10 +631,22 @@ _PLACE_QUESTION = re.compile(r"\b(?:deliver\w*|ship\w*|send|install\w*|fit\w*|st
 _PLACE_AFTER = re.compile(r"\b(?:in|to|at|near|around|into|from|for|out to)\s+((?:[A-Z][a-zA-Z'-]+)(?:\s+[A-Z][a-zA-Z'-]+){0,2})")
 
 
+def is_place_question(caller_text: str) -> bool:
+    """Whether the caller asks if something covers a place ("can you get it out to Geelong?"), by meaning."""
+    from turn_meaning import PLACE_QUESTION
+    # The place itself is blanked out ("Do you install in that town?"): the small model otherwise reacts to a city name
+    # whether or not anything is asked about it ("I live in Brisbane and like your taps" asks nothing).
+    masked = _PLACE_AFTER.sub(lambda match: match.group(0).replace(match.group(1), "that town"), caller_text)
+    kind = PLACE_QUESTION.best(masked)
+    if kind is None:  # the meaning model is unavailable: decide from words
+        return bool(_PLACE_QUESTION.search(caller_text))
+    return kind == "place"
+
+
 def unknown_places(caller_text: str, knowledge_text: str) -> List[str]:
     """Places the caller named in a delivery/installation/store question that the knowledge never mentions
     ("Do you install in Brisbane?" with no Brisbane in the knowledge)."""
-    if not _PLACE_QUESTION.search(caller_text):
+    if not is_place_question(caller_text):
         return []
     places = []
     for match in _PLACE_AFTER.finditer(caller_text):
@@ -442,12 +659,26 @@ def unknown_places(caller_text: str, knowledge_text: str) -> List[str]:
     return places
 
 
+def _named_area(caller_text: str, knowledge_text: str) -> List[str]:
+    """A short answer naming an area ("Geelong.", "It's Ballarat."), when we just asked which area: the capitalised
+    name, unless the knowledge mentions it."""
+    if len(caller_text.split()) > 5:
+        return []
+    names = re.findall(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b", caller_text)
+    skip = {"yes", "yeah", "yep", "no", "nope", "okay", "it's", "its", "it", "the", "in", "to", "sure", "well", "so", "um", "uh"}
+    return [name for name in names if name.lower() not in skip and not re.search(rf"\b{re.escape(name)}\b", knowledge_text, re.I)]
+
+
 def place_note(caller_text: str, knowledge_text: str, agent_text: str = "") -> str:
     """A note for this turn only, so the model does not say a place it knows nothing about is covered. Not while the
-    caller is giving their details ("it's an India number, nine one ..."): that is about a phone number, not an area."""
-    if _ASKED_FOR_DETAILS.search(agent_text or "") or said_number(caller_text, min_digits=4) or _PHONE_CONTEXT.search(caller_text):
+    caller is giving their details ("it's an India number, nine one ..."): that is about a phone number, not an area.
+    When we asked for their area or address, the place they name is exactly what must not be confirmed, so that stays."""
+    asked = detail_asked(agent_text)
+    if asked not in ("", "address", "order") or said_number(caller_text, min_digits=4) or about_phone(caller_text):
         return ""
     places = unknown_places(caller_text, knowledge_text)
+    if not places and asked == "address":
+        places = _named_area(caller_text, knowledge_text)  # "Are you after delivery to a specific area?" "Geelong."
     if not places:
         return ""
     names = " and ".join(places)
@@ -467,7 +698,8 @@ def careful_voice_model(default: str = "") -> str:
 #
 # Context-aware, rule-based (no extra model call): the caller's words decide the kind of acknowledgement, the last few
 # are never repeated, and simple questions, answers to the agent, short replies and sensitive issues get none at all.
-# Phrases never claim to be checking something ("let me check"), and are only said if the answer is not ready yet.
+# Only LOOKUP_BRIDGES say "let me check", and only when a live store lookup really runs; all are said only if the
+# answer is not ready yet.
 
 # Looking for a product or a recommendation.
 SEARCH_BRIDGES = ("Let's see what would work best for you.", "Let me think about what would suit you.")
@@ -483,7 +715,11 @@ REQUEST_BRIDGES = ("Sure, I can help with that.", "Yeah, I can sort that out.")
 CLARIFY_BRIDGES = ("Oh, sorry.", "Ah, sure.")
 # Said once if the answer still has not started a while after the caller finished (VOICE_STATUS_AFTER_MS).
 STATUS_PHRASES = ("I'm working through the details now.", "Just putting that together for you.")
-ALL_BRIDGES = (*SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES, *STATUS_PHRASES)
+# A question the live store answers (a price, stock, sizes, a warranty, an order): the store lookup really runs, so
+# saying so is true, and it fills the ~2 s the lookup and the model take. Only for those turns (store_lookup_runs).
+LOOKUP_BRIDGES = ("Let me check that for you.", "One sec, I'll have a look.", "Let me just look that up.", "Bear with me, I'll check.")
+ALL_BRIDGES = (*SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES,
+               *STATUS_PHRASES, *LOOKUP_BRIDGES)
 
 _SEARCH = re.compile(r"\b(?:looking for|look for|need (?:a|an|some|something)|want (?:a|an|some|something)|recommend\w*|suggest\w*|"
                      r"best|suit|which (?:one|ones|basin|tap|style)|what kind|what type|options? for|something for|ideas?)\b", re.I)
@@ -523,8 +759,59 @@ def bridges_enabled() -> bool:
     return os.getenv("VOICE_BRIDGE", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
-def bridge_kind(caller_text: str) -> str:
-    """Which acknowledgement fits ("" = none): rule-based, instant."""
+def store_lookup_runs(caller_text: str, earlier: str = "") -> bool:
+    """True when this turn clearly asks for live store data (products, an order, store policies), by meaning
+    (store_intent, ~7 ms): the store lookup then runs, so a "let me check" is never untrue, and an off-topic
+    question that only half-matches ("who won the football?") gets its answer straight away instead."""
+    try:
+        import store_intent
+        from shopify_service import shopify_service
+        if not shopify_service.configured:
+            return False
+        return store_intent.clearly_wanted(caller_text, " ".join(earlier.split()[-25:]))
+    except Exception:
+        return False
+
+
+def bridge_kind(caller_text: str, earlier: str = "") -> str:
+    """Which acknowledgement fits ("" = none), by what the caller means (turn_meaning.CALLER_TURN): none for a yes/no,
+    a goodbye, a detail, a simple question the business knowledge answers, or anything upset or urgent (the answer
+    itself must handle that). A question the live store answers gets a short "let me check" (`earlier`: what the
+    caller said before, for follow-ups such as "how much is that one?")."""
+    words = re.findall(r"[a-z']+", caller_text.lower())
+    if len(words) < 4:
+        return ""  # "Hello?", "Yes", "So what?": answer straight away
+    from turn_meaning import CALLER_TURN
+    turn_text = kind_of_turn_text(caller_text)
+    kind = CALLER_TURN.best(turn_text)
+    if kind is None:  # the meaning model is unavailable: decide from words
+        return _keyword_bridge_kind(caller_text, earlier)
+    if kind == "request" and not _clear_lead(CALLER_TURN.rank(turn_text)):
+        # "What's your phone number?" scored request, detail and question within 0.01: "Yeah, I can sort that out."
+        # before a plain answer sounded wrong. Only a clear request ("Can someone call me back?") gets one.
+        kind = "question"
+    if kind in ("clarify", "request", "problem"):
+        return kind
+    if kind in ("", "acknowledge", "closing", "detail", "sensitive"):
+        return ""
+    if len(words) >= 22 or len(re.findall(r"\b(?:and|also|plus)\b", caller_text.lower())) >= 2:
+        return "detail"  # a long message with several things in it
+    if kind in ("search", "question") and needs_facts(caller_text) and store_lookup_runs(caller_text, earlier):
+        return "lookup"  # "How much is the Lydia mixer?" reads as a search, but it is a question the store answers
+    if kind == "search":
+        return "search"
+    return "" if kind == "question" else "statement"
+
+
+CLEAR_LEAD = 0.03  # how far the best kind of turn must lead the next one to be taken as clearly that kind
+
+
+def _clear_lead(ranked) -> bool:
+    return bool(ranked) and (len(ranked) < 2 or ranked[0][1] - ranked[1][1] >= CLEAR_LEAD)
+
+
+def _keyword_bridge_kind(caller_text: str, earlier: str = "") -> str:
+    """Fallback for bridge_kind when the local meaning model cannot load."""
     words = re.findall(r"[a-z']+", caller_text.lower())
     if is_acknowledgement(caller_text) or len(words) < 4:
         return ""  # "Hello?", "Yes", "So what?": answer straight away
@@ -543,20 +830,21 @@ def bridge_kind(caller_text: str) -> str:
     if _SEARCH.search(caller_text):
         return "search"
     if needs_facts(caller_text):
-        return ""  # a simple question: the answer itself comes quickly enough
+        # A simple question the knowledge answers comes quickly enough; a live store lookup takes longer.
+        return "lookup" if store_lookup_runs(caller_text, earlier) else ""
     return "statement"
 
 
 _KIND_PHRASES = {"search": SEARCH_BRIDGES, "problem": PROBLEM_BRIDGES, "detail": DETAIL_BRIDGES, "statement": STATEMENT_BRIDGES,
-                 "request": REQUEST_BRIDGES, "clarify": CLARIFY_BRIDGES, "status": STATUS_PHRASES}
+                 "request": REQUEST_BRIDGES, "clarify": CLARIFY_BRIDGES, "status": STATUS_PHRASES, "lookup": LOOKUP_BRIDGES}
 
 
-def bridge_phrase(caller_text: str, recent=()) -> str:
+def bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     """A short acknowledgement that fits what the caller said, or "" when none should be said. Never one of the
-    recently used phrases (`recent`: a phrase or a list of the last few)."""
+    recently used phrases (`recent`: a phrase or a list of the last few; `earlier`: what the caller said before)."""
     global _bridge_turn
     recent = {recent} if isinstance(recent, str) else set(recent or ())
-    kind = "status" if caller_text == "__status__" else bridge_kind(caller_text)
+    kind = "status" if caller_text == "__status__" else bridge_kind(caller_text, earlier)
     if not kind:
         return ""
     options = _KIND_PHRASES[kind]
@@ -570,6 +858,42 @@ def bridge_phrase(caller_text: str, recent=()) -> str:
 
 def status_phrase(recent=()) -> str:
     return bridge_phrase("__status__", recent)
+
+
+def bridge_model_seconds() -> float:
+    """VOICE_BRIDGE_MODEL_MS: how long the small model may take to write the "let me check" line (counted from the end
+    of the caller's turn); slower than this, a fixed LOOKUP_BRIDGES phrase is said instead."""
+    try:
+        return max(0.1, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "900"))) / 1000
+    except ValueError:
+        return 0.9
+
+
+# The small model only phrases what to say while the store lookup runs; it is given no facts and must not answer.
+LOOKUP_BRIDGE_PROMPT = (
+    "You are the voice of a shop on a live phone call. The caller just asked something and you are looking it up right now. "
+    "Write only one short, natural spoken sentence (4 to 9 words) to say while you look it up, for example \"Let me check "
+    "the Lydia mixer for you.\" or \"One sec, I'll look up the warranty on that.\" Name what they asked about in a few of "
+    "their words, or say 'that' when unsure. Never answer the question: no price, number, size, colour, yes or no, or any "
+    "other fact. No greeting, no question, no quotes."
+)
+_LOOKUP_VERB = re.compile(r"\b(?:check\w*|look\w*|find\w*|see|pull\w*|moment|sec|second)\b", re.I)
+_ANSWER_WORDS = re.compile(r"\d|\$|%|\b(?:yes|no|yeah|nope|costs?|priced|available|in stock|comes? in|warranty is|aud|dollars?)\b", re.I)
+
+
+def lookup_bridge_messages(caller_text: str, agent_text: str = "") -> List[Dict[str, str]]:
+    context = f"You last said: {agent_text}\n" if agent_text else ""
+    return [{"role": "system", "content": LOOKUP_BRIDGE_PROMPT}, {"role": "user", "content": f"{context}Caller: {caller_text}"}]
+
+
+def clean_lookup_bridge(text: str) -> str:
+    """The small model's line if it is safe to say while looking up ("" otherwise): one short sentence that says it is
+    checking and states nothing (a digit, a yes/no or a price would be a guess said before the real answer)."""
+    line = re.split(r"(?<=[.!])\s", " ".join((text or "").replace('"', "").split()), maxsplit=1)[0].strip()
+    words = line.split()
+    if not 3 <= len(words) <= 12 or "?" in line or not _LOOKUP_VERB.search(line) or _ANSWER_WORDS.search(line):
+        return ""
+    return line if line[-1] in ".!" else f"{line}."
 
 
 def bridge_note(bridge: str) -> str:

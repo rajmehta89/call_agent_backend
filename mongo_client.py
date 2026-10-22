@@ -70,6 +70,7 @@ class MongoDBClient:
             self.roles = self.db.roles
             self.invitations = self.db.invitations
             self.shopify_sync_history = self.db.shopify_sync_history
+            self.shopify_oauth_states = self.db.shopify_oauth_states  # one-time "Connect with Shopify" requests
             self.audit_logs = self.db.audit_logs
             self.notifications = self.db.notifications
             self.email_outbox = self.db.email_outbox
@@ -138,6 +139,7 @@ class MongoDBClient:
             self.invitations.create_index("token_hash", unique=True)
             self.invitations.create_index("expires_at")
             self.shopify_sync_history.create_index("created_at")
+            self.shopify_oauth_states.create_index("created_at", expireAfterSeconds=3600)
             self.audit_logs.create_index("created_at")
             self.audit_logs.create_index("resource")
             self.notifications.create_index("created_at")

@@ -18,6 +18,8 @@ PUBLIC_ROUTES = {
     "/api/custom-voice/media", "/api/twilio/ws", "/api/retell/llm-websocket/{call_id}", "/api/retell/webhook",
     # Checks the sign-in token itself (passed in the URL: browsers' EventSource cannot send headers).
     "/api/realtime/events",
+    # Shopify's redirect after "Connect with Shopify": checked by HMAC with the app secret and a one-time state.
+    "/api/platform/shopify/oauth/callback",
 }
 GUARDS = {"require_user", "dependency", "verify_twilio_request"}
 

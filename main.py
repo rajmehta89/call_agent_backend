@@ -105,6 +105,7 @@ app.include_router(inbox_api.router)
 app.include_router(overview_api.router)
 app.include_router(platform_api.router)
 app.include_router(shopify_api.router)
+app.include_router(shopify_api.public_router)
 app.include_router(twilio_api.router)
 app.include_router(custom_twilio_voice_api.router)
 app.include_router(retell_api.router)
@@ -119,6 +120,50 @@ async def attach_realtime() -> None:
     """Live dashboard updates publish from worker threads onto this loop."""
     import asyncio
     realtime.attach_loop(asyncio.get_running_loop())
+
+
+@app.on_event("startup")
+async def keep_connections_warm() -> None:
+    """Open every connection a call needs as the server starts, and keep them open between calls, so no call waits on
+    a secure handshake (0.1-0.5 s each, from here to the US): the voice model (OpenRouter), the voices (ElevenLabs,
+    Deepgram), Shopify and Retell. Each ping is a free request (key info, model or project list, the shop's name),
+    every KEEP_WARM_SECONDS (default 25: Retell dropped idle connections after 30-60 s; 0 = only once at startup)."""
+    import asyncio
+    from ai_services import AIServices, warm_model_connection
+    from routers.custom_twilio_voice_api import _warm_tts_connection, warm_retell_connection
+    from routers.retell_api import configure_voice_services
+    from shopify_service import shopify_service
+
+    try:
+        interval = max(0.0, float(os.getenv("KEEP_WARM_SECONDS", "25")))
+    except ValueError:
+        interval = 25.0
+    services = None
+
+    async def ping_all() -> None:
+        nonlocal services
+        if services is None:
+            services = await asyncio.to_thread(configure_voice_services, AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b"))
+        voices = [engine for engine, key in (("elevenlabs", "ELEVENLABS_API_KEY"), ("deepgram", "DEEPGRAM_API_KEY")) if os.getenv(key, "").strip()]
+        await asyncio.gather(
+            asyncio.to_thread(warm_model_connection, services),
+            asyncio.to_thread(shopify_service.keep_warm),
+            warm_retell_connection(),
+            *(_warm_tts_connection(engine) for engine in voices),
+            return_exceptions=True,
+        )
+
+    async def keep_warm() -> None:
+        while True:
+            try:
+                await ping_all()
+            except Exception as error:  # never stop keeping the others warm
+                logging.getLogger(__name__).debug("keep-warm round failed: %s", error)
+            if not interval:
+                return
+            await asyncio.sleep(interval)
+
+    asyncio.get_running_loop().create_task(keep_warm())
 
 
 @app.on_event("startup")
@@ -146,6 +191,12 @@ async def warm_local_embeddings() -> None:
             # Speech-recognition key terms from the knowledge (rebuilt only if the knowledge changed).
             from voice_keyterms import current_keyterms
             current_keyterms()
+            # Words naming what the connected store sells, so product questions in any words get a live lookup.
+            from shopify_service import shopify_service
+            shopify_service.catalog_words()
+            shopify_service.catalog_index()  # the whole catalogue in memory, for instant product searches
+            import store_intent
+            store_intent.wanted("hello")  # the meaning examples for understanding store questions
         except Exception as error:
             logging.getLogger(__name__).warning("startup warm-up failed: %s", error)
 

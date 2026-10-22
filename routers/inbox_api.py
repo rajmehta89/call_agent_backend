@@ -165,6 +165,17 @@ def _utc(value: datetime) -> datetime:
     return value
 
 
+def _when_param(value: str, name: str) -> datetime | None:
+    """An ISO time from the query string as naive UTC (how times are stored); None when empty."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{name} must be an ISO date-time")
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
 def _event(key: str, kind: str, user: Dict[str, Any], text: str) -> None:
     """Record something that happened to a thread (closed, reopened, assigned...) for its timeline."""
     mongo_client.inbox_threads.update_one({"_id": key}, {"$push": {"events": {"type": kind, "text": text, "by_name": user.get("name"), "at": datetime.utcnow()}}}, upsert=True)
@@ -334,8 +345,13 @@ def team_members(user: Dict[str, Any] = Depends(require_user)):
 
 @router.get("/conversations")
 def list_conversations(folder: str = "all", search: str = "", stage: str = "", state: str = "open", limit: int = Query(200, ge=1, le=1000),
-                             user: Dict[str, Any] = Depends(require_user)):
+                       since: str = "", until: str = "", user: Dict[str, Any] = Depends(require_user)):
+    """`since`/`until` (ISO times, e.g. the caller's local midnights): only threads active in that range; in a status
+    view (`stage`), threads that moved into that status in the range."""
     _require_db()
+    start, end = _when_param(since, "since"), _when_param(until, "until")
+    in_range = lambda thread: (lambda at: isinstance(at, datetime) and (not start or at >= start) and (not end or at < end))(
+        (thread.get("stage_at") or thread["last_at"]) if stage else thread["last_at"])
     if folder not in FOLDERS or folder == "mentioned":
         raise HTTPException(status_code=400, detail=f"Unknown folder {folder!r}")
     if stage and stage not in STAGE_LABELS:
@@ -344,9 +360,9 @@ def list_conversations(folder: str = "all", search: str = "", stage: str = "", s
         raise HTTPException(status_code=400, detail=f"Unknown state {state!r}")
     needle = search.strip().lower()
     rows = [thread for thread in _threads() if _in_folder(thread, folder, _user_id(user)) and (not stage or thread["stage"] == stage)
-            and (state == "all" or thread["closed"] == (state == "closed"))
+            and (state == "all" or thread["closed"] == (state == "closed")) and (not (start or end) or in_range(thread))
             and (not needle or needle in " ".join(str(thread.get(field) or "") for field in ("name", "phone", "preview", "summary", "assigned_to_name")).lower())]
-    logger.info("inbox: %s listed %s (%d %s threads, stage=%r, search=%r)", user.get("email"), folder, len(rows), state, stage, search)
+    logger.info("inbox: %s listed %s (%d %s threads, stage=%r, search=%r, since=%r, until=%r)", user.get("email"), folder, len(rows), state, stage, search, since, until)
     return {"success": True, "data": _serialize(rows[:limit])}
 
 
@@ -531,6 +547,8 @@ def get_conversation(key: str, user: Dict[str, Any] = Depends(require_user)):
     events = (state.get("events") or [])[-100:] + [
         {"type": "stage", "text": f"{change.get('by_name') or 'Someone'} changed the status to {STAGE_LABELS.get(change.get('to'), change.get('to'))}"
                                  + (f": {change['reason']}" if change.get("reason") else ""),
+         # Structured too, so the conversation can show "Moved to Outreach" with the reason underneath.
+         "to": change.get("to"), "to_label": STAGE_LABELS.get(change.get("to"), change.get("to")), "reason": change.get("reason"),
          "by_name": change.get("by_name"), "at": change.get("at")} for change in (state.get("stage_history") or [])[-50:]]
     return {"success": True, "data": _serialize({**thread, "calls": history, "discussion": discussion, "stage_history": (state.get("stage_history") or [])[-50:],
                                                  "events": sorted(events, key=lambda event: event.get("at") or datetime.min), "profile": _profile(calls)})}
