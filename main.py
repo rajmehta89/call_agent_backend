@@ -61,6 +61,7 @@ app.add_middleware(
     allow_credentials=False,  # the dashboard authenticates with a bearer token, not cookies
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=7200,  # browsers remember the preflight for 2 hours (Chrome's cap) instead of 10 minutes: one round trip less per request
 )
 
 # Polling endpoints would drown out everything else at INFO.
