@@ -339,7 +339,7 @@ def conversation_knowledge(caller_text: str, history: Optional[List[Dict[str, st
 
 
 def _system_prompt(caller_text: str, caller_number: str, summary: str = "", history: Optional[List[Dict[str, str]]] = None,
-                   with_knowledge: bool = True) -> str:
+                   with_knowledge: bool = True, language: Optional[str] = None) -> str:
     """with_knowledge=False: a turn without a question (a name, a number, "okay") gets no business facts at all,
     so a small fast model has nothing to misquote and a shorter prompt to read."""
     try:
@@ -359,8 +359,14 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
                 knowledge = [{"text": store}, *knowledge]
         if caller_lookup is not None:
             caller_lookup.result(timeout=5)
+        if not language and phone:
+            from voice_languages import language_for_phone
+            language = language_for_phone(phone)
         business = agent_config.get_system_prompt().strip()
         channel = brain_service.channel_config("voice")
+        if language:
+            from voice_languages import language_label, normalize_language
+            channel = {**channel, "language": language_label(normalize_language(language))}
         caller = brain_service.customer_context(phone) if phone else ""
     except Exception:
         knowledge, business, channel, caller = [], "", {}, ""

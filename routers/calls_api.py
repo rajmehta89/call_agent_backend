@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from timeutil import api_time, local_midnight_utc, utc_iso, utc_now
 from bson import ObjectId
 from mongo_client import mongo_client
+from voice_languages import normalize_language
 import realtime
 from call_status import schedule_auto_status
 
@@ -163,7 +164,7 @@ class LogCallRequest(BaseModel):
     call_data: Optional[Dict[str, Any]] = None
 
 
-def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", phone: str = "") -> Optional[str]:
+def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", phone: str = "", preferred_language: str = "en") -> Optional[str]:
     """Save the caller details collected before a browser test call starts."""
     if not mongo_client.is_connected():
         return None
@@ -172,6 +173,7 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
     clean_name = re.sub(r"\s+", " ", str(name or "").strip())[:120]
     clean_email = str(email or "").strip()[:180]
     clean_phone = re.sub(r"[^\d+]", "", str(phone or "").strip())[:40]
+    clean_language = normalize_language(preferred_language)
     now = utc_now()
     existing = mongo_client.leads.find_one({"$or": [{"browser_identity": identity}, {"phone": identity}]})
     if not existing and clean_phone:
@@ -180,6 +182,7 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
     values = {
         "browser_identity": identity,
         "updated_at": now,
+        "preferred_language": clean_language,
     }
     if clean_name:
         values["name"] = clean_name

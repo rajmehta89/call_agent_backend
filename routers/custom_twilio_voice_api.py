@@ -37,6 +37,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
 from routers.twilio_api import _build_conversation_twiml, _get_request_base_url
+from voice_languages import language_for_call, language_greeting, normalize_language
 
 logger = logging.getLogger(__name__)
 
@@ -61,17 +62,20 @@ def _to_ws_url(http_url: str) -> str:
     return base
 
 
-def _deepgram_url() -> str:
-    model = os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
+def _deepgram_url(language: str = "en") -> str:
+    code = normalize_language(language)
+    auto_language = os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
+    model = os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
     # Words callers say that speech recognition could get wrong (business, brand and product names), taken from the
     # knowledge automatically (voice_keyterms.py) plus any extras in .env. Nova-3 listens for them ("keyterm").
     keyterms = current_keyterms()
     return (
         "wss://api.deepgram.com/v1/listen?"
-        f"model={model}&encoding=mulaw&sample_rate=8000&channels=1"
+        f"model={model}&language={quote('multi' if auto_language else {'en': 'en-US', 'ar': 'ar', 'ur': 'ur'}.get(code, 'en-US'))}&encoding=mulaw&sample_rate=8000&channels=1"
         "&interim_results=true&smart_format=true&punctuate=true"
         f"&endpointing={os.getenv('CUSTOM_ENDPOINTING_MS', '500')}"
         f"&utterance_end_ms={os.getenv('CUSTOM_UTTERANCE_END_MS', '1000')}&vad_events=true"
+        + ("&language_hint=en&language_hint=ar&language_hint=ur" if auto_language else "")
         + "".join(f"&keyterm={quote(term)}" for term in keyterms[:50])
     )
 
@@ -89,17 +93,18 @@ def _env_number(name: str, default: float, low: float, high: float) -> float:
         return default
 
 
-def _flux_url() -> str:
+def _flux_url(language: str = "en") -> str:
     """Deepgram Flux (/v2/listen) for phone audio. Turn ends are decided by the model: EndOfTurn once its confidence
     reaches CUSTOM_FLUX_EOT_THRESHOLD (0.5-1.0), EagerEndOfTurn earlier at CUSTOM_FLUX_EAGER_THRESHOLD (0.3-0.9, the
     signal to start preparing the reply), and an EndOfTurn anyway after CUSTOM_FLUX_EOT_TIMEOUT_MS of silence."""
     eot = _env_number("CUSTOM_FLUX_EOT_THRESHOLD", 0.7, 0.5, 1.0)
     eager = min(eot, _env_number("CUSTOM_FLUX_EAGER_THRESHOLD", 0.4, 0.3, 0.9))  # Flux rejects eager > eot
     timeout_ms = int(_env_number("CUSTOM_FLUX_EOT_TIMEOUT_MS", 3000, 500, 60000))
-    model = os.getenv("CUSTOM_FLUX_MODEL", "flux-general-en").strip() or "flux-general-en"
+    code = normalize_language(language)
+    model = os.getenv(f"CUSTOM_FLUX_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_FLUX_MODEL", "flux-general-en").strip() or "flux-general-en"
     return (
         "wss://api.deepgram.com/v2/listen?"
-        f"model={model}&encoding=mulaw&sample_rate=8000"
+        f"model={model}&language={quote({'en': 'en-US', 'ar': 'ar', 'ur': 'ur'}.get(code, 'en-US'))}&encoding=mulaw&sample_rate=8000"
         f"&eot_threshold={eot}&eager_eot_threshold={eager}&eot_timeout_ms={timeout_ms}"
         + "".join(f"&keyterm={quote(term)}" for term in current_keyterms()[:50])
     )
@@ -179,12 +184,12 @@ async def _elevenlabs_speech(text: str) -> bytes:
     return b"".join([chunk async for chunk in _elevenlabs_stream(text)])
 
 
-async def _deepgram_tts_stream(text: str) -> AsyncIterator[bytes]:
+async def _deepgram_tts_stream(text: str, language: str = "en") -> AsyncIterator[bytes]:
     """Deepgram Aura-2 voice in the caller's format (mulaw/8k, no container), streamed over the kept-alive pool."""
     api_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Deepgram voice is not configured")
-    url = f"https://api.deepgram.com/v1/speak?model={deepgram_voice()}&encoding=mulaw&sample_rate=8000&container=none"
+    url = f"https://api.deepgram.com/v1/speak?model={deepgram_voice(language)}&encoding=mulaw&sample_rate=8000&container=none"
     try:
         gain_db = float(os.getenv("DEEPGRAM_TTS_GAIN_DB", "7"))
     except ValueError:
@@ -220,14 +225,15 @@ class _DeepgramSpeaker:
     open line: about 0.6-0.7 s to first audio, steadily, where a separate web request per sentence took 1-2 s from
     here. If the caller interrupts mid-sentence the line is dropped and reopened, so stale audio never plays later."""
 
-    def __init__(self) -> None:
+    def __init__(self, language: str = "en") -> None:
+        self.language = normalize_language(language)
         self.ws: Any = None
         self.lock = asyncio.Lock()
         self.closed = False
 
     async def _ensure(self) -> Any:
         if self.ws is None:
-            url = f"wss://api.deepgram.com/v1/speak?model={deepgram_voice()}&encoding=mulaw&sample_rate=8000"
+            url = f"wss://api.deepgram.com/v1/speak?model={deepgram_voice(self.language)}&encoding=mulaw&sample_rate=8000"
             self.ws = await websockets.connect(url, additional_headers={"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY', '').strip()}"},
                                                open_timeout=10, ping_interval=20)
         return self.ws
@@ -239,6 +245,13 @@ class _DeepgramSpeaker:
                 await ws.close()
             except Exception:
                 pass
+
+    async def set_language(self, language: str) -> None:
+        code = normalize_language(language)
+        if code == self.language:
+            return
+        self.language = code
+        await self._drop()
 
     async def warm(self) -> None:
         try:
@@ -298,13 +311,13 @@ async def _warm_tts_connection(engine: str) -> None:
         logger.debug("voice connection warm-up skipped: %s", error)
 
 
-def _tts_stream(text: str, engine: str) -> AsyncIterator[bytes]:
+def _tts_stream(text: str, engine: str, language: str = "en") -> AsyncIterator[bytes]:
     """Speech for one sentence from the voice chosen for this call ("deepgram" or "elevenlabs")."""
-    return _deepgram_tts_stream(text) if engine == "deepgram" else _elevenlabs_stream(text)
+    return _deepgram_tts_stream(text, language) if engine == "deepgram" else _elevenlabs_stream(text)
 
 
-async def _speech(text: str, engine: str) -> bytes:
-    return b"".join([chunk async for chunk in _tts_stream(text, engine)])
+async def _speech(text: str, engine: str, language: str = "en") -> bytes:
+    return b"".join([chunk async for chunk in _tts_stream(text, engine, language)])
 
 
 # Greeting and filler audio never change, so synthesize each phrase once per process.
@@ -388,7 +401,7 @@ def _next_chunk(pending: str, first: bool) -> Optional[re.Match]:
 
 
 async def _voice_sentences(services: AIServices, text: str, history: List[Dict[str, str]], caller: str, summary: str,
-                           bridge: str = "", verified_phone: str = "") -> AsyncIterator[str]:
+                           bridge: str = "", verified_phone: str = "", language: str = "en") -> AsyncIterator[str]:
     """Stream the reply and yield it one finished sentence at a time, so speech can start before the model is done.
     Uses the same voice prompt, knowledge search and reply guard as the Retell agent (routers/retell_api.py).
     bridge: the phrase being spoken right now ("Sure, let me check."); the reply continues from it."""
@@ -401,7 +414,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     places = place_note(text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(history))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    system = await asyncio.to_thread(_system_prompt, search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places))
+    system = await asyncio.to_thread(_system_prompt, search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places), language)
     if call_forwarding.forwarding_on():
         system += ("\n\n# Live team transfer on this call\n"
                    "A live transfer to the human team is available. If the caller asks to speak with the team now, "
@@ -500,29 +513,30 @@ def _filler_after_seconds() -> float:
         return 0.0
 
 
-def _audio_cache_key(text: str, engine: str) -> str:
-    voice = deepgram_voice() if engine == "deepgram" else os.getenv("ELEVENLABS_VOICE_ID", "")
-    return f"{engine}:{voice}:{text}"
+def _audio_cache_key(text: str, engine: str, language: str = "en") -> str:
+    voice = deepgram_voice(language) if engine == "deepgram" else os.getenv("ELEVENLABS_VOICE_ID", "")
+    return f"{engine}:{normalize_language(language)}:{voice}:{text}"
 
 
-async def _warm_audio_cache(texts: tuple[str, ...], engine: str) -> None:
+async def _warm_audio_cache(texts: tuple[str, ...], engine: str, language: str = "en") -> None:
     for text in texts:
-        key = _audio_cache_key(text, engine)
+        key = _audio_cache_key(text, engine, language)
         if key not in _cached_audio:
             try:
-                _cached_audio[key] = await _speech(text, engine)
+                _cached_audio[key] = await _speech(text, engine, language)
             except Exception as error:
                 logger.warning("could not pre-generate voice phrase %r: %s", text, error)
 
 
-def _greeting_text() -> str:
+def _greeting_text(language: str = "en") -> str:
     configured = os.getenv("CUSTOM_VOICE_GREETING", "").strip()
     if configured:
-        return configured
+        return configured if normalize_language(language) == "en" else language_greeting(language, configured)
     try:
-        return str(brain_service.channel_config("voice").get("greeting") or "").strip() or "Hello, how can I help you today?"
+        configured = str(brain_service.channel_config("voice").get("greeting") or "").strip() or "Hello, how can I help you today?"
+        return language_greeting(language, configured)
     except Exception:
-        return "Hello, how can I help you today?"
+        return language_greeting(language, "Hello, how can I help you today?")
 
 
 def _active_custom(providers: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -620,14 +634,16 @@ def _with_full_call_recording(twiml: str, base: str) -> str:
 async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
     providers = await asyncio.to_thread(provider_snapshot)
-    bind_call((await request.form()).get("CallSid"))
+    form = dict(await request.form())
+    call_language = language_for_call(form)
+    bind_call(form.get("CallSid"))
     call_forwarding.forwarding_on()  # refresh the cached switch before the first caller turn
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
-            return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(dict(await request.form())), _public_base(request)), media_type="text/xml")
+            return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(form), _public_base(request)), media_type="text/xml")
         except Exception as error:
             logger.error("retell routing failed, using default Twilio agent: %s", error)
-            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request)), _public_base(request)), media_type="text/xml")
+            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language), _public_base(request)), media_type="text/xml")
 
     custom = _active_custom(providers)
     if not custom["enabled"] or not custom["ready"]:
@@ -636,26 +652,26 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
             "custom voice unavailable (enabled=%s, missing=%s); using default Twilio ConversationRelay",
             custom["enabled"], custom["missing_configuration"],
         )
-        return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request)), _public_base(request)), media_type="text/xml")
+        return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language), _public_base(request)), media_type="text/xml")
 
-    form = dict(await request.form())
     base = _public_base(request)
     if not base.startswith(("https://", "http://")):
         raise HTTPException(status_code=503, detail="TWILIO_PUBLIC_BASE_URL is not configured")
-    stream_url = f"{_to_ws_url(base)}/api/custom-voice/media"
+    stream_url = f"{_to_ws_url(base)}/api/custom-voice/media?preferred_language={quote(call_language)}"
     caller = html.escape(str(form.get("From") or "unknown"), quote=True)
     call_sid = html.escape(str(form.get("CallSid") or ""), quote=True)
     logger.info("custom voice stack answering call %s from %s", call_sid, caller)
     # Twilio opens the media stream about a second from now: have the greeting audio ready by then.
     async def warm_greeting() -> None:
-        greeting = await asyncio.to_thread(_greeting_text)
-        await _warm_audio_cache((greeting,), custom_voice_engine())
+        greeting = await asyncio.to_thread(_greeting_text, call_language)
+        await _warm_audio_cache((greeting,), custom_voice_engine(), call_language)
 
     asyncio.create_task(warm_greeting())
     return PlainTextResponse(_with_full_call_recording(
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Connect><Stream url=\"" + html.escape(stream_url, quote=True) + "\">"
         f'<Parameter name="caller" value="{caller}" /><Parameter name="call_sid" value="{call_sid}" />'
+        f'<Parameter name="preferred_language" value="{html.escape(call_language, quote=True)}" />'
         f'<Parameter name="stream_token" value="{stream_token(str(form.get("CallSid") or ""))}" />'
         "</Stream></Connect></Response>", base),
         media_type="text/xml",
@@ -669,8 +685,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="Custom Twilio voice is disabled")
         return
     custom = _active_custom(await asyncio.to_thread(provider_snapshot))
+    preferred_language = normalize_language(websocket.query_params.get("preferred_language"))
     engine = custom_voice_engine()  # chosen once per call: "deepgram" or "elevenlabs"
-    speaker = _DeepgramSpeaker() if engine == "deepgram" else None  # one live voice line for the whole call
+    speaker = _DeepgramSpeaker(preferred_language) if engine == "deepgram" else None  # one live voice line for the whole call
     leveller = _level_matcher()  # one steady voice loudness for the whole call
     if not custom["ready"]:
         await websocket.close(code=1011, reason="Custom Twilio voice is not configured")
@@ -706,7 +723,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     heard_text = ""             # the caller's words so far in this turn (final parts + the latest partial)
     heard_changed_at = 0.0      # when those words last changed
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
-    flux = _use_flux()          # Deepgram Flux turn detection; falls back to Nova-3 if it cannot connect
+    auto_language = os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
+    flux = _use_flux() and not auto_language  # Nova-3 multilingual handles turn audio when callers can switch languages.
     forced_turn = ""            # the words of a Flux turn we already asked Flux to end (asked once per turn)
     forced_at = 0.0             # ForceEndTurn can go unanswered; then finish from the partial transcript.
     forced_fallback_text = ""
@@ -835,13 +853,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         # Accessing .text there raises ResponseNotRead and prevents the fallback.
         detail = f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError) else str(error)
         logger.warning("ElevenLabs voice failed (%s: %s); this call continues with the Deepgram voice", type(error).__name__, detail)
-        engine, speaker = "deepgram", _DeepgramSpeaker()
+        engine, speaker = "deepgram", _DeepgramSpeaker(preferred_language)
         # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
-        asyncio.create_task(_warm_audio_cache(ALL_BRIDGES if bridges_enabled() else (), engine))
+        asyncio.create_task(_warm_audio_cache(ALL_BRIDGES if bridges_enabled() else (), engine, preferred_language))
 
     async def speak(text: str, cache_key: str = "") -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
         nonlocal pending_mark, mark_count
+        if speaker:
+            await speaker.set_language(preferred_language)
         started = perf_counter()
         first_audio = 0.0
         cached = _cached_audio.get(cache_key) if cache_key else None
@@ -888,7 +908,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             phone = caller if caller.startswith("+") else "unknown"
             await asyncio.gather(
                 asyncio.to_thread(warm_model_connection, services),
-                asyncio.to_thread(_system_prompt, "hello", phone, ""),
+                asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
             )
@@ -903,9 +923,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             # This turn needs the knowledge search and the main model (~1.5 s): a short, fitting phrase ("Sure, let me
             # check.") is said while they run, so the caller hears someone is there. Only recorded phrases (instant).
             candidate = bridge_phrase(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
-            if candidate and _audio_cache_key(candidate, engine) in _cached_audio:
+            if candidate and _audio_cache_key(candidate, engine, preferred_language) in _cached_audio:
                 bridge = candidate
-        sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge, contact_phone).__aiter__()
+        sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge, contact_phone, preferred_language).__aiter__()
         return {"text": text, "bridge": bridge, "sentences": sentences, "first": asyncio.ensure_future(sentences.__anext__()),
                 "started": perf_counter()}
 
@@ -965,27 +985,27 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     filler_spoken = True
                     spoken.append(bridge)
                     spoke_at = utc_iso()
-                    await speak(bridge, cache_key=_audio_cache_key(bridge, engine))  # the answer is being prepared meanwhile
+                    await speak(bridge, cache_key=_audio_cache_key(bridge, engine, preferred_language))  # the answer is being prepared meanwhile
                 filler_after = 0.0
             status_wait = status_after_seconds() - (perf_counter() - heard_at)
             if bridges_enabled() and status_wait > 0 and not first.done():
                 # A long wait: one real status update, said only if the answer still has not started.
                 done, _ = await asyncio.wait({first}, timeout=status_wait)
                 status = "" if done else status_phrase(recent_bridges[-3:])
-                if status and _audio_cache_key(status, engine) in _cached_audio:
+                if status and _audio_cache_key(status, engine, preferred_language) in _cached_audio:
                     recent_bridges.append(status)
                     filler_spoken = True
                     spoken.append(status)
                     spoke_at = spoke_at or utc_iso()
-                    await speak(status, cache_key=_audio_cache_key(status, engine))
+                    await speak(status, cache_key=_audio_cache_key(status, engine, preferred_language))
             if filler_after:
                 done, _ = await asyncio.wait({first}, timeout=filler_after)
                 filler = _FILLERS[filler_index % len(_FILLERS)]
-                if not done and _audio_cache_key(filler, engine) in _cached_audio:
+                if not done and _audio_cache_key(filler, engine, preferred_language) in _cached_audio:
                     # Acknowledge the caller instead of leaving dead air while the brain works.
                     filler_index += 1
                     filler_spoken = True
-                    await speak(filler, cache_key=_audio_cache_key(filler, engine))
+                    await speak(filler, cache_key=_audio_cache_key(filler, engine, preferred_language))
             try:
                 sentence = await first
                 if filler_spoken:
@@ -1182,6 +1202,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     embedding_task: Optional[asyncio.Task[Any]] = None
 
     async def receive_transcripts(connection: Any) -> None:
+        nonlocal preferred_language
         nonlocal embedding_task
         async for raw in connection:
             try:
@@ -1203,6 +1224,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if kind != "Results":
                     continue
                 alternative = ((payload.get("channel") or {}).get("alternatives") or [{}])[0]
+                detected_languages = alternative.get("languages") or []
+                if auto_language and detected_languages:
+                    detected = normalize_language(detected_languages[0])
+                    if detected in {"en", "ar", "ur"}:
+                        preferred_language = detected
                 text = str(alternative.get("transcript") or "").strip()
                 if not text:
                     # Deepgram can end a turn with an empty final transcript for a short word it showed in the partial
@@ -1238,14 +1264,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         connection = None
         if flux:
             try:
-                connection = await websockets.connect(_flux_url(), additional_headers=headers, open_timeout=12, ping_interval=20)
+                connection = await websockets.connect(_flux_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20)
                 logger.info("custom voice: listening with Deepgram Flux (turn detection by the model)")
             except Exception as error:
                 # e.g. Flux not enabled on the Deepgram account: the call still works with Nova-3.
                 logger.warning("custom voice: Deepgram Flux unavailable (%s); using Nova-3", error)
                 flux = False
         if connection is None:
-            connection = await websockets.connect(_deepgram_url(), additional_headers=headers, open_timeout=12, ping_interval=20)
+            connection = await websockets.connect(_deepgram_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20)
         while audio_backlog:
             await connection.send(audio_backlog.pop(0))
         deepgram = connection
@@ -1266,25 +1292,26 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         call_sid = str(start.get("callSid") or "")
                         params = start.get("customParameters") or {}
                         caller = str(params.get("caller") or caller)
+                        preferred_language = normalize_language(params.get("preferred_language"))
                         call_sid = str(params.get("call_sid") or call_sid)
                         bind_call(call_sid)
                         if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
                             await websocket.close(code=1008)
                             return
-                        greeting = await asyncio.to_thread(_greeting_text)
+                        greeting = await asyncio.to_thread(_greeting_text, preferred_language)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)
                         responses.append({"content": greeting, "timestamp": utc_iso()})
                         memory.add_assistant(greeting)
                         save_progress()
-                        reply_task = asyncio.create_task(speak(greeting, cache_key=_audio_cache_key(greeting, engine)))
+                        reply_task = asyncio.create_task(speak(greeting, cache_key=_audio_cache_key(greeting, engine, preferred_language)))
                         asyncio.create_task(warm_call())
                         reply_task.add_done_callback(log_reply_failure)
                         # Record the bridge phrases and fillers in this call's voice while the greeting plays, so
                         # they can be said instantly.
                         phrases = (*(ALL_BRIDGES if bridges_enabled() else ()), *(_FILLERS if _filler_after_seconds() else ()))
                         if phrases:
-                            asyncio.create_task(_warm_audio_cache(phrases, engine))
+                            asyncio.create_task(_warm_audio_cache(phrases, engine, preferred_language))
                     elif event == "media":
                         encoded = ((message.get("media") or {}).get("payload") or "")
                         if encoded:

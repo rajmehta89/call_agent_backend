@@ -28,6 +28,7 @@ from twilio_security import verify_twilio_request
 load_project_env()
 
 from auth_service import can_assign_conversations, require_permission, require_user
+from voice_languages import normalize_language
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_permission("manage_assigned_leads"))])  # dashboard API: sign-in required for every route
@@ -45,6 +46,7 @@ class Lead(BaseModel):
     email: Optional[str] = ""
     company: Optional[str] = ""
     notes: Optional[str] = ""
+    preferred_language: str = "en"
     status: str = "new"
     call_attempts: int = 0
     last_call: Optional[datetime] = None
@@ -59,6 +61,7 @@ class LeadUpdate(BaseModel):
     email: Optional[str] = None
     company: Optional[str] = None
     notes: Optional[str] = None
+    preferred_language: Optional[str] = None
     status: Optional[str] = None
 
 
@@ -213,6 +216,7 @@ def add_lead(lead_data: Dict[str, Any], owner: Optional[str] = None):
         "email": lead_data.get("email", ""),
         "company": lead_data.get("company", ""),
         "notes": lead_data.get("notes", ""),
+        "preferred_language": normalize_language(lead_data.get("preferred_language")),
         "status": "new",
         "call_attempts": 0,
         "last_call": None,
@@ -236,7 +240,10 @@ def update_lead(lead_id: str, lead_data: Dict[str, Any], scope: Dict[str, Any] |
         if duplicate:
             raise HTTPException(status_code=400, detail={"success": False, "error": "Phone number already exists"})
 
-    update: Dict[str, Any] = {"$set": {**lead_data, "updated_at": utc_now()}}
+    cleaned_data = dict(lead_data)
+    if "preferred_language" in cleaned_data:
+        cleaned_data["preferred_language"] = normalize_language(cleaned_data["preferred_language"])
+    update: Dict[str, Any] = {"$set": {**cleaned_data, "updated_at": utc_now()}}
     if lead_data.get("assigned_to") == "":
         update["$set"].pop("assigned_to")
         update["$unset"] = {"assigned_to": ""}
@@ -345,6 +352,7 @@ async def upload_leads_csv(file: UploadFile = File(...), user: Dict[str, Any] = 
                     "email": row.get("email", "").strip(),
                     "company": row.get("company", "").strip(),
                     "notes": row.get("notes", "").strip(),
+                    "preferred_language": normalize_language(row.get("preferred_language")),
                     "status": "new",
                     "call_attempts": 0,
                     "last_call": None,
@@ -521,6 +529,7 @@ async def receive_inbound_sms(request: Request):
             "email": "",
             "company": "",
             "notes": "Created from an inbound SMS.",
+            "preferred_language": "en",
             "status": "new",
             "source": "sms",
             "call_attempts": 0,

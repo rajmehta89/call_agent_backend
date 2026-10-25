@@ -87,6 +87,7 @@ class ProfilePayload(BaseModel):
     company: Optional[str] = Field(default=None, max_length=160)
     address: Optional[str] = Field(default=None, max_length=300)
     tags: Optional[List[str]] = None
+    preferred_language: Optional[str] = Field(default=None, max_length=12)
 
 
 class MessageEditPayload(BaseModel):
@@ -556,7 +557,10 @@ def update_profile(key: str, payload: ProfilePayload, user: Dict[str, Any] = Dep
         return {"success": True}
     now = utc_now()
     lead_id = next((str(call["lead_id"]) for call in calls if call.get("lead_id") and ObjectId.is_valid(str(call["lead_id"]))), None)
-    lead_fields = {field: changes[field] for field in ("name", "phone", "email", "company") if field in changes}
+    lead_fields = {field: changes[field] for field in ("name", "phone", "email", "company", "preferred_language") if field in changes}
+    if "preferred_language" in lead_fields:
+        from voice_languages import normalize_language
+        lead_fields["preferred_language"] = normalize_language(lead_fields["preferred_language"])
     if lead_id and lead_fields:
         mongo_client.leads.update_one({"_id": ObjectId(lead_id)}, {"$set": {**lead_fields, "updated_at": now}})
     lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}, {"phone": 1}) if lead_id else None
@@ -618,7 +622,7 @@ def _profile(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     lead = (mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id else None) or {}
     phone = lead.get("phone") or calls[-1].get("phone_number")
     customer = (mongo_client.customers.find_one({"phone": phone}) if phone else None) or {}
-    return {"name": lead.get("name") or customer.get("name"), "phone": phone, "email": lead.get("email") or customer.get("email"), "company": lead.get("company"),
+    return {"name": lead.get("name") or customer.get("name"), "phone": phone, "email": lead.get("email") or customer.get("email"), "company": lead.get("company"), "preferred_language": lead.get("preferred_language") or "en",
             "address": customer.get("location"), "tags": customer.get("tags") or [],
             "source": lead.get("source") or ("Web call" if str(phone or "").startswith("client:") else "Phone"),
             "lead_status": lead.get("status") or customer.get("lead_status"), "created_at": _utc(lead.get("created_at") or customer.get("created_at") or _when(calls[0])),

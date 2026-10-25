@@ -41,8 +41,11 @@ def custom_voice_engine() -> str:
     return "deepgram" if provider_enabled("custom_deepgram") else "elevenlabs"
 
 
-def deepgram_voice() -> str:
-    return os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-theia-en").strip() or "aura-2-theia-en"
+def deepgram_voice(language: str = "en") -> str:
+    """Return the configured Aura voice for a call language, with English as the safe fallback."""
+    code = str(language or "en").strip().lower()
+    variable = {"ar": "DEEPGRAM_TTS_VOICE_AR", "ur": "DEEPGRAM_TTS_VOICE_UR"}.get(code, "DEEPGRAM_TTS_VOICE")
+    return os.getenv(variable, "").strip() or os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-theia-en").strip() or "aura-2-theia-en"
 
 
 def _load_controls() -> Dict[str, bool]:

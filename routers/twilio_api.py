@@ -30,6 +30,7 @@ from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
 from conversation_memory import ConversationMemory
+from voice_languages import language_config, language_for_call, language_greeting, normalize_language
 import call_forwarding
 
 load_project_env()
@@ -81,14 +82,21 @@ def _get_request_base_url(request: Request) -> str:
 RELAY_TOKEN_SUBJECT = "conversation-relay"
 
 
-def _build_conversation_twiml(public_base_url: Optional[str] = None) -> str:
+def _build_conversation_twiml(public_base_url: Optional[str] = None, language: str = "en") -> str:
     ws_url = f"{_get_ws_base_url(public_base_url)}/api/twilio/ws"
-    greeting = html.escape(agent_config.get_greeting_message(), quote=True)
+    selected = language_config(language)
+    greeting = html.escape(language_greeting(selected["code"], agent_config.get_greeting_message()), quote=True)
+    language_nodes = "".join(
+        f'<Language code="{item["locale"]}" ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" />'
+        for item in (language_config("en"), language_config("ar"), language_config("ur"))
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Connect>"
-        f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" language="{TWILIO_CONVERSATION_LANG}">'
+        f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" '
+        f'ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" ttsLanguage="multi" transcriptionLanguage="multi">{language_nodes}'
+        f'<Parameter name="preferred_language" value="{selected["code"]}" />'
         f'<Parameter name="stream_token" value="{stream_token(RELAY_TOKEN_SUBJECT)}" />'
         "</ConversationRelay>"
         "</Connect>"
@@ -221,11 +229,13 @@ async def twilio_config() -> Dict[str, Any]:
     }
 
 
-async def _send_text(websocket: WebSocket, text: str, last: bool = True):
+async def _send_text(websocket: WebSocket, text: str, last: bool = True, language: str = "en"):
+    locale = language_config(language)["locale"]
     await websocket.send_text(json.dumps({
         "type": "text",
         "token": text,
         "last": last,
+        "lang": locale,
         "interruptible": True,
         "preemptible": True,
     }))
@@ -308,6 +318,7 @@ async def browser_token(request: Request, user: Dict[str, Any] = Depends(require
         request.query_params.get("caller_name", ""),
         request.query_params.get("caller_email", ""),
         request.query_params.get("caller_phone", ""),
+        request.query_params.get("caller_language", "en"),
     )
     twilio_now = int(time.time() + await _twilio_clock_offset())
     token = AccessToken(
@@ -383,6 +394,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
         "phone_number": "unknown",
         "direction": "inbound",
         "lead_id": None,
+        "preferred_language": "en",
         "started_at": utc_now(),
         "transfer_attempted": False,
         "transfer_succeeded": False,
@@ -407,6 +419,10 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 bind_call(session["call_sid"])
                 session["phone_number"] = data.get("from") or "unknown"
                 session["direction"] = data.get("direction") or "inbound"
+                custom_parameters = data.get("customParameters") or {}
+                session["preferred_language"] = normalize_language(
+                    custom_parameters.get("preferred_language") or language_for_call({"From": session["phone_number"]})
+                )
                 outbound_context = get_outbound_call_context(session["call_sid"])
                 if outbound_context:
                     session["phone_number"] = outbound_context.get("phone_number") or session["phone_number"]
@@ -435,6 +451,15 @@ async def twilio_conversation_ws(websocket: WebSocket):
             if not caller_text:
                 continue
 
+            detected_language = str(data.get("lang") or "").strip()
+            if detected_language:
+                session["preferred_language"] = normalize_language(detected_language)
+                await websocket.send_text(json.dumps({
+                    "type": "language",
+                    "ttsLanguage": language_config(session["preferred_language"])["locale"],
+                    "transcriptionLanguage": "multi",
+                }))
+
             timestamp = utc_iso()
             user_transcript.append({"content": caller_text, "timestamp": timestamp})
             transfer_service.append_message(session["session_id"], "user", caller_text)
@@ -458,7 +483,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 )
                 ai_responses.append({"content": handoff_text, "timestamp": utc_iso()})
                 transfer_service.append_message(session["session_id"], "assistant", handoff_text)
-                await _send_text(websocket, handoff_text)
+                await _send_text(websocket, handoff_text, language=session.get("preferred_language", "en"))
 
                 client = _get_twilio_client()
                 transfer_settings = _get_transfer_settings()
@@ -537,7 +562,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 exit_text = bot.get_exit_message()
                 ai_responses.append({"content": exit_text, "timestamp": utc_iso()})
                 transfer_service.append_message(session["session_id"], "assistant", exit_text)
-                await _send_text(websocket, exit_text)
+                await _send_text(websocket, exit_text, language=session.get("preferred_language", "en"))
                 break
 
             reply = brain_service.respond(
@@ -546,12 +571,13 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 channel="voice",
                 customer_phone=session.get("phone_number"),
                 summary=memory.summary,
+                    language=session.get("preferred_language"),
             ) or "I'm sorry, the AI service is not available right now."
             memory.add(caller_text, reply)
             history = memory.history()
             ai_responses.append({"content": reply, "timestamp": utc_iso()})
             transfer_service.append_message(session["session_id"], "assistant", reply)
-            await _send_text(websocket, reply)
+            await _send_text(websocket, reply, language=session.get("preferred_language", "en"))
 
     except WebSocketDisconnect:
         pass

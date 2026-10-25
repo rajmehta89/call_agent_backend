@@ -1110,8 +1110,11 @@ class BrainService:
             return f"The live store lookup failed just now ({exc}). Say you could not check the store and offer a follow-up.", "shopify_error"
         return "", None
 
-    def system_context(self, channel: str, customer_phone: Optional[str], live_context: str = "", retrieved_knowledge: Optional[List[Dict[str, Any]]] = None, conversation_summary: str = "") -> str:
+    def system_context(self, channel: str, customer_phone: Optional[str], live_context: str = "", retrieved_knowledge: Optional[List[Dict[str, Any]]] = None, conversation_summary: str = "", language: Optional[str] = None) -> str:
         channel_config = self.channel_config(channel)
+        if language:
+            from voice_languages import language_label, normalize_language
+            channel_config = {**channel_config, "language": language_label(normalize_language(language))}
         instructions = str(channel_config.get("instructions") or "").strip()
         # The base business prompt is already the model's system prompt; only add channel-specific overrides.
         if instructions == agent_config.get_system_prompt().strip():
@@ -1161,7 +1164,7 @@ class BrainService:
         previous = [str(item.get("content") or "") for item in (history or []) if item.get("role") == "user"]
         return " ".join([*previous[-1:], user_input]).strip()
 
-    def respond(self, user_input: str, history: Optional[List[Dict[str, str]]] = None, channel: str = "whatsapp", customer_phone: Optional[str] = None, summary: str = "") -> Optional[str]:
+    def respond(self, user_input: str, history: Optional[List[Dict[str, str]]] = None, channel: str = "whatsapp", customer_phone: Optional[str] = None, summary: str = "", language: Optional[str] = None) -> Optional[str]:
         started = perf_counter()
         # Cap history by size, not just message count, so long pasted messages cannot bloat every turn.
         history = bounded_history(history)
@@ -1186,7 +1189,7 @@ class BrainService:
             raw_response = qa.get_response(
                 user_input,
                 history or [],
-                self.system_context(channel, customer_phone, live_context, retrieved_knowledge, summary),
+                self.system_context(channel, customer_phone, live_context, retrieved_knowledge, summary, language),
                 final_instructions=VOICE_REPLY_CHECKLIST if channel == "voice" else "",
             )
             rendered = render_response(raw_response, channel)
