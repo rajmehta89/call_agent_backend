@@ -115,16 +115,23 @@ TWILIO_DEFAULT_REGION=AU
 TWILIO_PUBLIC_BASE_URL=https://your-public-ngrok-domain.ngrok-free.app
 TWILIO_CONVERSATION_LANG=en-US
 TWILIO_HUMAN_AGENT_NUMBER=+1xxxxxxxxxx
+TWILIO_VALIDATE_SIGNATURES=true
 
 # Optional self-managed voice route: Twilio Media Streams -> Deepgram -> AI Brain -> ElevenLabs.
 # Keep false until the credentials below are configured. Route the Twilio number to
 # /api/custom-voice/inbound only when you want this path rather than Retell.
 CUSTOM_TWILIO_VOICE_ENABLED=false
 DEEPGRAM_API_KEY=
+DEEPGRAM_TTS_VOICE=aura-2-thalia-en
+DEEPGRAM_TTS_VOICE_UR=flux-ambreen-ur
+CUSTOM_AUTO_LANGUAGE=true
+CUSTOM_STT=flux
 CUSTOM_DEEPGRAM_MODEL=nova-3
 ELEVENLABS_API_KEY=
 ELEVENLABS_VOICE_ID=
-ELEVENLABS_MODEL_ID=eleven_flash_v2_5
+ELEVENLABS_VOICE_AR=
+ELEVENLABS_VOICE_UR=
+ELEVENLABS_MODEL_ID=eleven_v4_turbo
 
 # WhatsApp: auto selects Meta direct Cloud API first, then Twilio WhatsApp.
 # Set WHATSAPP_PROVIDER=meta or twilio to force one path.

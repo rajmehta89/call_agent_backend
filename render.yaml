@@ -17,7 +17,37 @@ services:
         value: https://moxper.vercel.app
       - key: AUTH_SECRET
         sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: TWILIO_PUBLIC_BASE_URL
+        sync: false
       - key: TWILIO_SMS_FROM
         sync: false
       - key: TWILIO_DEFAULT_REGION
         value: AU
+      - key: TWILIO_VALIDATE_SIGNATURES
+        value: "true"
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: DEEPGRAM_TTS_VOICE
+        value: aura-2-thalia-en
+      - key: DEEPGRAM_TTS_VOICE_UR
+        value: flux-ambreen-ur
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        value: EXAVITQu4vr4xnSDxMaL
+      - key: ELEVENLABS_VOICE_AR
+        value: EXAVITQu4vr4xnSDxMaL
+      - key: ELEVENLABS_VOICE_UR
+        value: EXAVITQu4vr4xnSDxMaL
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_v4_turbo
+      - key: CUSTOM_AUTO_LANGUAGE
+        value: "true"
+      - key: CUSTOM_STT
+        value: flux

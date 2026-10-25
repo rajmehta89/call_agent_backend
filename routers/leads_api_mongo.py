@@ -111,7 +111,7 @@ def _lead_sms_number(value: str) -> str:
 
 
 def _sms_media_public_base() -> str:
-    return (os.getenv("TWILIO_PUBLIC_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    return (os.getenv("TWILIO_PUBLIC_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
 
 
 @router.post("/{lead_id}/sms-media")
