@@ -114,9 +114,12 @@ def sync_retell(base: str, check: bool) -> str:
         return "Retell agent: ok"
     if check:
         return "Retell agent: stale"
-    httpx.patch(f"https://api.retellai.com/update-agent/{agent_id}", headers=headers, timeout=20,
-                json={"response_engine": {"type": "custom-llm", "llm_websocket_url": wanted}, "webhook_url": webhook}).raise_for_status()
-    httpx.post(f"https://api.retellai.com/publish-agent/{agent_id}", headers=headers, timeout=20).raise_for_status()
+    updated = httpx.patch(f"https://api.retellai.com/update-agent/{agent_id}", headers=headers, timeout=20,
+                          json={"response_engine": {"type": "custom-llm", "llm_websocket_url": wanted}, "webhook_url": webhook})
+    updated.raise_for_status()
+    version = (updated.json() or {}).get("version")
+    publish = {"version": version} if version else {}
+    httpx.post(f"https://api.retellai.com/publish-agent/{agent_id}", headers=headers, json=publish, timeout=20).raise_for_status()
     return "Retell agent: updated and published"
 
 
