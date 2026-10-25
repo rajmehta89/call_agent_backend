@@ -57,7 +57,7 @@ class FakeDeepgram:
 def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0):
     starts, finished = [], []
 
-    async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone=""):
+    async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en"):
         starts.append((round(time.perf_counter() - t0, 2), text))
         try:
             await asyncio.sleep(0.6)  # the model thinking
@@ -66,7 +66,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
         except asyncio.CancelledError:
             raise
 
-    async def fake_tts(text, engine):
+    async def fake_tts(text, engine, language="en"):
         yield b"\xff" * 160
 
     async def fake_connect(*args, **kwargs):
@@ -100,6 +100,9 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     monkeypatch.setenv("CUSTOM_FILLER_AFTER_SECONDS", "0")
     monkeypatch.setenv("CUSTOM_SPECULATE_AFTER_MS", "250")
     monkeypatch.setenv("CUSTOM_STT", stt)
+    # Flux is only selected when automatic language detection is off; mirror
+    # the production switch explicitly so these tests exercise the Flux path.
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "false" if stt == "flux" else "true")
 
     app = FastAPI()
     app.include_router(custom.router)
@@ -226,11 +229,17 @@ def test_when_elevenlabs_cuts_off_the_call_carries_on_with_the_deepgram_voice(mo
     import httpx
     spoken = []
 
-    async def elevenlabs_out_of_credits(text, engine):
+    async def elevenlabs_out_of_credits(text, engine, language="en"):
         yield b"\xff" * 160  # part of the sentence played, then the stream was cut
         raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
 
     class FakeDeepgramVoice:
+        def __init__(self, language="en"):
+            self.language = language
+
+        async def set_language(self, language):
+            self.language = language
+
         async def stream(self, text):
             spoken.append(text)
             yield b"\xff" * 160
