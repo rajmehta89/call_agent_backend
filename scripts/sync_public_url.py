@@ -5,6 +5,7 @@ Run after starting ngrok; only out-of-date settings are changed.
 
     python scripts/sync_public_url.py              # discover the URL from ngrok's local API
     python scripts/sync_public_url.py https://x.ngrok-free.app
+    python scripts/sync_public_url.py --browser-only # update local .env and local browser app only
     python scripts/sync_public_url.py --local-only # update local .env without touching providers
     python scripts/sync_public_url.py --check      # report only, change nothing
 """
@@ -51,7 +52,7 @@ def update_env_file(base: str, check: bool) -> str:
     return "updated"
 
 
-def sync_twilio(base: str, check: bool) -> list[str]:
+def sync_browser_app(base: str, check: bool) -> list[str]:
     from twilio.rest import Client
 
     sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
@@ -71,6 +72,18 @@ def sync_twilio(base: str, check: bool) -> list[str]:
         else:
             client.applications(app_sid).update(voice_url=wanted, voice_method="POST", status_callback=status_url, status_callback_method="POST")
             report.append("Twilio browser app: updated")
+    return report
+
+
+def sync_twilio(base: str, check: bool) -> list[str]:
+    from twilio.rest import Client
+
+    report = sync_browser_app(base, check)
+    sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        return report
+    client = Client(sid, token)
+    status_url = f"{base}/api/twilio/status"
 
     number = (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
     wanted = f"{base}/api/custom-voice/inbound"  # single router: Retell / custom stack / default agent
@@ -112,11 +125,21 @@ def main() -> int:
     parser.add_argument("url", nargs="?", help="public https URL; defaults to the running ngrok tunnel")
     parser.add_argument("--check", action="store_true", help="report what is out of date without changing it")
     parser.add_argument("--local-only", action="store_true", help="update only local .env; leave production provider webhooks intact")
+    parser.add_argument("--browser-only", action="store_true", help="update local .env and the separate local browser app; leave the production number and Retell intact")
     args = parser.parse_args()
+    if args.local_only and args.browser_only:
+        parser.error("--local-only and --browser-only cannot be combined")
+    if args.browser_only:
+        local_app = os.getenv("TWILIO_BROWSER_TWIML_APP_SID", "").strip()
+        production_app = os.getenv("TWILIO_PRODUCTION_BROWSER_TWIML_APP_SID", "").strip()
+        if not local_app or not production_app or local_app == production_app:
+            parser.error("configure distinct local and production browser TwiML app SIDs in local .env")
     base = (args.url or ngrok_url()).rstrip("/")
     print(f"Public URL: {base}")
     results = [f".env TWILIO_PUBLIC_BASE_URL: {update_env_file(base, args.check)}"]
-    steps = () if args.local_only else (lambda: sync_twilio(base, args.check), lambda: [sync_retell(base, args.check)])
+    steps = (() if args.local_only else
+             (lambda: sync_browser_app(base, args.check),) if args.browser_only else
+             (lambda: sync_twilio(base, args.check), lambda: [sync_retell(base, args.check)]))
     for step in steps:
         try:
             results.extend(step())

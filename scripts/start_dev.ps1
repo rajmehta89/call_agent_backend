@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Safe to run again at any time: it stops stale servers on ports 8000/3000 (Python or Node only),
-  reuses a running ngrok tunnel and waits until everything answers. Provider webhooks are only
-  redirected to this PC with -SyncProviderWebhooks, so a restart cannot break production calls.
+  reuses a running ngrok tunnel and waits until everything answers. The separate local browser
+  TwiML app follows ngrok; the production phone number and Retell agent stay on Render.
 
   Logs:  backend  call_agent_backend\logs\app.log   (follow with scripts\tail_logs.ps1)
          frontend call_agent_frontend\logs\dev.log
@@ -14,7 +14,7 @@
   Set NGROK_DOMAIN in call_agent_backend\.env to a free static ngrok domain so the URL never changes.
 
 .EXAMPLE
-  .\scripts\start_dev.ps1            # start or restart everything
+  .\scripts\start_dev.ps1            # start or restart local browser calling
   .\scripts\start_dev.ps1 -SyncProviderWebhooks  # route Twilio and Retell to this PC for local call tests
   .\scripts\start_dev.ps1 -Stop      # stop backend, frontend and ngrok
 #>
@@ -136,9 +136,10 @@ if ($publicUrl) {
         Write-Step 'Pointing Twilio and Retell at the local public URL'
         Invoke-Native { & $python $syncScript $publicUrl } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
     } else {
-        Write-Step 'Updating local public URL without changing production webhooks'
-        Invoke-Native { & $python $syncScript $publicUrl --local-only } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
+        Write-Step 'Updating local public URL and local browser app only'
+        Invoke-Native { & $python $syncScript $publicUrl --browser-only } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
     }
+    if ($LASTEXITCODE -ne 0) { throw 'Could not update local browser calling. Check the Twilio app SIDs in backend .env.' }
 }
 
 try {
