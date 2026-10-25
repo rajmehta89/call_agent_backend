@@ -407,7 +407,8 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                    "A live transfer to the human team is available. If the caller asks to speak with the team now, "
                    "do not say calls are unavailable or offer a callback instead. Do not ask for a name or phone number "
                    "before a live transfer. The call system connects them; a callback needs contact details only when "
-                   "the caller explicitly wants the team to call later.")
+                   "the caller explicitly wants the team to call later. The call system announces and starts a live "
+                   "transfer separately. In an ordinary AI reply, never claim a transfer is already happening.")
     prompt_ms = (perf_counter() - started) * 1000
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()

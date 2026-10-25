@@ -241,6 +241,32 @@ def test_production_embedding_score_accepts_the_recorded_live_request(monkeypatc
     assert call_forwarding.handoff_intent("Is there anything possible, like, you can call now?") == "live"
 
 
+def test_live_request_wins_a_close_callback_embedding_tie(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
+        ("callback", 0.597), ("live", 0.593), ("unclear", 0.554), ("other", 0.357)])
+    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="": "live")
+    assert call_forwarding.handoff_intent("Can you arrange a call to the teammate now?") == "live"
+
+
+def test_later_callback_keeps_its_intent_when_scores_are_distinct(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
+        ("callback", 0.743), ("live", 0.609), ("unclear", 0.527), ("other", 0.52)])
+    assert call_forwarding.handoff_intent("Can someone call me back tomorrow?") == "callback"
+
+
+def test_close_tie_can_still_be_a_later_callback(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
+        ("live", 0.766), ("callback", 0.765), ("unclear", 0.74), ("other", 0.458)])
+    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="": "callback")
+    assert call_forwarding.handoff_intent("Can you arrange a call tomorrow so I can talk with him?") == "callback"
+
+
 def test_explicit_request_to_take_current_call_is_live_transfer():
     assert call_forwarding.wants_person("Okay. No. I want someone to pick my call now.")
     assert call_forwarding.wants_person("No. Not more. Could you arrange a call to your")

@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from functools import lru_cache
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -192,6 +193,14 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
     scores = dict(ranked)
     live, callback = scores["live"], scores["callback"]
     unclear, other = scores["unclear"], scores["other"]
+    # Embeddings sometimes put "arrange a call now" and "arrange a call tomorrow"
+    # almost on top of each other. Ask a small language model to resolve only
+    # that close live/callback tie, preserving the rest of the fast classifier.
+    if max(live, callback) >= HANDOFF_ACTION.min_score and abs(live - callback) <= 0.02 and unclear <= max(live, callback) + 0.03:
+        decided = _adjudicate_handoff(caller_text, earlier)
+        if decided:
+            return decided
+        return "unclear"  # ask now-or-later instead of guessing after a provider error
     if live >= HANDOFF_ACTION.min_score and live >= callback + 0.025 and live >= unclear - 0.02 and live >= other + 0.02:
         result = "live"
     elif callback >= HANDOFF_ACTION.min_score and callback >= live + 0.02 and callback >= unclear + 0.02 and callback >= other + 0.02:
@@ -202,6 +211,31 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
         result = ""
     logger.debug("handoff intent %r -> %s (%s)", caller_text[:80], result or "other", ", ".join(f"{k} {v:.2f}" for k, v in ranked))
     return result
+
+
+@lru_cache(maxsize=256)
+def _adjudicate_handoff(caller_text: str, earlier: str = "") -> str:
+    """Resolve an embedding tie using the actual caller wording and context."""
+    try:
+        from ai_services import AIServices
+        services = AIServices()
+        model = os.getenv("HANDOFF_CLASSIFIER_MODEL") or ("openai/gpt-4.1-mini" if services.provider == "openrouter" else "gpt-4.1-mini")
+        message = f"Earlier caller request: {earlier}\nCurrent caller turn: {caller_text}" if earlier else caller_text
+        response = services.openai_client.with_options(timeout=6).chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Classify whether the caller wants to speak with a human team member. "
+                 "Reply with exactly one word: LIVE, CALLBACK, UNCLEAR, or OTHER. "
+                 "LIVE means connect during this ongoing phone call. CALLBACK means the team should contact them later. "
+                 "UNCLEAR means a human is requested but timing is not clear. OTHER means no human is requested. "
+                 "Read the caller's meaning and timing, even when the wording is indirect."},
+                {"role": "user", "content": message},
+            ], max_tokens=8, temperature=0)
+        answer = (response.choices[0].message.content or "").strip().lower()
+        return answer if answer in {"live", "callback", "unclear", "other"} else ""
+    except Exception as error:
+        logger.warning("handoff tie check failed: %s", error)
+        return ""
 
 
 def wants_person(caller_text: str, earlier: str = "") -> bool:
