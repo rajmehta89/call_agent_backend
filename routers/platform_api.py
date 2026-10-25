@@ -1205,7 +1205,7 @@ def get_team_performance(days: int = Query(30, ge=0, le=365), user: Dict[str, An
         str(row["_id"]): {
             "id": str(row["_id"]), "name": row.get("name") or row.get("email", ""), "email": row.get("email", ""),
             "role": row.get("role", "agent"), "assigned_conversations": 0, "assigned_calls": 0,
-            "handled_calls": 0, "follow_ups": 0, "open_tasks": 0, "won": 0, "assigned_leads": 0,
+            "handled_calls": 0, "closed_conversations": 0, "follow_ups": 0, "open_tasks": 0, "won": 0, "assigned_leads": 0,
             "last_activity": None,
         }
         for row in member_rows
@@ -1233,6 +1233,8 @@ def get_team_performance(days: int = Query(30, ge=0, le=365), user: Dict[str, An
         thread_owners[str(thread["_id"])] = owner
         if in_range(thread.get("assigned_at") or thread.get("updated_at")):
             metrics[owner]["assigned_conversations"] += 1
+        if in_range(thread.get("closed_at")):
+            metrics[owner]["closed_conversations"] += 1
         if not thread.get("closed_at"):
             stage = str(thread.get("stage") or "new_lead")
             if stage == "follow_up":
@@ -1261,7 +1263,7 @@ def get_team_performance(days: int = Query(30, ge=0, le=365), user: Dict[str, An
     open_threads = list(mongo_client.inbox_threads.find({"closed_at": {"$exists": False}}, {"assigned_to": 1}))
     unassigned = sum(1 for thread in open_threads if not thread.get("assigned_to"))
     rows = sorted(metrics.values(), key=lambda row: (-row["assigned_calls"], str(row["name"]).lower()))
-    totals = {key: sum(row[key] for row in rows) for key in ("assigned_conversations", "assigned_calls", "handled_calls", "follow_ups", "open_tasks", "won", "assigned_leads")}
+    totals = {key: sum(row[key] for row in rows) for key in ("assigned_conversations", "assigned_calls", "handled_calls", "closed_conversations", "follow_ups", "open_tasks", "won", "assigned_leads")}
     return {"success": True, "data": {"days": days, "members": _serialize(rows), "totals": {**totals, "active_members": len(rows), "unassigned_conversations": unassigned}}}
 
 

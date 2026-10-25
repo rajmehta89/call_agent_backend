@@ -31,6 +31,7 @@ from urllib.parse import quote
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from pymongo.errors import DuplicateKeyError
 
 import live_transcript
 import realtime
@@ -333,8 +334,21 @@ def notification_link(kind: str, conversation_id: Optional[str]) -> str:
 def _notify(recipient: Dict[str, Any], kind: str, title: str, message: str, conversation_id: Optional[str]) -> None:
     mongo_client.notifications.insert_one({"type": kind, "channel": "inbox", "title": title, "message": message,
                                            "recipient": recipient.get("email") or recipient.get("name"), "conversation_id": conversation_id,
-                                           "link": notification_link(kind, conversation_id), "created_at": datetime.utcnow(), "read": False})
+                                           "workspace_id": recipient.get("workspace_id", "default"), "link": notification_link(kind, conversation_id),
+                                           "created_at": datetime.utcnow(), "read": False})
     logger.info("inbox: notified %s (%s) about %s", recipient.get("email"), kind, conversation_id or "channel")
+
+
+def _notify_team_operation(user: Dict[str, Any], kind: str, title: str, message: str, conversation_id: str) -> None:
+    """Put an operational update in every active inbox member's personal notifications."""
+    members = mongo_client.users.find(
+        {"workspace_id": user.get("workspace_id", "default"), "active": {"$ne": False}},
+        {"name": 1, "email": 1, "role": 1, "permissions": 1, "workspace_id": 1},
+    )
+    actor_id = _user_id(user)
+    for member in members:
+        if str(member.get("_id")) != actor_id and has_permission(member, "handle_conversations"):
+            _notify(member, kind, title, message, conversation_id)
 
 
 @router.get("/counts")
@@ -387,27 +401,29 @@ def _thread_name(key: str) -> str:
 
 @router.post("/conversations/{key:path}/assign")
 def assign_conversation(key: str, payload: AssignPayload, user: Dict[str, Any] = Depends(require_user)):
-    """Admins assign, move and unassign (user_id null). Team members cannot change assignments, including their own."""
+    """Admins assign, move and unassign; team members may claim an unassigned thread for themselves."""
     _require_db()
-    if not _can_assign(user):
+    admin_assignment = _can_assign(user)
+    self_claim = not admin_assignment and payload.user_id == _user_id(user)
+    if not admin_assignment and not self_claim:
         logger.warning("inbox: %s (role %s) tried to change the assignment of %s without permission", user.get("email"), user.get("role"), key)
-        raise HTTPException(status_code=403, detail="Only admins can assign or unassign conversations")
+        raise HTTPException(status_code=403, detail="Team members can only claim unassigned conversations for themselves")
     before = (mongo_client.inbox_threads.find_one({"_id": key}) or {}).get("assigned_to")
     if not mongo_client.calls.find_one(_calls_query(key), {"_id": 1}):
         logger.warning("inbox: %s tried to assign missing thread %s", user.get("email"), key)
         raise HTTPException(status_code=404, detail="Conversation not found")
     name = _thread_name(key)
-    previous = mongo_client.users.find_one({"_id": ObjectId(before)}) if before and ObjectId.is_valid(before) else None
-
     if payload.user_id is None:
+        # This branch is admin-only because a member must never be able to make
+        # someone else's work unassigned.
         mongo_client.inbox_threads.update_one({"_id": key}, {"$unset": {"assigned_to": "", "assigned_to_name": "", "assigned_at": ""},
                                                              "$set": {"assigned_by_name": user.get("name"), "updated_at": datetime.utcnow()}}, upsert=True)
         realtime.publish("assignment", key=key, workspace=user.get("workspace_id", "default"))
         logger.info("inbox: %s unassigned thread %s (was %s)", user.get("email"), key, before)
         _event(key, "unassigned", user, f"{user.get('name')} moved it back to Unassigned")
         sync_lead_owner(key, None)
-        if previous and str(previous["_id"]) != _user_id(user):
-            _notify(previous, "unassignment", "Conversation taken back", f"{user.get('name')} moved the conversation with {name} back to Unassigned.", key)
+        _notify_team_operation(user, "team_operation", "Conversation moved to Unassigned",
+                               f"{user.get('name')} moved the conversation with {name} back to Unassigned.", key)
         return {"success": True}
 
     assignee = mongo_client.users.find_one({"_id": _object_id(payload.user_id, "user"), "workspace_id": user.get("workspace_id", "default"), "active": {"$ne": False}})
@@ -419,17 +435,35 @@ def assign_conversation(key: str, payload: AssignPayload, user: Dict[str, Any] =
         raise HTTPException(status_code=400, detail="Conversations are assigned to team members; admins hand them out")
     if before == str(assignee["_id"]):
         return {"success": True}  # already theirs; no duplicate notification
-    mongo_client.inbox_threads.update_one({"_id": key}, {"$set": {"assigned_to": str(assignee["_id"]), "assigned_to_name": assignee.get("name"),
-                                                                  "assigned_by_name": user.get("name"), "assigned_at": datetime.utcnow(),
-                                                                  "updated_at": datetime.utcnow()}}, upsert=True)
+    now = datetime.utcnow()
+    assignment = {"assigned_to": str(assignee["_id"]), "assigned_to_name": assignee.get("name"),
+                  "assigned_by_name": user.get("name"), "assigned_at": now, "updated_at": now}
+    if self_claim:
+        # A member may only win the claim while the thread is still unassigned.
+        # The conditional update prevents two agents clicking Claim together
+        # from overwriting one another.
+        try:
+            result = mongo_client.inbox_threads.update_one(
+                {"_id": key, "$or": [{"assigned_to": {"$exists": False}}, {"assigned_to": None}, {"assigned_to": ""}]},
+                {"$set": assignment}, upsert=True,
+            )
+        except DuplicateKeyError:
+            result = None
+        if result is None or (result.matched_count == 0 and result.upserted_id is None):
+            latest = mongo_client.inbox_threads.find_one({"_id": key}) or {}
+            if latest.get("assigned_to") == _user_id(user):
+                return {"success": True}
+            raise HTTPException(status_code=409, detail="This conversation was already claimed by another team member")
+    else:
+        mongo_client.inbox_threads.update_one({"_id": key}, {"$set": assignment}, upsert=True)
     realtime.publish("assignment", key=key, workspace=user.get("workspace_id", "default"))
-    logger.info("inbox: %s assigned thread %s to %s (was %s)", user.get("email"), key, assignee.get("email"), before)
-    _event(key, "assigned", user, f"{user.get('name')} assigned it to {assignee.get('name')}")
+    action = "claimed" if self_claim else "assigned"
+    logger.info("inbox: %s %s thread %s to %s (was %s)", user.get("email"), action, key, assignee.get("email"), before)
+    _event(key, "assigned", user, f"{user.get('name')} {action} it")
     logger.info("inbox: %d lead(s) of %s now owned by %s", sync_lead_owner(key, str(assignee["_id"])), key, assignee.get("email"))
-    if str(assignee["_id"]) != _user_id(user):
-        _notify(assignee, "assignment", "Conversation assigned to you", f"{user.get('name')} assigned you the conversation with {name}.", key)
-    if previous and str(previous["_id"]) not in {str(assignee["_id"]), _user_id(user)}:
-        _notify(previous, "unassignment", "Conversation moved", f"{user.get('name')} moved the conversation with {name} to {assignee.get('name')}.", key)
+    verb = "claimed" if self_claim else f"assigned it to {assignee.get('name')}"
+    _notify_team_operation(user, "team_operation", "Conversation assignment changed",
+                           f"{user.get('name')} {verb} the conversation with {name}.", key)
     return {"success": True}
 
 
@@ -460,9 +494,12 @@ def close_conversation(key: str, payload: ClosePayload, user: Dict[str, Any] = D
     if payload.closed:
         mongo_client.inbox_threads.update_one({"_id": key}, {"$set": {"closed_at": datetime.utcnow(), "closed_by_name": user.get("name")}}, upsert=True)
         _event(key, "closed", user, f"Conversation closed by {user.get('name')}")
+        operation_title, operation_message = "Conversation closed", f"{user.get('name')} closed the conversation with {_thread_name(key)}."
     else:
         mongo_client.inbox_threads.update_one({"_id": key}, {"$unset": {"closed_at": "", "closed_by_name": ""}}, upsert=True)
         _event(key, "reopened", user, f"Conversation reopened by {user.get('name')}")
+        operation_title, operation_message = "Conversation reopened", f"{user.get('name')} reopened the conversation with {_thread_name(key)}."
+    _notify_team_operation(user, "team_operation", operation_title, operation_message, key)
     realtime.publish("close", key=key, workspace=user.get("workspace_id", "default"))
     logger.info("inbox: %s %s thread %s", user.get("email"), "closed" if payload.closed else "reopened", key)
     return {"success": True}
@@ -489,12 +526,8 @@ def set_stage(key: str, payload: StagePayload, user: Dict[str, Any] = Depends(re
                                                          "$push": {"stage_history": {"from": before, "to": payload.stage, "by": _user_id(user), "by_name": user.get("name"), "at": now}}}, upsert=True)
     realtime.publish("stage", key=key, workspace=user.get("workspace_id", "default"))
     logger.info("inbox: %s moved thread %s from %s to %s", user.get("email"), key, before, payload.stage)
-    assignee_id = state.get("assigned_to")
-    if assignee_id and assignee_id != _user_id(user) and ObjectId.is_valid(assignee_id):
-        assignee = mongo_client.users.find_one({"_id": ObjectId(assignee_id)})
-        if assignee:
-            _notify(assignee, "status", "Conversation status changed",
-                    f"{user.get('name')} moved the conversation with {_thread_name(key)} to {STAGE_LABELS[payload.stage]}.", key)
+    _notify_team_operation(user, "team_operation", "Conversation status changed",
+                           f"{user.get('name')} moved the conversation with {_thread_name(key)} to {STAGE_LABELS[payload.stage]}.", key)
     return {"success": True}
 
 
