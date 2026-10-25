@@ -2,7 +2,7 @@
 
 A Classifier holds a few example sentences per kind ("the caller is asking for a callback": "Can someone call me
 back?", "I'd like a quote"...). A turn's kind is the kind of its closest examples in meaning, using the local
-embedding model the knowledge search already runs. Every text is embedded once and cached, so the several decisions
+embedding model the knowledge search already runs, with the network embedding provider as a fallback. Every text is embedded once and cached, so the several decisions
 made about one turn (which model answers, which acknowledgement fits, which store data it needs...) share one vector.
 None of the examples hold facts about the business: they describe kinds of things callers say.
 """
@@ -20,20 +20,28 @@ _CACHE_LOCK = threading.Lock()
 
 
 def vectors(texts: Sequence[str]):
-    """Meaning vectors for texts (numpy rows), embedding only the ones not seen recently; None when the local model is
-    unavailable."""
+    """Unit meaning vectors for texts, from the local model or the network embedding provider."""
     import numpy as np
-    from brain_service import local_embeddings
+    from brain_service import brain_service, local_embeddings
     keys = [" ".join((text or "").split()) for text in texts]
     with _CACHE_LOCK:
         missing = list(dict.fromkeys(key for key in keys if key not in _CACHE))
     if missing:
         fresh = local_embeddings(missing)
         if not fresh:
+            fresh, _ = brain_service._embeddings(missing)
+        if len(fresh) != len(missing) or any(not vector for vector in fresh):
             return None
+        normalized = []
+        for vector in fresh:
+            values = np.asarray(vector, dtype=float)
+            magnitude = np.linalg.norm(values)
+            if not magnitude:
+                return None
+            normalized.append(values / magnitude)
         with _CACHE_LOCK:
-            for key, vector in zip(missing, fresh):
-                _CACHE[key] = np.array(vector)
+            for key, vector in zip(missing, normalized):
+                _CACHE[key] = vector
                 _CACHE.move_to_end(key)
             while len(_CACHE) > _CACHE_SIZE:
                 _CACHE.popitem(last=False)

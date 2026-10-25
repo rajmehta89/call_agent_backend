@@ -57,7 +57,7 @@ class FakeDeepgram:
 def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0):
     starts, finished = [], []
 
-    async def fake_sentences(services, text, history, caller, summary, bridge=""):
+    async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone=""):
         starts.append((round(time.perf_counter() - t0, 2), text))
         try:
             await asyncio.sleep(0.6)  # the model thinking

@@ -29,7 +29,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from conversation_memory import ConversationMemory, voice_history_token_budget
 import call_forwarding
-from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
+from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
 import live_transcript
 from logging_setup import bind_call, timed
@@ -388,7 +388,7 @@ def _next_chunk(pending: str, first: bool) -> Optional[re.Match]:
 
 
 async def _voice_sentences(services: AIServices, text: str, history: List[Dict[str, str]], caller: str, summary: str,
-                           bridge: str = "") -> AsyncIterator[str]:
+                           bridge: str = "", verified_phone: str = "") -> AsyncIterator[str]:
     """Stream the reply and yield it one finished sentence at a time, so speech can start before the model is done.
     Uses the same voice prompt, knowledge search and reply guard as the Retell agent (routers/retell_api.py).
     bridge: the phrase being spoken right now ("Sure, let me check."); the reply continues from it."""
@@ -415,6 +415,8 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     messages = [{"role": "system", "content": system}, *conversation] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
         messages.append({"role": "system", "content": details_note})
+    if verified_phone:
+        messages.append({"role": "system", "content": f"The caller has already provided a valid contact number: {verified_phone}. Keep it for this call. Do not call it incomplete or ask for it again."})
     if places:
         messages.append({"role": "system", "content": places})
     offered = yes_to_offer_note(text, last_agent_text(history))
@@ -618,6 +620,7 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
     providers = await asyncio.to_thread(provider_snapshot)
     bind_call((await request.form()).get("CallSid"))
+    call_forwarding.forwarding_on()  # refresh the cached switch before the first caller turn
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
             return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(dict(await request.form())), _public_base(request)), media_type="text/xml")
@@ -686,6 +689,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     reply_task: Optional[asyncio.Task[Any]] = None
     transfer_pending = False  # Once promised, a new caller fragment must not cancel the handoff.
     earlier_handoff_text = ""  # keep an unclear team request so a short follow-up is read in context
+    contact_phone = ""  # valid number spoken on a browser call, which has no phone caller ID
+    contact_tasks: set[asyncio.Task[Any]] = set()
     pending_mark = ""
     mark_count = 0
     filler_index = 0
@@ -880,7 +885,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             candidate = bridge_phrase(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
             if candidate and _audio_cache_key(candidate, engine) in _cached_audio:
                 bridge = candidate
-        sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge).__aiter__()
+        sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge, contact_phone).__aiter__()
         return {"text": text, "bridge": bridge, "sentences": sentences, "first": asyncio.ensure_future(sentences.__anext__()),
                 "started": perf_counter()}
 
@@ -896,8 +901,24 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     async def answer(text: str, heard_at: float, prepared: Optional[Dict[str, Any]] = None) -> None:
         """Think and speak at the same time: each sentence goes to ElevenLabs as soon as the model finishes it.
         `prepared`: the reply already started while the caller was finishing (see speculate)."""
-        nonlocal filler_index, unanswered_text, services
+        nonlocal filler_index, unanswered_text, services, contact_phone
         bind_call(call_sid)  # tasks copy their context when created, before the call id was known
+        contact_history = memory.history()
+        contact_question = last_agent_text(contact_history)
+        contact_earlier = earlier_caller_texts(contact_history, text)
+        async def capture_contact() -> None:
+            nonlocal contact_phone
+            try:
+                spoken = await asyncio.to_thread(
+                    provided_contact_phone, text, contact_question, contact_earlier, caller_region(caller))
+                if spoken:
+                    contact_phone = spoken
+            except Exception as error:
+                logger.warning("could not capture a spoken contact number: %s", error)
+
+        contact_task = asyncio.create_task(capture_contact())
+        contact_tasks.add(contact_task)
+        contact_task.add_done_callback(contact_tasks.discard)
         if services is None:
             services = await asyncio.to_thread(_voice_services)
         if prepared:
@@ -1272,6 +1293,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     except Exception as error:
         logger.error("custom Twilio voice websocket error: %s", error)
     finally:
+        if contact_tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*contact_tasks, return_exceptions=True), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("contact number capture did not finish before the call ended")
         await memory.close()
         if speaker is not None:
             await speaker.close()
@@ -1287,6 +1313,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],
                 "messages": live_transcript.ordered_from_lists(transcript, responses),
+                "contact_phone": contact_phone,
                 "summary": memory.summary or f"Custom Twilio voice call with {len(transcript)} caller turns and {len(responses)} AI responses.",
                 "sentiment": "neutral",
                 "call_session_id": call_sid or stream_sid,

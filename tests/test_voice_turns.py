@@ -296,6 +296,15 @@ def test_an_international_number_with_country_code_is_accepted():
     assert not problem and "valid India number" in note
 
 
+def test_spoken_indian_number_is_saved_as_a_valid_contact():
+    from voice_turns import provided_contact_phone
+
+    text = "Yeah. So it is Indian number. So eight eight six six six three one four nine one."
+    asked = "Could you please say your phone number slowly so I can get that right?"
+    assert provided_contact_phone(text, asked) == "+918866631491"
+    assert provided_contact_phone("Order 1234567890 arrived broken.", "How can I help?") == ""
+
+
 def test_yes_or_no_to_the_agents_question_goes_to_the_main_model(monkeypatch):
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
     assert choose_voice_model("Yeah.", "Hello, thanks for calling. How can I help you today?") is None

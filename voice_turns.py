@@ -534,6 +534,16 @@ def about_phone(caller_text: str, agent_text: str = "") -> bool:
     return said == "phone" or (asked == "phone" and said != "email")
 
 
+def provided_contact_phone(caller_text: str, agent_text: str = "", earlier: List[str] = (), region: str = "") -> str:
+    """Return the caller's valid spoken contact number in E.164, or an empty string."""
+    digits = said_number(caller_text, min_digits=9)
+    if not digits or not about_phone(caller_text, agent_text):
+        return ""
+    country = region or mentioned_region([*earlier, caller_text]) or home_region()
+    info = phone_info(digits, country)
+    return info["e164"] if info else ""
+
+
 def agent_question(agent_text: str) -> str:
     """What our last reply asked: its last question, or the whole reply when it asked none. "You can pick up your order
     from our store. Would you like details on collection?" asked about collection, not for an order number."""

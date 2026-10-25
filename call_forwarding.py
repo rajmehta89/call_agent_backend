@@ -233,7 +233,7 @@ def twilio_call_for_retell(retell_call_id: str) -> Optional[Dict[str, Any]]:
 
 # ---- TwiML
 def _base_url() -> str:
-    return (os.getenv("TWILIO_PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    return (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("TWILIO_PUBLIC_BASE_URL") or "").rstrip("/")
 
 
 def _caller_id(caller: str) -> str:

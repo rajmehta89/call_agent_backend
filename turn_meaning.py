@@ -184,4 +184,4 @@ HANDOFF_ACTION = Classifier("handoff action", {
         "My payment went through but I have not received the order. What happened?",
         "I need an update on my delivery.", "There is a problem with my purchase.",
     ],
-}, min_score=0.62, close_call=0.035)
+}, min_score=0.56, close_call=0.035)

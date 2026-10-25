@@ -87,6 +87,14 @@ def test_browser_test_call_shows_the_business_number(db, monkeypatch):
     assert 'callerId="+18178092336"' in call_forwarding.transfer_twiml("client:browser_abc")
 
 
+def test_render_transfer_callbacks_stay_on_production(db, monkeypatch):
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://production.onrender.com")
+    call_forwarding.save_settings({"enabled": True, "agents": [{"name": "Sam", "phone": "0412345678"}]}, ADMIN)
+    twiml = call_forwarding.transfer_twiml("+61400000000")
+    assert 'action="https://production.onrender.com/api/call-forwarding/dial-result"' in twiml
+    assert 'recordingStatusCallback="https://production.onrender.com/api/call-forwarding/recording-result"' in twiml
+
+
 def test_agent_must_press_1():
     assert "<Gather" in call_forwarding.screen_twiml() and "Press 1" in call_forwarding.screen_twiml()
     assert 'timeout="15"' in call_forwarding.screen_twiml()
@@ -208,6 +216,29 @@ def test_asks_for_team_by_meaning(text, kind):
 ])
 def test_handoff_meaning_paraphrases_and_order_issue(text, expected):
     assert call_forwarding.handoff_intent(text) == expected
+
+
+def test_semantic_classifier_uses_network_vectors_when_local_model_is_disabled(monkeypatch):
+    import brain_service as brain_module
+    import meaning
+
+    monkeypatch.setattr(brain_module, "local_embeddings", lambda texts: [])
+    vectors = {"connect me now": [3.0, 0.0], "call me later": [0.0, 4.0],
+               "please connect me": [2.0, 0.0]}
+    monkeypatch.setattr(brain_module.brain_service, "_embeddings",
+                        lambda texts: ([vectors[text] for text in texts], "openrouter"))
+    meaning._CACHE.clear()
+    classifier = meaning.Classifier("handoff", {"live": ["connect me now"], "callback": ["call me later"]})
+    assert classifier.best("please connect me") == "live"
+    meaning._CACHE.clear()
+
+
+def test_production_embedding_score_accepts_the_recorded_live_request(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
+        ("live", 0.572), ("unclear", 0.495), ("callback", 0.489), ("other", 0.469)])
+    assert call_forwarding.handoff_intent("Is there anything possible, like, you can call now?") == "live"
 
 
 def test_explicit_request_to_take_current_call_is_live_transfer():

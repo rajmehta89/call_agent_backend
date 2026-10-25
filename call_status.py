@@ -63,6 +63,7 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
     transcript = _transcript(call)
     summary = str(call.get("call_summary") or call.get("summary") or "").strip()
     human_summary = str(call.get("human_summary") or "").strip()
+    contact_phone = str(call.get("contact_phone") or "").strip()
     if not transcript and not summary:
         return None
     guide = "\n".join(f"- {stage}: {meaning}" for stage, meaning in STAGE_GUIDE.items())
@@ -75,7 +76,10 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         "Classify by the main unresolved reason for the latest call. A team callback about an existing order does not "
         "turn an order or delivery problem into outreach. If the caller says they paid and their order has not arrived, "
         "choose servicing; choose payment_collection only when the payment, charge, balance or refund itself needs resolution.\n\n"
-        f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n\nTranscript:\n{transcript or '(none)'}\n\n"
+        f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n"
+        f"System-validated contact number: {contact_phone or '(none)'}. If present, it is valid and overrides any agent guess that it was short or incomplete.\n"
+        "If the caller asked to speak with someone now, describe it as a live transfer request, even if the agent incorrectly offered a later callback.\n\n"
+        f"Transcript:\n{transcript or '(none)'}\n\n"
         'Answer with JSON only: {"stage": "<one stage id>", "reason": "<one short sentence for the team, quoting what the caller wanted>", '
         '"confidence": <0 to 1>, "summary": "<one or two plain sentences for the team: what the caller wanted and how the call ended; '
         'include any name, number or email the caller confirmed; no stage names>"}'
@@ -119,7 +123,8 @@ def apply_auto_status(call_id: str) -> Optional[str]:
     key = inbox_api._thread_key(call)
     state = mongo_client.inbox_threads.find_one({"_id": key}) or {}
     person_set = bool(state.get("stage_by_name") and state.get("stage_by") != AI_ACTOR)
-    needs_summary = is_placeholder_summary(call.get("call_summary") or call.get("summary"))
+    needs_summary = is_placeholder_summary(call.get("call_summary") or call.get("summary")) or bool(
+        call.get("contact_phone") and call.get("provider") == "custom_twilio")
     if person_set and not needs_summary:
         logger.info("auto status: %s was set by %s; the AI leaves it", key, state.get("stage_by_name"))
         return None
