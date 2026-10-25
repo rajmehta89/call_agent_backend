@@ -934,7 +934,7 @@ class BrainService:
         if customer:
             parts.append(f"Customer: {customer.get('name') or phone}; tags: {', '.join(customer.get('tags') or [])}; notes: {customer.get('notes', '')}")
         if lead:
-            parts.append(f"Lead: {lead.get('name') or phone}; status: {lead.get('status', 'new')}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
+            parts.append(f"Existing CRM lead: {lead.get('name') or phone}; status: {lead.get('status', 'new')}; assigned to: {lead.get('assigned_to_name') or 'the team'}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
         return "\n".join(parts)
 
     # Order names may carry the store's own letters ("DFO001001", "dfo 001001") as well as "#1001" or plain digits.

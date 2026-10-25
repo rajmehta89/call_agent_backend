@@ -321,6 +321,15 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             upsert=True,
         )
         _remember_caller_name(identity, lead, call_data)
+        try:
+            # The voice prompt is cached briefly for latency. Drop this caller's
+            # entry after every save so the next call sees the current lead,
+            # owner and saved name immediately rather than an empty first-call
+            # snapshot.
+            from brain_service import invalidate_customer_context
+            invalidate_customer_context(identity)
+        except Exception:
+            logger.debug("Could not refresh cached caller context for %s", identity)
 
         call_record = {
             "phone_number": phone_number,

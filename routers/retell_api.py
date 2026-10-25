@@ -410,7 +410,7 @@ def _business_voice_prompt(template: str, caller: str, phone: Optional[str], kno
     details = [
         f"Caller ID: {describe_caller_id(phone) if phone else 'not available (web call or hidden number)'}",
         caller_country_line(phone or ""),
-        f"What we already know about this caller:\n{caller}" if caller else "This caller is not in the CRM yet.",
+        f"Existing CRM context for this caller (use these saved details; do not ask for them again):\n{caller}" if caller else "This caller is not in the CRM yet.",
         f"Earlier in this call (facts the caller already told you):\n{summary}" if summary else "",
     ]
     live = "\n\n## Live call details (filled in automatically)\n" + "\n".join(item for item in details if item)
@@ -482,7 +482,9 @@ VOICE_TURN_SAFETY_RULES = (
     "re-explain your previous answer in simpler words; do not ask for their details. (b) Ask for name, phone or email only "
     "after the caller asked for a callback, quote, meeting or a person, one detail per reply. (c) If asked whether something is "
     "booked or confirmed, start with 'Not yet'. (d) When repeating a phone number or email, copy it exactly as the caller "
-    "confirmed it, digit by digit, or say 'the number you gave'. (e) Under 50 words; summarise, never read the knowledge out."
+    "confirmed it, digit by digit, or say 'the number you gave'. (e) If the live call details show an Existing CRM lead "
+    "or saved customer name, use it and never ask for the caller's name just to identify them again. (f) Under 50 words; "
+    "summarise, never read the knowledge out."
 )
 
 
@@ -535,6 +537,7 @@ def _voice_prompt(business: str, channel: Dict[str, Any], caller: str, phone: Op
         "This call section shows one), and if they offer it an email and a preferred day or time. Treat any day or time as a preference to pass on, not a booking.\n"
         "- Before asking for a name, phone number or email, check the whole conversation above. If the caller already gave it, and especially "
         "if they confirmed it, never ask for it again: use it. Ask again only if the caller says it was wrong.\n"
+        "- If the live call details show an Existing CRM lead or a saved customer name, this caller is already known. Use that name and saved context; do not ask for their name just to identify them again.\n"
         "- If the caller asks whether it is booked or confirmed, answer plainly: not yet, you have passed on their request and the team will contact them to confirm.\n"
         "- When you have the details, thank the caller by name, briefly say what you are passing on (their request and the number the team "
         "will call), and say the team will contact them to confirm. Never claim a person is joining this call.\n"
@@ -554,7 +557,7 @@ def _voice_prompt(business: str, channel: Dict[str, Any], caller: str, phone: Op
         "# This call\n"
         f"Caller ID: {describe_caller_id(phone) if phone else 'not available (web call or hidden number); if they want a callback, use the number they give in this conversation'}.\n"
         + caller_country_line(phone or "") + "\n"
-        + (f"What we already know about this caller:\n{caller}" if caller else "This caller is not in the CRM yet."),
+        + (f"Existing CRM context for this caller (use these saved details; do not ask for them again):\n{caller}" if caller else "This caller is not in the CRM yet."),
         f"# Earlier in this call (facts the caller already told you)\n{summary}" if summary else "",
         "# Business knowledge (the only facts you may state)\n" + facts,
     ]
