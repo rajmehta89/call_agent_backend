@@ -110,9 +110,11 @@ def _flux_url(language: str = "en") -> str:
     )
 
 
-def _elevenlabs_request() -> tuple[str, Dict[str, str], str]:
+def _elevenlabs_request(language: str = "en") -> tuple[str, Dict[str, str], str]:
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+    code = normalize_language(language)
+    voice_variable = {"ar": "ELEVENLABS_VOICE_AR", "ur": "ELEVENLABS_VOICE_UR"}.get(code, "ELEVENLABS_VOICE_ID")
+    voice_id = os.getenv(voice_variable, "").strip() or os.getenv("ELEVENLABS_VOICE_ID", "").strip()
     model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"
     if not api_key or not voice_id:
         raise RuntimeError("ElevenLabs voice is not configured")
@@ -155,10 +157,10 @@ async def _reset_elevenlabs_client() -> None:
             pass
 
 
-async def _elevenlabs_stream(text: str) -> AsyncIterator[bytes]:
+async def _elevenlabs_stream(text: str, language: str = "en") -> AsyncIterator[bytes]:
     """Yield caller-ready mulaw/8k audio while ElevenLabs is still generating it. If no audio arrives within
     CUSTOM_TTS_FIRST_AUDIO_TIMEOUT_MS, the request is made once more on a fresh connection."""
-    url, headers, model_id = _elevenlabs_request()
+    url, headers, model_id = _elevenlabs_request(language)
     for attempt in (1, 2):
         got_audio = False
         try:
@@ -180,8 +182,8 @@ async def _elevenlabs_stream(text: str) -> AsyncIterator[bytes]:
             await _reset_elevenlabs_client()
 
 
-async def _elevenlabs_speech(text: str) -> bytes:
-    return b"".join([chunk async for chunk in _elevenlabs_stream(text)])
+async def _elevenlabs_speech(text: str, language: str = "en") -> bytes:
+    return b"".join([chunk async for chunk in _elevenlabs_stream(text, language)])
 
 
 async def _deepgram_tts_stream(text: str, language: str = "en") -> AsyncIterator[bytes]:
@@ -313,7 +315,7 @@ async def _warm_tts_connection(engine: str) -> None:
 
 def _tts_stream(text: str, engine: str, language: str = "en") -> AsyncIterator[bytes]:
     """Speech for one sentence from the voice chosen for this call ("deepgram" or "elevenlabs")."""
-    return _deepgram_tts_stream(text, language) if engine == "deepgram" else _elevenlabs_stream(text)
+    return _deepgram_tts_stream(text, language) if engine == "deepgram" else _elevenlabs_stream(text, language)
 
 
 async def _speech(text: str, engine: str, language: str = "en") -> bytes:
@@ -875,7 +877,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             try:
                 # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
                 # once, which releases the live Deepgram line instead of holding it until garbage collection.
-                audio = speaker.stream(text) if speaker else _tts_stream(text, engine)
+                audio = speaker.stream(text) if speaker else _tts_stream(text, engine, preferred_language)
                 async with contextlib.aclosing(audio):
                     async for chunk in audio:
                         if not active:
