@@ -36,7 +36,7 @@ from logging_setup import bind_call, timed
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
-from routers.twilio_api import _build_conversation_twiml, _get_request_base_url
+from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
 from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language
 
 logger = logging.getLogger(__name__)
@@ -637,8 +637,10 @@ async def warm_retell_connection() -> None:
 async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     """Register the call with Retell, then bridge Twilio to Retell over SIP."""
     payload: Dict[str, Any] = {"agent_id": os.getenv("RETELL_AGENT_ID", "").strip(), "direction": "inbound"}
-    if str(form.get("From") or "").startswith("+"):
-        payload["from_number"] = form["From"]
+    caller_phone = _browser_caller_phone(form.get("caller_phone"))
+    source_phone = str(form.get("From") or "") if str(form.get("From") or "").startswith("+") else caller_phone
+    if source_phone:
+        payload["from_number"] = source_phone
     if str(form.get("To") or "").startswith("+"):
         payload["to_number"] = form["To"]
     async with _async_timed("Retell register-phone-call"):
@@ -650,7 +652,7 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
         response.raise_for_status()
     retell_call_id = response.json()["call_id"]
     logger.info("retell answering call %s (retell call %s)", form.get("CallSid"), retell_call_id)
-    call_forwarding.remember_retell_call(retell_call_id, str(form.get("CallSid") or ""), str(form.get("From") or ""))
+    call_forwarding.remember_retell_call(retell_call_id, str(form.get("CallSid") or ""), source_phone or str(form.get("From") or ""))
     sip_uri = html.escape(f"sip:{retell_call_id}@sip.retellai.com", quote=True)
     # Browser calls arrive From "client:..."; Twilio rejects that as a SIP caller ID (error 13247).
     caller_id = str(form.get("From") or "")
@@ -682,7 +684,7 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
             return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(form), _public_base(request)), media_type="text/xml")
         except Exception as error:
             logger.error("retell routing failed, using default Twilio agent: %s", error)
-            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language), _public_base(request)), media_type="text/xml")
+            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language, _browser_caller_phone(form.get("caller_phone"))), _public_base(request)), media_type="text/xml")
 
     custom = _active_custom(providers)
     if not custom["enabled"] or not custom["ready"]:
@@ -691,13 +693,14 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
             "custom voice unavailable (enabled=%s, missing=%s); using default Twilio ConversationRelay",
             custom["enabled"], custom["missing_configuration"],
         )
-        return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language), _public_base(request)), media_type="text/xml")
+        return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language, _browser_caller_phone(form.get("caller_phone"))), _public_base(request)), media_type="text/xml")
 
     base = _public_base(request)
     if not base.startswith(("https://", "http://")):
         raise HTTPException(status_code=503, detail="TWILIO_PUBLIC_BASE_URL is not configured")
     stream_url = f"{_to_ws_url(base)}/api/custom-voice/media?preferred_language={quote(call_language)}"
-    caller = html.escape(str(form.get("From") or "unknown"), quote=True)
+    browser_phone = _browser_caller_phone(form.get("caller_phone"))
+    caller = html.escape(browser_phone or str(form.get("From") or "unknown"), quote=True)
     call_sid = html.escape(str(form.get("CallSid") or ""), quote=True)
     logger.info("custom voice stack answering call %s from %s", call_sid, caller)
     # Twilio opens the media stream about a second from now: have the greeting audio ready by then.

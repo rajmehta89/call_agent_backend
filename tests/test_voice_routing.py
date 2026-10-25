@@ -29,6 +29,24 @@ def test_custom_stack_streams_audio_with_a_stream_token(client, monkeypatch):
     assert "wss://voice.example/api/custom-voice/media" in twiml and 'name="stream_token"' in twiml
 
 
+def test_browser_phone_is_forwarded_to_custom_voice_stream(client, monkeypatch):
+    monkeypatch.setattr(custom, "provider_snapshot", lambda: snapshot(custom_on=True))
+    twiml = client.post(
+        "/api/custom-voice/inbound",
+        data={"CallSid": "CA-browser", "From": "client:browser_test", "caller_phone": "+918866631491"},
+    ).text
+    assert 'name="caller" value="+918866631491"' in twiml
+
+
+def test_browser_phone_is_forwarded_to_conversation_relay(client, monkeypatch):
+    monkeypatch.setattr(custom, "provider_snapshot", lambda: snapshot())
+    twiml = client.post(
+        "/api/custom-voice/inbound",
+        data={"CallSid": "CA-browser", "From": "client:browser_test", "caller_phone": "+918866631491"},
+    ).text
+    assert 'name="caller_phone" value="+918866631491"' in twiml
+
+
 def test_nothing_selected_falls_back_to_the_default_agent(client, monkeypatch):
     assert "<ConversationRelay" in route(client, monkeypatch)
 

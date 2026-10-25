@@ -82,13 +82,37 @@ def _get_request_base_url(request: Request) -> str:
 RELAY_TOKEN_SUBJECT = "conversation-relay"
 
 
-def _build_conversation_twiml(public_base_url: Optional[str] = None, language: str = "en") -> str:
+def _browser_caller_phone(value: Any) -> str:
+    """Return a safe E.164-like browser-test phone, or empty when none was supplied."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    compact = re.sub(r"[^\d+]", "", raw)
+    if compact.startswith("00"):
+        compact = "+" + compact[2:]
+    digits = re.sub(r"\D", "", compact)
+    if not compact.startswith("+"):
+        if len(digits) == 10:
+            digits = f"{TWILIO_DEFAULT_COUNTRY_CODE}{digits}"
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = f"{TWILIO_DEFAULT_COUNTRY_CODE}{digits[1:]}"
+    if not 8 <= len(digits) <= 15:
+        return ""
+    return f"+{digits}"
+
+
+def _build_conversation_twiml(public_base_url: Optional[str] = None, language: str = "en", caller_phone: str = "") -> str:
     ws_url = f"{_get_ws_base_url(public_base_url)}/api/twilio/ws"
     selected = language_config(language)
     greeting = html.escape(language_greeting(selected["code"], agent_config.get_greeting_message()), quote=True)
     language_nodes = "".join(
         f'<Language code="{item["locale"]}" ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" />'
         for item in (language_config("en"), language_config("ar"), language_config("ur"))
+    )
+    caller_phone_node = (
+        f'<Parameter name="caller_phone" value="{html.escape(_browser_caller_phone(caller_phone), quote=True)}" />'
+        if _browser_caller_phone(caller_phone)
+        else ""
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -97,6 +121,7 @@ def _build_conversation_twiml(public_base_url: Optional[str] = None, language: s
         f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" '
         f'ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" ttsLanguage="multi" transcriptionLanguage="multi">{language_nodes}'
         f'<Parameter name="preferred_language" value="{selected["code"]}" />'
+        f'{caller_phone_node}'
         f'<Parameter name="stream_token" value="{stream_token(RELAY_TOKEN_SUBJECT)}" />'
         "</ConversationRelay>"
         "</Connect>"
@@ -445,6 +470,9 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 session["phone_number"] = data.get("from") or "unknown"
                 session["direction"] = data.get("direction") or "inbound"
                 custom_parameters = data.get("customParameters") or {}
+                browser_phone = _browser_caller_phone(custom_parameters.get("caller_phone"))
+                if browser_phone and not str(session["phone_number"]).startswith("+"):
+                    session["phone_number"] = browser_phone
                 session["preferred_language"] = normalize_language(
                     custom_parameters.get("preferred_language") or language_for_call({"From": session["phone_number"]})
                 )

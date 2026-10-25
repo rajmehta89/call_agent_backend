@@ -196,6 +196,12 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
 
     if existing:
         mongo_client.leads.update_one({"_id": existing["_id"]}, {"$set": values})
+        if clean_phone:
+            try:
+                from brain_service import invalidate_customer_context
+                invalidate_customer_context(clean_phone)
+            except Exception:
+                logger.debug("Could not invalidate cached browser caller context for %s", clean_phone)
         return str(existing["_id"])
 
     values.update({
@@ -210,6 +216,12 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
         "created_at": now,
     })
     inserted = mongo_client.leads.insert_one(values)
+    if clean_phone:
+        try:
+            from brain_service import invalidate_customer_context
+            invalidate_customer_context(clean_phone)
+        except Exception:
+            logger.debug("Could not invalidate cached browser caller context for %s", clean_phone)
     return str(inserted.inserted_id)
 
 
