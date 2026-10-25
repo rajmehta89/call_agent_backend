@@ -340,9 +340,18 @@ async def _warm_tts_connection(engine: str) -> None:
         logger.debug("voice connection warm-up skipped: %s", error)
 
 
+def _tts_engine_for_language(engine: str, language: str = "en") -> str:
+    """Use ElevenLabs automatically for Arabic when Deepgram has no Arabic TTS model configured."""
+    if engine == "deepgram" and normalize_language(language) == "ar" and not os.getenv("DEEPGRAM_TTS_VOICE_AR", "").strip():
+        if os.getenv("ELEVENLABS_API_KEY", "").strip() and _elevenlabs_voice(language):
+            return "elevenlabs"
+    return engine
+
+
 def _tts_stream(text: str, engine: str, language: str = "en") -> AsyncIterator[bytes]:
-    """Speech for one sentence from the voice chosen for this call ("deepgram" or "elevenlabs")."""
-    return _deepgram_tts_stream(text, language) if engine == "deepgram" else _elevenlabs_stream(text, language)
+    """Speech for one sentence from the provider selected for this language."""
+    selected_engine = _tts_engine_for_language(engine, language)
+    return _deepgram_tts_stream(text, language) if selected_engine == "deepgram" else _elevenlabs_stream(text, language)
 
 
 async def _speech(text: str, engine: str, language: str = "en") -> bytes:
@@ -543,8 +552,9 @@ def _filler_after_seconds() -> float:
 
 
 def _audio_cache_key(text: str, engine: str, language: str = "en") -> str:
-    voice = deepgram_voice(language) if engine == "deepgram" else _elevenlabs_voice(language)
-    return f"{engine}:{normalize_language(language)}:{voice}:{text}"
+    selected_engine = _tts_engine_for_language(engine, language)
+    voice = deepgram_voice(language) if selected_engine == "deepgram" else _elevenlabs_voice(language)
+    return f"{selected_engine}:{normalize_language(language)}:{voice}:{text}"
 
 
 async def _warm_audio_cache(texts: tuple[str, ...], engine: str, language: str = "en") -> None:
@@ -716,7 +726,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     custom = _active_custom(await asyncio.to_thread(provider_snapshot))
     preferred_language = normalize_language(websocket.query_params.get("preferred_language"))
     engine = custom_voice_engine()  # chosen once per call: "deepgram" or "elevenlabs"
-    speaker = _DeepgramSpeaker(preferred_language) if engine == "deepgram" else None  # one live voice line for the whole call
+    speaker = _DeepgramSpeaker(preferred_language) if _tts_engine_for_language(engine, preferred_language) == "deepgram" else None  # one live voice line for the whole call
     leveller = _level_matcher()  # one steady voice loudness for the whole call
     if not custom["ready"]:
         await websocket.close(code=1011, reason="Custom Twilio voice is not configured")
@@ -886,11 +896,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
         asyncio.create_task(_warm_audio_cache(ALL_BRIDGES if bridges_enabled() else (), engine, preferred_language))
 
-    async def speak(text: str, cache_key: str = "") -> float:
+    async def speak(text: str, cache_key: str = "", forced_engine: Optional[str] = None) -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
         nonlocal pending_mark, mark_count
-        if speaker:
-            await speaker.set_language(preferred_language)
+        selected_engine = forced_engine or _tts_engine_for_language(engine, preferred_language)
+        selected_speaker = speaker if selected_engine == "deepgram" else None
+        if selected_speaker:
+            await selected_speaker.set_language(preferred_language)
         started = perf_counter()
         first_audio = 0.0
         cached = _cached_audio.get(cache_key) if cache_key else None
@@ -904,7 +916,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             try:
                 # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
                 # once, which releases the live Deepgram line instead of holding it until garbage collection.
-                audio = speaker.stream(text) if speaker else _tts_stream(text, engine, preferred_language)
+                audio = selected_speaker.stream(text) if selected_speaker else _tts_stream(text, selected_engine, preferred_language)
                 async with contextlib.aclosing(audio):
                     async for chunk in audio:
                         if not active:
@@ -914,12 +926,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         chunks.append(chunk)  # the cache keeps the original audio; it is levelled when played
                         await send_audio(leveller.process(chunk) if leveller else chunk)
             except (httpx.HTTPError, RuntimeError) as error:
-                if engine != "elevenlabs" or not os.getenv("DEEPGRAM_API_KEY", "").strip():
+                if selected_engine != "elevenlabs" or not os.getenv("DEEPGRAM_API_KEY", "").strip():
                     raise
                 # ElevenLabs refused or cut off the sentence (out of credits, a dropped stream): the rest of the call
                 # speaks with the Deepgram voice, starting with this whole sentence again, instead of going silent.
                 await use_deepgram_voice(error)
-                return await speak(text)
+                return await speak(text, forced_engine="deepgram")
             if cache_key:
                 _cached_audio[cache_key] = b"".join(chunks)
         mark_count += 1
