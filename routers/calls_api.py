@@ -74,6 +74,88 @@ def caller_identity(phone_number: str) -> str:
     match = _BROWSER_CALLER.match(raw)
     return f"client:{match.group(1)}" if match else raw
 
+
+_CALLER_NAME_PATTERN = re.compile(
+    r"\b(?:my name is|i am|i'm|this is|speaking,? this is)\s+([A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,2})",
+    re.I,
+)
+_NAME_QUESTION_PATTERN = re.compile(r"\b(?:your name|what(?:'s| is) your name|who am i speaking|who is calling|may i ask who)\b", re.I)
+_GENERIC_CALLER_NAMES = {"calling", "call", "just", "here", "looking", "calling about", "from"}
+_NON_NAME_WORDS = {"yes", "no", "yeah", "yep", "sure", "hello", "hi", "okay", "ok", "thanks", "thank", "the", "a", "an"}
+
+
+def _caller_name_from_call(call_data: Optional[Dict[str, Any]]) -> str:
+    """Extract only explicit caller introductions; never treat an arbitrary spoken name as the caller's identity."""
+    if not call_data:
+        return ""
+    conversation_lines: List[tuple[str, str]] = []
+    caller_lines: List[str] = []
+    for field in ("transcription", "messages"):
+        for item in call_data.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or item.get("type") or item.get("speaker") or "").lower()
+            if role not in {"user", "caller", "customer", "assistant", "agent", "ai", "bot"}:
+                continue
+            text = str(item.get("content") or item.get("text") or "").strip()
+            if text:
+                conversation_lines.append((role, text))
+                if role in {"user", "caller", "customer"}:
+                    caller_lines.append(text)
+
+    def clean_candidate(raw: str) -> str:
+        candidate = re.split(r"\s+(?:from|calling|about|regarding|and|at)\b", raw, maxsplit=1, flags=re.I)[0].strip(" .,!?-")
+        first_word = candidate.split(maxsplit=1)[0].lower() if candidate else ""
+        if not candidate or first_word in _GENERIC_CALLER_NAMES:
+            return ""
+        return " ".join(part.capitalize() for part in candidate.split())
+
+    for line in caller_lines:
+        match = _CALLER_NAME_PATTERN.search(line)
+        if not match:
+            continue
+        candidate = clean_candidate(match.group(1))
+        if candidate:
+            return candidate
+
+    # On a first call the assistant may ask for a name and the caller may reply
+    # with only "Jordan". Preserve that common short answer, but only when the
+    # preceding assistant turn explicitly asked for the caller's name.
+    for index, (role, text) in enumerate(conversation_lines):
+        if role not in {"user", "caller", "customer"} or index == 0:
+            continue
+        previous = " ".join(previous_text for previous_role, previous_text in conversation_lines[max(0, index - 2):index]
+                            if previous_role in {"assistant", "agent", "ai", "bot"})
+        words = re.findall(r"[A-Za-z][A-Za-z'’-]*", text)
+        if not previous or not _NAME_QUESTION_PATTERN.search(previous) or not 1 <= len(words) <= 3:
+            continue
+        if any(word.lower() in _NON_NAME_WORDS for word in words):
+            continue
+        candidate = clean_candidate(" ".join(words))
+        if candidate:
+            return candidate
+    return ""
+
+
+def _remember_caller_name(phone_number: str, lead: Optional[Dict[str, Any]], call_data: Optional[Dict[str, Any]]) -> None:
+    """Persist an explicitly provided caller name without overwriting an existing real lead/customer name."""
+    name = _caller_name_from_call(call_data)
+    if not name or not lead:
+        return
+    existing_name = str(lead.get("name") or "").strip()
+    generic = not existing_name or existing_name.lower().startswith(("inbound caller", "browser caller", "web caller"))
+    identity = caller_identity(phone_number)
+    if not generic or not identity:
+        return
+    now = utc_now()
+    mongo_client.leads.update_one({"_id": lead["_id"]}, {"$set": {"name": name, "updated_at": now}})
+    mongo_client.customers.update_one({"phone": identity}, {"$set": {"name": name, "updated_at": now}})
+    try:
+        from brain_service import invalidate_customer_context
+        invalidate_customer_context(identity)
+    except Exception:
+        logger.debug("Could not invalidate cached caller context for %s", identity)
+
 # Pydantic Models
 class LogCallRequest(BaseModel):
     phone_number: str
@@ -238,6 +320,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
             },
             upsert=True,
         )
+        _remember_caller_name(identity, lead, call_data)
 
         call_record = {
             "phone_number": phone_number,

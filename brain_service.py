@@ -192,6 +192,14 @@ def _swr_cached(key: str, ttl_seconds: float, load):
     return hit[1]
 
 
+def invalidate_customer_context(phone: Optional[str]) -> None:
+    """Drop one caller's cached CRM context after the voice pipeline saves new identity data."""
+    if not phone:
+        return
+    with _TTL_LOCK:
+        _TTL_CACHE.pop(f"customer:{phone}", None)
+
+
 class BrainService:
     def _setting(self, key: str, default: Any) -> Any:
         if not mongo_client.is_connected():
@@ -926,7 +934,7 @@ class BrainService:
         if customer:
             parts.append(f"Customer: {customer.get('name') or phone}; tags: {', '.join(customer.get('tags') or [])}; notes: {customer.get('notes', '')}")
         if lead:
-            parts.append(f"Lead status: {lead.get('status', 'new')}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
+            parts.append(f"Lead: {lead.get('name') or phone}; status: {lead.get('status', 'new')}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
         return "\n".join(parts)
 
     # Order names may carry the store's own letters ("DFO001001", "dfo 001001") as well as "#1001" or plain digits.

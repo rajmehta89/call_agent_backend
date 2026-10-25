@@ -163,6 +163,100 @@ def requested_agent(caller_text: str, settings: Optional[Dict[str, Any]] = None)
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def assign_lead_to_requested_agent(
+    caller: str,
+    requested_text: str,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Assign the caller's lead to the registered user named in a handoff request.
+
+    Call forwarding settings contain the phone used to ring an agent, while lead
+    ownership uses the authenticated user's id. Resolve the configured phone to
+    that user before writing ``assigned_to`` so the normal team-member scope and
+    dashboard counts continue to work. A small inbound lead is created when the
+    live transfer happens before the end-of-call webhook has saved one.
+    """
+    matched = requested_agent(requested_text, settings)
+    if not matched:
+        return None
+
+    try:
+        from routers.calls_api import caller_identity
+
+        identity = caller_identity(caller)
+        if not identity or identity.lower() in {"unknown", "anonymous", "web caller"}:
+            logger.info("call forwarding: cannot assign named request without a caller identity")
+            return {"agent": matched, "user": None, "lead": None}
+        if not mongo_client.is_connected() or not hasattr(mongo_client, "users") or not hasattr(mongo_client, "leads"):
+            logger.warning("call forwarding: cannot assign %s; users or leads collection is unavailable", matched.get("name"))
+            return {"agent": matched, "user": None, "lead": None}
+
+        # Only active authenticated users can own a lead. A forwarding number
+        # may still be a non-login phone, in which case the notification remains
+        # useful but no invalid lead owner is written.
+        users = list(mongo_client.users.find({"active": {"$ne": False}}))
+        target_phone = normalize_number(matched.get("phone"))
+        user = next(
+            (candidate for candidate in users
+             if target_phone and normalize_number(candidate.get("phone")) == target_phone),
+            None,
+        )
+        if not user:
+            target_name = re.sub(r"\s+", " ", str(matched.get("name") or "").strip().lower())
+            user = next(
+                (candidate for candidate in users
+                 if target_name and re.sub(r"\s+", " ", str(candidate.get("name") or "").strip().lower()) == target_name),
+                None,
+            )
+        if not user:
+            logger.warning("call forwarding: named agent %s is not a registered active user; lead stays unassigned", matched.get("name"))
+            return {"agent": matched, "user": None, "lead": None}
+
+        lead = mongo_client.leads.find_one({"phone": identity})
+        if not lead:
+            now = datetime.utcnow()
+            draft = {
+                "name": "Inbound caller",
+                "phone": identity,
+                "email": "",
+                "company": "",
+                "notes": "Automatically captured from an inbound voice call.",
+                "status": "new",
+                "source": "voice",
+                "call_attempts": 0,
+                "last_call": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                inserted = mongo_client.leads.insert_one(draft)
+                draft["_id"] = inserted.inserted_id
+                lead = draft
+            except Exception:
+                # A concurrent webhook may have created the unique phone row.
+                lead = mongo_client.leads.find_one({"phone": identity})
+        if not lead:
+            logger.warning("call forwarding: could not find or create lead for %s", identity)
+            return {"agent": matched, "user": user, "lead": None}
+
+        assigned_name = user.get("name") or matched.get("name") or "Team member"
+        mongo_client.leads.update_one(
+            {"_id": lead["_id"]},
+            {"$set": {
+                "assigned_to": str(user["_id"]),
+                "assigned_to_name": assigned_name,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        lead.update({"assigned_to": str(user["_id"]), "assigned_to_name": assigned_name})
+        logger.info("call forwarding: assigned lead %s to %s (%s)", identity, assigned_name, user.get("_id"))
+        return {"agent": matched, "user": user, "lead": lead}
+    except Exception as error:
+        # Assignment must never stop a live transfer or callback notification.
+        logger.warning("call forwarding: could not assign named lead to %s: %s", matched.get("name"), error)
+        return {"agent": matched, "user": None, "lead": None}
+
+
 _ON_CACHE: Dict[str, Any] = {"at": -1e9, "on": False, "refreshing": False}
 ON_CACHE_SECONDS = 10  # re-read in the background at most this often; saving the settings page updates it at once
 
@@ -452,6 +546,8 @@ def create_callback_outreach(
     settings = get_settings()
     matched = requested_agent(requested_text, settings)
     recipient = destination or (matched.get("name") if matched else "Human team")
+    if matched:
+        assign_lead_to_requested_agent(caller, requested_text, settings)
     from notification_service import notify_human_assignment
     notify_human_assignment(
         channel="voice",

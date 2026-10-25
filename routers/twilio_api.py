@@ -29,6 +29,7 @@ from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
 from conversation_memory import ConversationMemory
+import call_forwarding
 
 load_project_env()
 
@@ -458,6 +459,11 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 transfer_destination = None
 
                 if dedicated_agent:
+                    call_forwarding.assign_lead_to_requested_agent(
+                        session.get("phone_number") or "",
+                        caller_text,
+                        transfer_settings,
+                    )
                     transfer_destination = dedicated_agent.get("name") or "Human agent"
                     transfer_service.append_message(
                         session["session_id"],
