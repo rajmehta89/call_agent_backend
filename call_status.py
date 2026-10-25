@@ -29,10 +29,10 @@ FINAL_STATUSES = {"completed", "failed", "missed", "no-answer", "busy", "cancele
 # What each stage means, for the model. Generic on purpose: the business and its knowledge change.
 STAGE_GUIDE = {
     "new_lead": "first contact or a general enquiry with no clear next step yet",
-    "outreach": "the team needs to contact the caller: they asked for a callback, a quote, more information, or a person",
+    "outreach": "the team needs to contact a prospective caller about a callback, quote, more information, or a person, with no existing order issue as the main reason",
     "scheduling": "the caller wants to arrange a time: a meeting, visit, measure, installation, delivery or collection time",
-    "servicing": "an existing customer with an order, delivery, installation, faulty product, return or exchange being handled",
-    "payment_collection": "the call is about paying: an invoice, deposit, balance, payment method, or a refund owed",
+    "servicing": "an existing customer needs help with an order, missing or late delivery, installation, faulty product, return or exchange; includes an order already paid for but not received",
+    "payment_collection": "the money itself needs action: an unpaid invoice, deposit or balance, failed payment, payment method, disputed charge, or refund owed",
     "follow_up": "the caller is interested but will decide later, is comparing options, or asked to be contacted again later",
     "won": "the caller committed: they placed or confirmed an order or purchase, or accepted a quote",
     "lost": "the caller is not interested, chose someone else, or declined",
@@ -51,6 +51,10 @@ def _transcript(call: Dict[str, Any]) -> str:
             text = str(item.get("content") or "").strip()
             if text:
                 lines.append(f"{'Caller' if item.get('type') == 'user' else 'Agent'}: {text}")
+    for line in call.get("human_transcript") or []:
+        text = str(line.get("text") or "").strip()
+        if text:
+            lines.append(f"{'Human agent' if line.get('role') == 'human_agent' else 'Caller'}: {text}")
     return "\n".join(lines[-60:])
 
 
@@ -58,6 +62,7 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
     """Ask the model which stage the conversation belongs in now. None when there is nothing to judge."""
     transcript = _transcript(call)
     summary = str(call.get("call_summary") or call.get("summary") or "").strip()
+    human_summary = str(call.get("human_summary") or "").strip()
     if not transcript and not summary:
         return None
     guide = "\n".join(f"- {stage}: {meaning}" for stage, meaning in STAGE_GUIDE.items())
@@ -65,8 +70,12 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         "You file inbound phone calls for a business into a sales pipeline. Pick the ONE stage that best describes "
         "where this caller's conversation stands now, based on what the caller said and asked for.\n\n"
         f"Stages:\n{guide}\n\nThe conversation is currently in: {current_stage}. Keep it there if nothing in this call "
-        "moves it. A request for a callback or quote is outreach; wanting a time arranged is scheduling.\n\n"
-        f"Call summary: {summary or '(none)'}\n\nTranscript:\n{transcript or '(none)'}\n\n"
+        "moves it: an earlier request (a callback, a time, an order) stays open even if this call only asked a general "
+        "question. A request for a callback or quote is outreach; wanting a time arranged is scheduling. "
+        "Classify by the main unresolved reason for the latest call. A team callback about an existing order does not "
+        "turn an order or delivery problem into outreach. If the caller says they paid and their order has not arrived, "
+        "choose servicing; choose payment_collection only when the payment, charge, balance or refund itself needs resolution.\n\n"
+        f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n\nTranscript:\n{transcript or '(none)'}\n\n"
         'Answer with JSON only: {"stage": "<one stage id>", "reason": "<one short sentence for the team, quoting what the caller wanted>", '
         '"confidence": <0 to 1>, "summary": "<one or two plain sentences for the team: what the caller wanted and how the call ended; '
         'include any name, number or email the caller confirmed; no stage names>"}'
@@ -83,6 +92,14 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         return None
     return {"stage": result["stage"], "reason": str(result.get("reason") or "").strip()[:240], "confidence": float(result.get("confidence") or 0),
             "summary": str(result.get("summary") or "").strip()[:600]}
+
+
+def may_move(current: str, stage: str) -> bool:
+    """New lead is only where a conversation starts ("no next step yet"). Once a caller has asked for something
+    (a callback, a time, an order), a later call with just a general question must not undo that by sending the
+    conversation back to New lead. Moves between the other stages are the model's judgement (e.g. Follow-up ->
+    Scheduling when the caller comes back to book a time)."""
+    return stage != "new_lead" or current == "new_lead"
 
 
 def is_placeholder_summary(text: Any) -> bool:
@@ -125,6 +142,9 @@ def apply_auto_status(call_id: str) -> Optional[str]:
         minimum = 0.6
     if not verdict or verdict["stage"] == current or verdict["confidence"] < minimum:
         logger.info("auto status: %s stays %s (%s)", key, current, verdict)
+        return None
+    if not may_move(current, verdict["stage"]):
+        logger.info("auto status: %s stays %s: a later call never sends it back to %s (%s)", key, current, verdict["stage"], verdict["reason"])
         return None
     now = datetime.utcnow()
     stage = verdict["stage"]

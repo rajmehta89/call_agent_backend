@@ -151,11 +151,14 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     from brain_service import brain_service
     from email_templates import normalize_draft_copy
     from gmail_service import gmail_service
+    from private_email_service import private_email_service
 
-    if not brain_service.tools().get("send_gmail_email", False):
+    is_dubai = draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach"
+    sender = private_email_service if is_dubai else gmail_service
+    if not is_dubai and not brain_service.tools().get("send_gmail_email", False):
         return {"status": "error", "reason": "The Gmail tool is disabled"}
-    if not gmail_service.configured:
-        return {"status": "error", "reason": "Gmail is not configured"}
+    if not sender.configured:
+        return {"status": "error", "reason": "Private Email is not configured" if is_dubai else "Gmail is not configured"}
     safe_copy = normalize_draft_copy(draft)
     if safe_copy["body"] != draft.get("body") or safe_copy["company_context"] != draft.get("company_context"):
         mongo_client.email_outbox.update_one(
@@ -175,7 +178,7 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     if not claimed:
         return {"status": "skipped", "reason": "Draft is already being processed"}
     try:
-        result = gmail_service.send([draft.get("recipient_email", "")], draft.get("subject", ""), draft.get("body", ""))
+        result = sender.send([draft.get("recipient_email", "")], draft.get("subject", ""), draft.get("body", ""))
         if result.get("status") != "sent":
             mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": result.get("reason", "Email was not sent"), "updated_at": datetime.utcnow()}})
             return {"status": "error", "reason": result.get("reason", "Email was not sent")}
@@ -184,7 +187,7 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "sent", "id": str(draft["_id"])}
     except Exception as exc:
         mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": str(exc), "updated_at": datetime.utcnow()}})
-        return {"status": "error", "reason": "Gmail delivery failed"}
+        return {"status": "error", "reason": "Private Email delivery failed" if is_dubai else "Gmail delivery failed"}
 
 
 def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100) -> Dict[str, Any]:
@@ -219,7 +222,10 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
             break
         if _daily_count(policy) >= int(current_campaign["daily_limit"]):
             break
-        if draft.get("status") == "pending_approval" and current_campaign and policy.get("approval_required") and approval_window_open(policy):
+        if draft.get("status") == "pending_approval" and (
+            draft.get("requires_explicit_approval")
+            or (current_campaign and policy.get("approval_required") and approval_window_open(policy))
+        ):
             skipped_for_approval += 1
             continue
         result = _send_draft(draft)
@@ -363,6 +369,13 @@ async def email_campaign_worker() -> None:
             # remain responsive during discovery and delivery.
             await asyncio.to_thread(refill_campaign_candidates)
             await asyncio.to_thread(notify_pending_approval_digest)
-            await asyncio.to_thread(process_email_outbox)
+            # The background worker only delivers drafts explicitly approved in
+            # the outbox. Discovery can still prepare candidates for review.
+            approved_ids = await asyncio.to_thread(
+                lambda: [str(item["_id"]) for item in mongo_client.email_outbox.find(
+                    {"status": "approved"}, {"_id": 1}).sort("created_at", 1).limit(100)]
+            )
+            if approved_ids:
+                await asyncio.to_thread(process_email_outbox, approved_ids)
         except Exception as exc:
             logger.error(f"Email campaign worker cycle failed: {exc}")

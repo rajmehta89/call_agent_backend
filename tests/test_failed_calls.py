@@ -11,7 +11,7 @@ from twilio_security import verify_twilio_request
 @pytest.fixture
 def status(monkeypatch):
     recorded, updated = [], {"result": False}
-    monkeypatch.setattr(twilio_api, "update_call_from_twilio", lambda sid, call_status=None: updated["result"])
+    monkeypatch.setattr(twilio_api, "update_call_from_twilio", lambda sid, call_status=None, call_duration=None: updated["result"])
     monkeypatch.setattr(twilio_api, "record_failed_call", lambda sid, caller, call_status, direction="inbound", error_code=None: recorded.append((sid, caller, call_status, direction)))
     app = FastAPI()
     app.include_router(twilio_api.router)

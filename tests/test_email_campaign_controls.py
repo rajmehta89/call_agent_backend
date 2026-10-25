@@ -100,6 +100,20 @@ class CampaignControlsIntegrationTests(unittest.TestCase):
         self.assertEqual(result["skipped_for_approval"], 1)
         self.assertEqual(result["sent"], 0)
 
+    def test_explicit_review_draft_is_never_auto_sent_when_global_approval_is_off(self):
+        draft = {"_id": "draft-1", "status": "pending_approval", "requires_explicit_approval": True, "created_at": datetime.utcnow()}
+        fake = FakeMongo([draft])
+        campaign = {"status": "running", "max_emails": 20, "interval_minutes": 60, "daily_limit": 450}
+        with patch.object(email_campaign, "mongo_client", fake), \
+             patch.object(email_campaign, "get_email_campaign", return_value=campaign), \
+             patch.object(email_campaign, "get_email_policy", return_value={"approval_required": False}), \
+             patch.object(email_campaign, "send_window_open", return_value=True), \
+             patch.object(email_campaign, "_daily_window_start", return_value=datetime.utcnow() - timedelta(days=1)), \
+             patch.object(email_campaign, "_send_draft") as send:
+            result = email_campaign.process_email_outbox()
+        send.assert_not_called()
+        self.assertEqual(result["skipped_for_approval"], 1)
+
     def test_timezone_reset_is_utc_naive_and_uses_policy_timezone(self):
         policy = {"timezone": "America/New_York"}
         reset = email_campaign._next_daily_reset(policy)

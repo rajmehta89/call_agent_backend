@@ -4,6 +4,7 @@ Handles call logging, retrieval, and linking with leads
 """
 
 from fastapi import Depends, APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
@@ -12,11 +13,18 @@ from bson import ObjectId
 from mongo_client import mongo_client
 import realtime
 from call_status import schedule_auto_status
+
+FORWARDING_MODE = "ring_all_answer"  # call_forwarding.py marks forwarded calls with this transfer_mode
+FORWARDING_MODES = {FORWARDING_MODE, "ring_all_press_1"}  # preserve results from calls made before the change
+FORWARDING_FIELDS = ("status", "transfer_requested", "transfer_status", "transfer_destination", "transfer_error", "transfer_succeeded",
+                     "accepted_by", "handled_by", "recording_url", "recording_sid")
 from live_transcript import ordered_from_lists
 import re
 
 from auth_service import can_assign_conversations, require_permission, require_user
 import logging
+import os
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +290,10 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     # call_date stays when the call started (set by the first, live save); the final save must not move it.
                     **({} if existing.get("call_date") else {"call_date": call_record["call_date"]}),
                 }
+                if existing.get("transfer_mode") in FORWARDING_MODES:
+                    # The call was moved to the team (call_forwarding.py): its outcome comes from Twilio's callbacks;
+                    # the AI's end-of-call save must not reset it to "completed" / no transfer.
+                    update_data.update({field: existing.get(field) for field in FORWARDING_FIELDS})
                 mongo_client.calls.update_one(
                     {"_id": existing["_id"]},
                     {"$set": update_data}
@@ -327,6 +339,7 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
 def update_call_from_twilio(
     call_sid: Optional[str],
     call_status: Optional[str] = None,
+    call_duration: Optional[str] = None,
     transfer_status: Optional[str] = None,
     transfer_destination: Optional[str] = None,
     transfer_error: Optional[str] = None,
@@ -339,6 +352,8 @@ def update_call_from_twilio(
         return False
 
     updates: Dict[str, Any] = {"updated_at": utc_now()}
+    if call_status and str(call_status).lower() == "completed" and str(call_duration or "").isdigit():
+        updates["duration"] = max(int(call_duration), int(existing.get("duration") or 0))
     if transfer_status:
         updates["transfer_status"] = transfer_status
         if transfer_status in {"connected", "completed"}:
@@ -366,6 +381,10 @@ def update_call_from_twilio(
             existing_transfer_status = existing.get("transfer_status")
             if existing_transfer_status in {"connected", "completed", "accepted"}:
                 updates["status"] = "transferred"
+            elif existing.get("human_callback_requested") and existing.get("transfer_mode") in FORWARDING_MODES:
+                # The AI answered this call; only the human leg went unanswered.
+                # Keep it in the callback queue with its recording and transcript.
+                updates["status"] = "transfer_requested"
             elif existing_transfer_status in {"failed", "busy", "no-answer", "canceled", "disabled", "unconfigured"}:
                 updates["status"] = "failed"
             elif existing_transfer_status in {"requested", "dialing", "ringing"}:
@@ -726,6 +745,38 @@ def get_call_endpoint(call_id: str, user: Dict[str, Any] = Depends(require_user)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.get("/{call_id}/recording")
+def get_call_recording(call_id: str, part: str = "full", user: Dict[str, Any] = Depends(require_user)):
+    """Stream a Twilio recording through the authenticated API; Twilio media needs Basic auth."""
+    result = get_call_by_id(call_id, call_scope(user))
+    call = result.get("data") if result.get("success") else None
+    part = str(part or "full").lower()
+    if part not in {"full", "human"}:
+        raise HTTPException(status_code=400, detail="Invalid recording part")
+    sid = str(((call or {}).get("recording_sid") if part == "human" else (call or {}).get("full_recording_sid") or (call or {}).get("recording_sid")) or "")
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+    media_user = os.getenv("TWILIO_API_KEY_SID") or account_sid
+    media_password = os.getenv("TWILIO_API_KEY_SECRET") or os.getenv("TWILIO_AUTH_TOKEN", "")
+    if not sid.startswith("RE") or not account_sid or not media_user or not media_password:
+        raise HTTPException(status_code=404, detail="Recording is not available")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Recordings/{sid}.mp3"
+    try:
+        upstream = requests.get(url, auth=(media_user, media_password), stream=True, timeout=(5, 30))
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Could not load recording")
+    if upstream.status_code != 200:
+        upstream.close()
+        raise HTTPException(status_code=502, detail="Recording is not ready")
+
+    def audio_chunks():
+        try:
+            yield from upstream.iter_content(chunk_size=65536)
+        finally:
+            upstream.close()
+
+    return StreamingResponse(audio_chunks(), media_type="audio/mpeg", headers={"Cache-Control": "private, no-store"})
+
 @router.get("/{lead_id}/messages")
 def get_call_messages(lead_id: str, user: Dict[str, Any] = Depends(require_user)):
     """Retrieve conversation messages for a specific lead"""
@@ -738,11 +789,14 @@ def get_call_messages(lead_id: str, user: Dict[str, Any] = Depends(require_user)
             call_id = str(call["_id"])
             # Prefer the ordered transcript (live_transcript.py); Retell's final save stamps every line of
             # transcription / ai_responses with the same time, so those lists alone would list the caller first.
-            ordered = call.get("messages") or ordered_from_lists(call.get("transcription") or [], call.get("ai_responses") or [])
+            ai_lines = call.get("messages") or ordered_from_lists(call.get("transcription") or [], call.get("ai_responses") or [])
+            ordered = [({**line, "segment": "ai"}) for line in ai_lines]
+            ordered.extend({**line, "segment": "human"} for line in (call.get("human_transcript") or []))
             for idx, line in enumerate(ordered):
                 messages.append({
                     "id": f"{call_id}-{idx}",
-                    "type": "user" if line.get("role") == "customer" else "bot",
+                    "type": "user" if line.get("role") == "customer" else "human_agent" if line.get("role") == "human_agent" else "bot",
+                    "segment": line.get("segment"),
                     "content": line.get("text", ""),
                     "timestamp": line.get("at", "")
                 })

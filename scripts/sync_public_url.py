@@ -5,6 +5,7 @@ Run after starting ngrok; only out-of-date settings are changed.
 
     python scripts/sync_public_url.py              # discover the URL from ngrok's local API
     python scripts/sync_public_url.py https://x.ngrok-free.app
+    python scripts/sync_public_url.py --local-only # update local .env without touching providers
     python scripts/sync_public_url.py --check      # report only, change nothing
 """
 
@@ -110,11 +111,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("url", nargs="?", help="public https URL; defaults to the running ngrok tunnel")
     parser.add_argument("--check", action="store_true", help="report what is out of date without changing it")
+    parser.add_argument("--local-only", action="store_true", help="update only local .env; leave production provider webhooks intact")
     args = parser.parse_args()
     base = (args.url or ngrok_url()).rstrip("/")
     print(f"Public URL: {base}")
     results = [f".env TWILIO_PUBLIC_BASE_URL: {update_env_file(base, args.check)}"]
-    for step in (lambda: sync_twilio(base, args.check), lambda: [sync_retell(base, args.check)]):
+    steps = () if args.local_only else (lambda: sync_twilio(base, args.check), lambda: [sync_retell(base, args.check)])
+    for step in steps:
         try:
             results.extend(step())
         except Exception as error:  # keep going: one provider failing should not block the others

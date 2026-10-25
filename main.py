@@ -39,7 +39,7 @@ from timeutil import api_time
 # Stored datetimes are UTC (timeutil.utc_now); send them with "Z" so every browser shows its own local time.
 fastapi.encoders.ENCODERS_BY_TYPE[datetime] = api_time
 
-from routers import auth_api, calls_api, config_api, custom_twilio_voice_api, inbox_api, overview_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
+from routers import auth_api, call_forwarding_api, calls_api, config_api, custom_twilio_voice_api, data_reset_api, inbox_api, overview_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
 from routers.leads_api_mongo import router as leads_router
 import realtime
 
@@ -105,12 +105,14 @@ app.include_router(calls_api.router)
 app.include_router(inbox_api.router)
 app.include_router(overview_api.router)
 app.include_router(platform_api.router)
+app.include_router(data_reset_api.router)
 app.include_router(shopify_api.router)
 app.include_router(shopify_api.public_router)
 app.include_router(twilio_api.router)
 app.include_router(custom_twilio_voice_api.router)
 app.include_router(retell_api.router)
 app.include_router(transfer_api.router)
+app.include_router(call_forwarding_api.router)
 app.include_router(leads_router)
 app.include_router(voice_provider_api.router)
 app.include_router(realtime.router)
@@ -121,6 +123,20 @@ async def attach_realtime() -> None:
     """Live dashboard updates publish from worker threads onto this loop."""
     import asyncio
     realtime.attach_loop(asyncio.get_running_loop())
+
+
+@app.on_event("startup")
+async def start_email_campaign_worker() -> None:
+    """Process approved campaign drafts while the backend is running."""
+    import asyncio
+    from email_campaign import email_campaign_worker
+
+    app.state.email_campaign_task = asyncio.create_task(email_campaign_worker())
+
+
+@app.on_event("shutdown")
+async def stop_email_campaign_worker() -> None:
+    app.state.email_campaign_task.cancel()
 
 
 @app.on_event("startup")
@@ -196,8 +212,19 @@ async def warm_local_embeddings() -> None:
             from shopify_service import shopify_service
             shopify_service.catalog_words()
             shopify_service.catalog_index()  # the whole catalogue in memory, for instant product searches
+            if shopify_service.configured:
+                shopify_service.access_scopes()  # checked on store lookups: ~0.5 s on the first caller's question otherwise
             import store_intent
             store_intent.wanted("hello")  # the meaning examples for understanding store questions
+            import call_forwarding
+            call_forwarding._refresh_on()  # the on/off flag calls read without waiting
+            # Every turn decision's examples (caller turn, person request, contact details...): each is prepared the
+            # first time it is used, which the first caller after a restart would otherwise wait for.
+            import turn_meaning
+            from meaning import Classifier
+            for classifier in vars(turn_meaning).values():
+                if isinstance(classifier, Classifier):
+                    classifier.rank("hello")
         except Exception as error:
             logging.getLogger(__name__).warning("startup warm-up failed: %s", error)
 

@@ -17,8 +17,9 @@ class FakeDeepgram:
 
     sent_controls: list = []
 
-    def __init__(self, script):
+    def __init__(self, script, answer_force=True):
         self.script = script
+        self.answer_force = answer_force
         self.last_text = ""
         self.forced = asyncio.Event()
 
@@ -46,13 +47,14 @@ class FakeDeepgram:
                               "channel": {"alternatives": [{"transcript": text}]}})
         try:
             await asyncio.wait_for(self.forced.wait(), 30)
-            yield json.dumps({"type": "TurnInfo", "event": "EndOfTurn", "transcript": self.last_text, "trigger": "manual"})
+            if self.answer_force:
+                yield json.dumps({"type": "TurnInfo", "event": "EndOfTurn", "transcript": self.last_text, "trigger": "manual"})
         except asyncio.TimeoutError:
             pass
         await asyncio.sleep(30)
 
 
-def run_call(monkeypatch, script, stt="nova", tts=None):
+def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0):
     starts, finished = [], []
 
     async def fake_sentences(services, text, history, caller, summary, bridge=""):
@@ -68,7 +70,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None):
         yield b"\xff" * 160
 
     async def fake_connect(*args, **kwargs):
-        return FakeDeepgram(script)
+        return FakeDeepgram(script, answer_force=answer_force)
 
     async def no_op(*args, **kwargs):
         return None
@@ -109,7 +111,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None):
             if message.get("event") == "mark":
                 ws.send_text(json.dumps({"event": "mark", "mark": message["mark"]}))
                 break
-        time.sleep(3.0)
+        time.sleep(call_seconds)
         ws.send_text(json.dumps({"event": "stop"}))
     return starts, finished
 
@@ -194,6 +196,28 @@ def test_flux_turn_that_never_ends_is_ended_with_force_end_turn(monkeypatch):
     starts, finished = run_call(monkeypatch, script, stt="flux")
     assert FakeDeepgram.sent_controls == ["ForceEndTurn"]
     assert finished == ["eight eight six six six three one four nine one"], (starts, finished)
+
+
+def test_flux_force_end_without_reply_answers_partial_transcript(monkeypatch):
+    # Deepgram kept the turn open even after ForceEndTurn in the latest real call.
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "800")
+    FakeDeepgram.sent_controls.clear()
+    turn = lambda event, text: {"event": event, "transcript": text, "turn_index": 0}
+    script = [(0.5, turn("StartOfTurn", "I am talking about")),
+              (0.8, turn("Update", "I am talking about what are your services like"))]
+    starts, finished = run_call(monkeypatch, script, stt="flux", answer_force=False, call_seconds=3.6)
+    assert FakeDeepgram.sent_controls == ["ForceEndTurn"]
+    assert finished == ["I am talking about what are your services like"], (starts, finished)
+
+
+def test_forwarding_off_does_not_force_end_an_unfinished_turn(monkeypatch):
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "10000")
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
+    turn = lambda event, text: {"event": event, "transcript": text, "turn_index": 0}
+    script = [(0.8, turn("Update", "Could you arrange a call to your"))]
+    starts, finished = run_call(monkeypatch, script, stt="flux")
+    assert starts and starts[0][0] < 2.0, (starts, finished)
+    assert finished == [], (starts, finished)
 
 
 def test_when_elevenlabs_cuts_off_the_call_carries_on_with_the_deepgram_voice(monkeypatch):

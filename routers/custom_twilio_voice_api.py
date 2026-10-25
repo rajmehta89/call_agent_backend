@@ -28,6 +28,7 @@ from auth_service import require_user
 from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from conversation_memory import ConversationMemory, voice_history_token_budget
+import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
 import live_transcript
@@ -401,6 +402,12 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
     system = await asyncio.to_thread(_system_prompt, search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places))
+    if call_forwarding.forwarding_on():
+        system += ("\n\n# Live team transfer on this call\n"
+                   "A live transfer to the human team is available. If the caller asks to speak with the team now, "
+                   "do not say calls are unavailable or offer a callback instead. Do not ask for a name or phone number "
+                   "before a live transfer. The call system connects them; a callback needs contact details only when "
+                   "the caller explicitly wants the team to call later.")
     prompt_ms = (perf_counter() - started) * 1000
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()
@@ -587,6 +594,7 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
         response.raise_for_status()
     retell_call_id = response.json()["call_id"]
     logger.info("retell answering call %s (retell call %s)", form.get("CallSid"), retell_call_id)
+    call_forwarding.remember_retell_call(retell_call_id, str(form.get("CallSid") or ""), str(form.get("From") or ""))
     sip_uri = html.escape(f"sip:{retell_call_id}@sip.retellai.com", quote=True)
     # Browser calls arrive From "client:..."; Twilio rejects that as a SIP caller ID (error 13247).
     caller_id = str(form.get("From") or "")
@@ -596,6 +604,15 @@ async def _retell_sip_twiml(form: Dict[str, Any]) -> str:
     return f'<?xml version="1.0" encoding="UTF-8"?><Response><Dial{caller_attr}><Sip>{sip_uri}</Sip></Dial></Response>'
 
 
+def _with_full_call_recording(twiml: str, base: str) -> str:
+    """Start one parent-call recording before the AI or human bridge begins."""
+    if not base.startswith(("https://", "http://")):
+        return twiml
+    callback = html.escape(f"{base.rstrip('/')}/api/call-forwarding/full-recording-result", quote=True)
+    start = f'<Start><Recording track="both" channels="mono" trim="do-not-trim" recordingStatusCallback="{callback}" recordingStatusCallbackMethod="POST" /></Start>'
+    return twiml.replace("<Response>", f"<Response>{start}", 1)
+
+
 @router.post("/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
@@ -603,10 +620,10 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     bind_call((await request.form()).get("CallSid"))
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
-            return PlainTextResponse(await _retell_sip_twiml(dict(await request.form())), media_type="text/xml")
+            return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(dict(await request.form())), _public_base(request)), media_type="text/xml")
         except Exception as error:
             logger.error("retell routing failed, using default Twilio agent: %s", error)
-            return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
+            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request)), _public_base(request)), media_type="text/xml")
 
     custom = _active_custom(providers)
     if not custom["enabled"] or not custom["ready"]:
@@ -615,7 +632,7 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
             "custom voice unavailable (enabled=%s, missing=%s); using default Twilio ConversationRelay",
             custom["enabled"], custom["missing_configuration"],
         )
-        return PlainTextResponse(_build_conversation_twiml(_get_request_base_url(request)), media_type="text/xml")
+        return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request)), _public_base(request)), media_type="text/xml")
 
     form = dict(await request.form())
     base = _public_base(request)
@@ -627,12 +644,12 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     logger.info("custom voice stack answering call %s from %s", call_sid, caller)
     # Twilio opens the media stream about a second from now: have the greeting audio ready by then.
     asyncio.create_task(_warm_audio_cache((_greeting_text(),), custom_voice_engine()))
-    return PlainTextResponse(
+    return PlainTextResponse(_with_full_call_recording(
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Connect><Stream url=\"" + html.escape(stream_url, quote=True) + "\">"
         f'<Parameter name="caller" value="{caller}" /><Parameter name="call_sid" value="{call_sid}" />'
         f'<Parameter name="stream_token" value="{stream_token(str(form.get("CallSid") or ""))}" />'
-        "</Stream></Connect></Response>",
+        "</Stream></Connect></Response>", base),
         media_type="text/xml",
     )
 
@@ -663,6 +680,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     send_lock = asyncio.Lock()
     utterance: List[str] = []
     reply_task: Optional[asyncio.Task[Any]] = None
+    transfer_pending = False  # Once promised, a new caller fragment must not cancel the handoff.
+    earlier_handoff_text = ""  # keep an unclear team request so a short follow-up is read in context
     pending_mark = ""
     mark_count = 0
     filler_index = 0
@@ -679,6 +698,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
     flux = _use_flux()          # Deepgram Flux turn detection; falls back to Nova-3 if it cannot connect
     forced_turn = ""            # the words of a Flux turn we already asked Flux to end (asked once per turn)
+    forced_at = 0.0             # ForceEndTurn can go unanswered; then finish from the partial transcript.
+    forced_fallback_text = ""
+    early_handoff_checked = ""
     flux_turn_started = 0.0     # when the current Flux turn began (for logging turns that stay open long)
     flux_turn_logged = False
 
@@ -703,6 +725,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     async def interrupt() -> None:
         """Caller started talking: stop thinking/speaking and flush audio Twilio has buffered."""
         nonlocal reply_task, pending_mark
+        if transfer_pending:
+            return
         if unanswered_text:
             # Still thinking about a question nobody has heard an answer to: the caller is continuing
             # that sentence, not interrupting. finish_utterance() merges the two parts.
@@ -725,9 +749,62 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.warning("custom voice: could not end call %s: %s", call_sid, error)
 
+    async def forward_to_team(text: str, heard_at: float) -> None:
+        """The caller asked for a person and call forwarding is on: say so, let it play, then ring the team
+        (call_forwarding.py). If the transfer cannot start, the caller is told and the AI carries on."""
+        nonlocal unanswered_text, transfer_pending
+        bind_call(call_sid)
+        unanswered_text = ""
+        line = call_forwarding.CONNECTING_LINE
+        spoke_at = utc_iso()
+        await speak(line)
+        memory.add(text, line)
+        responses.append({"content": line, "timestamp": spoke_at})
+        save_progress()
+        for _ in range(80):  # the line has finished playing (its mark came back); at most ~8 s
+            if not pending_mark:
+                break
+            await asyncio.sleep(0.1)
+        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller):
+            logger.info("custom voice: call=%s handed to the team %.2fs after the caller asked", call_sid, perf_counter() - heard_at)
+            return
+        transfer_pending = False
+        fallback = "Sorry, I couldn't put you through just now. I've noted that you'd like to talk to someone, and our team will call you back."
+        await speak(fallback)
+        memory.add(text, fallback)
+        responses.append({"content": fallback, "timestamp": utc_iso()})
+        save_progress()
+
+    async def answer_or_forward(text: str, heard_at: float, prepared: Optional[Dict[str, Any]]) -> None:
+        """Forwarding is on: hand the call to the team if the caller asked for a person (a meaning check, off the
+        event loop), otherwise answer as usual."""
+        nonlocal transfer_pending, earlier_handoff_text, unanswered_text
+        intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
+        if intent == "live":
+            earlier_handoff_text = ""
+            transfer_pending = True
+            drop_reply(prepared)
+            await forward_to_team(text, heard_at)
+        elif intent == "unclear":
+            if len(text.split()) > 2:
+                earlier_handoff_text = text
+            unanswered_text = ""
+            drop_reply(prepared)
+            line = "Would you like me to connect you with the team now, or have someone call you back later?"
+            spoke_at = utc_iso()
+            await speak(line)
+            memory.add(text, line)
+            responses.append({"content": line, "timestamp": spoke_at})
+            save_progress()
+        else:
+            earlier_handoff_text = ""
+            await answer(text, heard_at, prepared)
+
     async def use_deepgram_voice(error: Exception) -> None:
         nonlocal engine, speaker
-        detail = error.response.text[:160] if isinstance(error, httpx.HTTPStatusError) else str(error)
+        # HTTPStatusError may carry a streaming response whose body was never read.
+        # Accessing .text there raises ResponseNotRead and prevents the fallback.
+        detail = f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError) else str(error)
         logger.warning("ElevenLabs voice failed (%s: %s); this call continues with the Deepgram voice", type(error).__name__, detail)
         engine, speaker = "deepgram", _DeepgramSpeaker()
         # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
@@ -923,17 +1000,32 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         turn. If the turn ends with the same words, the reply is already on its way; if the caller goes on, it is
         dropped. Nothing is spoken until the turn has really ended. With Nova-3 it also ends a turn Deepgram never
         ends (it sometimes drops short words)."""
-        nonlocal forced_turn
+        nonlocal forced_turn, forced_at, forced_fallback_text, early_handoff_checked
         wait = _speculate_after_seconds()
         stuck_after = _turn_timeout_seconds()
         while active:
             await asyncio.sleep(0.05)
             quiet_for = perf_counter() - heard_changed_at
+            if flux and call_forwarding.forwarding_on() and heard_text and quiet_for >= 0.6 and not bot_busy() and early_handoff_checked != heard_text:
+                early_handoff_checked = heard_text
+                if await asyncio.to_thread(call_forwarding.wants_person, heard_text, earlier_handoff_text):
+                    # A clear live request should not wait for Flux's often-missing EndOfTurn.
+                    forced_fallback_text = heard_text
+                    logger.info("custom voice: ending live handoff turn early: %s", heard_text[:120])
+                    finish_utterance()
+                    continue
+            if flux and heard_text and stuck_after and quiet_for >= stuck_after and not bot_busy() and forced_turn == heard_text and forced_at and perf_counter() - forced_at >= 0.75:
+                # Some Flux sessions acknowledge neither the request nor the turn. Do not leave the caller waiting.
+                forced_fallback_text = heard_text
+                logger.warning("custom voice: Flux did not end the requested turn; answering partial text: %s", heard_text[:120])
+                finish_utterance()
+                continue
             if flux and heard_text and stuck_after and quiet_for >= stuck_after and not bot_busy() and forced_turn != heard_text:
                 # Flux keeps a turn open while someone reads out digits ("eight eight six ... six six three") and once
                 # never ended one, leaving a caller giving their number unanswered. The words have stopped changing:
                 # ask Flux to end the turn now (it then sends EndOfTurn with the final words, answered once as usual).
                 forced_turn = heard_text
+                forced_at = perf_counter()
                 logger.info("custom voice: Flux turn still open %.1fs after the last words; ending it: %s", quiet_for, heard_text[:120])
                 try:
                     await deepgram.send(json.dumps({"type": "ForceEndTurn"}))
@@ -955,9 +1047,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     def on_flux_turn(payload: Dict[str, Any]) -> None:
         """Deepgram Flux turn events. The transcript is the whole turn so far."""
         nonlocal early_reply
-        nonlocal flux_turn_started, flux_turn_logged
+        nonlocal flux_turn_started, flux_turn_logged, forced_fallback_text
         event = payload.get("event")
         text = str(payload.get("transcript") or "").strip()
+        if forced_fallback_text and _same_words(text, forced_fallback_text) and event in {"Update", "EagerEndOfTurn", "EndOfTurn"}:
+            if event == "EndOfTurn":
+                forced_fallback_text = ""
+            return  # A delayed Flux update for a turn already handled locally.
         if text:
             heard_changed(text)
         if event == "StartOfTurn":
@@ -996,6 +1092,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if not text:
             drop_reply(prepared)
             return
+        if transfer_pending:
+            drop_reply(prepared)
+            transcript.append({"content": text, "timestamp": utc_iso()})
+            logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
+            save_progress()
+            return
         if not unanswered_text and not (reply_task and not reply_task.done()) and call_is_over(text, last_agent_text(memory.history())):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             drop_reply(prepared)
@@ -1022,6 +1124,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         transcript.append({"content": text, "timestamp": utc_iso()})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
         save_progress()
+        if call_sid and call_forwarding.forwarding_on():  # a cached flag: no waiting here
+            reply_task = asyncio.create_task(answer_or_forward(text, perf_counter(), prepared))
+            reply_task.add_done_callback(log_reply_failure)
+            return
         reply_task = asyncio.create_task(answer(text, perf_counter(), prepared))
         reply_task.add_done_callback(log_reply_failure)
 

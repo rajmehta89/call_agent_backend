@@ -97,6 +97,11 @@ GMAIL_SMTP_PORT=587
 GMAIL_SMTP_SSL=false
 GMAIL_APPROVAL_EMAIL=
 
+# Namecheap Private Email for individually approved Dubai messages.
+# Set the mailbox password only in the backend environment or secret manager.
+PRIVATE_EMAIL_ADDRESS=raj@buildwithraj.com
+PRIVATE_EMAIL_PASSWORD=
+
 # Prospect discovery (Google Places API New; requires Places API enabled and billing)
 GOOGLE_PLACES_API_KEY=
 

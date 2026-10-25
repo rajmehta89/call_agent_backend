@@ -120,3 +120,68 @@ PRODUCT_DETAIL = Classifier("product detail", {
                "Is the cartridge ceramic?", "Does it need a special waste?", "What's the difference between those two?",
                "Is it suitable for a small bathroom?", "How do I clean it?"],
 }, min_score=0.5)
+
+# Does the caller want to talk to a person RIGHT NOW (live call forwarding), rather than a callback later or a question
+# about people? Read on kind_of_turn_text, so product words never decide it.
+PERSON_REQUEST = Classifier("person request", {
+    "person": ["Can I speak to a person?", "I want to talk to a real person.", "Can you put me through to someone?",
+               "Is there someone I can talk to?", "Can you transfer me to your team?", "I'd rather talk to a human.",
+               "Let me speak to a manager.", "Connect me with someone from sales.", "Can I talk to a staff member now?",
+               "Put me on to a real person please.", "I need to speak with someone, not a machine.", "Get me an actual human.",
+               "Is anyone there I can talk to?", "Can I be transferred?", "I'd like to talk to someone in customer service."],
+    "callback": ["Can someone call me back?", "Have the team ring me tomorrow.", "Could someone phone me later about it?",
+                 "Ask them to give me a call when they can.", "I'd like a callback.", "Can the team contact me next week?"],
+    "other": ["Are you a real person?", "Am I talking to a robot?", "Can someone install it for me?", "Do you have people who measure up?",
+              "I need to ask my partner first.", "How many staff do you have?", "Who owns the business?", "What's your phone number?",
+              "Can I pick it up in person?", "Is the showroom staffed on weekends?", "Do your installers come to the house?",
+              "What are your opening hours?", "How much is the product?", "I'll talk to my builder and get back to you.",
+              "Can a plumber fit it?", "Thanks, that's all I needed."],
+}, min_score=0.6, close_call=0.04)
+
+# Live handoff, later callback and unclear timing are separate meanings. This reads the full caller turn and, when
+# available, the preceding team request; trimming to the last sentence can discard the request itself.
+HANDOFF_ACTION = Classifier("handoff action", {
+    "live": [
+        "Please connect me to your team on this call.", "I want to speak with a person right now.",
+        "Can you transfer me to someone in the team?", "Put me through to a human agent.",
+        "I need to talk with your team if you can link them.", "Can I speak with your staff now?",
+        "Can you arrange a call so I can talk with a person now?", "Could you connect us while I am on the line?",
+        "No, I mean call now, not a callback later.", "Can you just help me to call now?",
+        "Yeah, just forward it.", "Please forward this call to the team.", "Connect me now, please.",
+        "Let me talk to the team on the phone.", "Can you get someone to pick up this call?",
+        "Can somebody put me through to the sales desk?", "Please connect me with the team.",
+        "I do not want a bot; give me a person.", "I want someone to pick up my call now.",
+        "Can we transfer this call to the team?", "Can you arrange a call from your team now?",
+        "Can we transfer our call?",
+        "Please arrange a call with a human so I can speak with him now.",
+        "Yes, please arrange that call now while I am here.",
+        "Please send me through to somebody who can speak with me on the phone.",
+        "Put me on the line with an available staff member.",
+    ],
+    "callback": [
+        "Please have someone call me back later.", "Could the team ring me tomorrow?",
+        "I want a callback when someone is free.", "Ask a staff member to phone me next week.",
+        "Can you take my number so the team can call me?", "I cannot talk now; call me this afternoon.",
+        "Have someone contact me after this call.", "Please arrange for the team to call me later.",
+        "Can you arrange a call from your team tomorrow?", "Can you transfer my call tomorrow?",
+        "Can your team call me back later?", "I would rather have the team call me another time.",
+        "Could your people phone me once they have a moment?",
+    ],
+    "unclear": [
+        "Can you arrange a call from your team?", "I would like to speak with your team sometime.",
+        "Can someone from the team talk to me?", "I need to discuss this with a person.",
+        "Could I get in touch with someone?", "Can you arrange a call so we can discuss it?",
+        "I would like somebody from your team to help me.", "Yeah.", "Okay.", "Yes.",
+        "I would like to talk with someone about a problem with my order.",
+    ],
+    "other": [
+        "What does your team do?", "How many agents work there?", "Can your installers come to my house?",
+        "What are the opening hours?", "How much is this product?", "Can I call your store number?",
+        "I will talk to my partner first.", "What is the price of the black basin?",
+        "Do you have someone who can install a shower?", "Thank you, goodbye.",
+        "Are you an AI?", "Am I talking to a bot?",
+        "I paid for my order and it has not arrived. Where is it?",
+        "My payment went through but I have not received the order. What happened?",
+        "I need an update on my delivery.", "There is a problem with my purchase.",
+    ],
+}, min_score=0.62, close_call=0.035)

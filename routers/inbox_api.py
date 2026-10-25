@@ -47,9 +47,17 @@ FOLDERS = ("all", "unassigned", "mine", "assigned", "mentioned", "failed")
 FAILED_STATUSES = {"failed", "busy", "no-answer", "no_answer", "canceled", "cancelled", "missed"}
 # A call still marked in progress after this long ended without a final save (e.g. the server restarted).
 LIVE_WINDOW = timedelta(minutes=3)
-LIST_FIELDS = {"phone_number": 1, "lead_id": 1, "status": 1, "call_date": 1, "created_at": 1, "updated_at": 1, "call_summary": 1,
+LIST_FIELDS = {"phone_number": 1, "lead_id": 1, "status": 1, "call_date": 1, "created_at": 1, "updated_at": 1, "call_summary": 1, "human_summary": 1,
                "provider": 1, "channel_type": 1, "call_session_id": 1, "messages": {"$slice": -1}, "ai_responses": {"$slice": -1}}
 MAX_CALLS_SCANNED = 3000
+
+
+def _full_call_summary(call: Dict[str, Any]) -> str:
+    ai = str(call.get("call_summary") or "").strip()
+    human = str(call.get("human_summary") or "").strip()
+    if ai and human:
+        return f"AI: {ai}\nHuman: {human}"
+    return human or ai
 # Pipeline stages, in order. Keep in step with components/stages.ts in the frontend.
 STAGES = [("new_lead", "New lead"), ("outreach", "Outreach"), ("scheduling", "Scheduling"), ("servicing", "Servicing"),
           ("payment_collection", "Payment collection"), ("follow_up", "Follow-up"), ("lost", "Lost"), ("unqualified", "Unqualified"), ("won", "Won")]
@@ -189,16 +197,23 @@ def _is_live(call: Dict[str, Any]) -> bool:
 def _call_messages(call: Dict[str, Any]) -> List[Dict[str, str]]:
     """The call's transcript in speaking order, from whichever form this record stores."""
     if call.get("messages"):
-        return call["messages"]
-    tool_transcript = call.get("transcript_with_tool_calls")
-    if isinstance(tool_transcript, list) and tool_transcript:
-        started = call.get("provider_started_at")
-        try:
-            started_at = datetime.fromisoformat(started) if isinstance(started, str) else None
-        except ValueError:
-            started_at = None
-        return live_transcript.ordered_from_retell(tool_transcript, started_at)
-    return live_transcript.ordered_from_lists(call.get("transcription") or [], call.get("ai_responses") or [])
+        lines = list(call["messages"])
+    else:
+        tool_transcript = call.get("transcript_with_tool_calls")
+        if isinstance(tool_transcript, list) and tool_transcript:
+            started = call.get("provider_started_at")
+            try:
+                started_at = datetime.fromisoformat(started) if isinstance(started, str) else None
+            except ValueError:
+                started_at = None
+            lines = live_transcript.ordered_from_retell(tool_transcript, started_at)
+        else:
+            lines = live_transcript.ordered_from_lists(call.get("transcription") or [], call.get("ai_responses") or [])
+    # The two phases are sequential. Keep their saved speaking order even when an older
+    # provider omitted timestamps, and label the caller's human-phase lines too.
+    ai_lines = [{**line, "segment": "ai"} for line in lines]
+    human_lines = [{**line, "segment": "human"} for line in (call.get("human_transcript") or [])]
+    return ai_lines + human_lines
 
 
 def _browser_owner_names() -> Dict[str, str]:
@@ -255,7 +270,7 @@ def _build_threads() -> List[Dict[str, Any]]:
             "key": key, "name": _display_name(key, lead, owners), "phone": caller_identity(latest.get("phone_number") or ""),
             # Closing lasts until the caller calls again (a newer call reopens it), like Podium.
             "closed": isinstance(closed_at, datetime) and last_at <= closed_at, "closed_by_name": state.get("closed_by_name"),
-            "last_at": last_at, "preview": last_line or latest.get("call_summary") or "", "summary": latest.get("call_summary") or "",
+            "last_at": last_at, "preview": last_line or _full_call_summary(latest), "summary": _full_call_summary(latest),
             "call_count": len(items), "status": latest.get("status", "completed"), "provider": latest.get("provider"),
             "failed": str(latest.get("status", "")).lower() in FAILED_STATUSES, "live": any(_is_live(call) for call in items),
             "assigned_to": state.get("assigned_to"), "assigned_to_name": state.get("assigned_to_name"),
@@ -537,8 +552,11 @@ def get_conversation(key: str, user: Dict[str, Any] = Depends(require_user)):
     thread = next((item for item in _threads() if item["key"] == key), None) or {"key": key, "name": key}
     history = [{"id": str(call["_id"]), "at": _utc(_when(call)), "phone": caller_identity(call.get("phone_number") or ""), "status": call.get("status", "completed"), "live": _is_live(call),
                 "failed": str(call.get("status", "")).lower() in FAILED_STATUSES, "provider": call.get("provider") or "voice",
-                "channel_type": call.get("channel_type"), "duration": call.get("duration") or 0, "summary": call.get("call_summary") or "",
-                "recording_url": call.get("recording_url"), "disconnection_reason": call.get("disconnection_reason"),
+                "channel_type": call.get("channel_type"), "duration": call.get("duration") or 0, "summary": _full_call_summary(call),
+                "recording_url": call.get("recording_url"), "recording_sid": call.get("recording_sid"),
+                "full_recording_url": call.get("full_recording_url"), "full_recording_sid": call.get("full_recording_sid"),
+                "transfer_status": call.get("transfer_status"), "human_callback_requested": bool(call.get("human_callback_requested")),
+                "disconnection_reason": call.get("disconnection_reason"),
                 "messages": _call_messages(call)} for call in calls]
     discussion = list(mongo_client.team_messages.find({"workspace_id": user.get("workspace_id", "default"), "conversation_id": key, **_visible_query(user)}).sort("created_at", 1))
     read = _read_notifications(user, key)

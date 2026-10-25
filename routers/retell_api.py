@@ -31,7 +31,7 @@ from logging_setup import bind_call
 from ai_services import AIServices, is_reasoning_model, warm_model_connection
 from brain_service import agent_config, brain_service
 from conversation_memory import bounded_history, voice_history_token_budget
-from qa_engine import DynamicQA
+import call_forwarding
 import live_transcript
 from routers.calls_api import log_call
 from transfer_service import transfer_service
@@ -373,9 +373,22 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
 STORE_LOOKUP_SECONDS = float(os.getenv("VOICE_STORE_LOOKUP_SECONDS", "2.5"))  # never hold a reply longer for Shopify
 
 
+def _no_lookup_turn(caller_text: str) -> bool:
+    """"Sorry?", "Yes.", "Thanks, bye": nothing to look up in the store (the reply re-explains or carries on from the
+    call so far). Judged by meaning; a store lookup otherwise costs up to a second or two on these turns."""
+    from turn_meaning import CALLER_TURN
+    from voice_turns import kind_of_turn_text
+    try:
+        return CALLER_TURN.best(kind_of_turn_text(caller_text)) in {"clarify", "acknowledge", "closing"}
+    except Exception:
+        return False
+
+
 def _store_facts(caller_text: str, phone: Optional[str], history: Optional[List[Dict[str, str]]]) -> str:
     """What the connected Shopify store says about this question, as one fact block ("" when not connected or not a
     store question). The earlier turns go along so an order number said before an email still verifies the caller."""
+    if _no_lookup_turn(caller_text):
+        return ""
     earlier = " ".join(str(item.get("content") or "") for item in (history or [])[-8:] if item.get("role") == "user")
     context, tool = brain_service._shopify_context(caller_text, phone, f"{earlier} {caller_text}".strip())
     if not context:
@@ -692,12 +705,16 @@ _TRAILING_CONNECTORS = {"the", "a", "an", "and", "or", "but", "of", "for", "to",
 
 
 def sounds_unfinished(text: str) -> bool:
-    """The caller paused mid-sentence: no closing punctuation, or the last word is one a sentence can't end on."""
+    """The caller paused mid-sentence: no closing punctuation, or the last word is one a sentence can't end on. A
+    question mark means the speech-to-text heard a finished question, even when it ends on such a word ("what is it
+    for?", "who is it by?"): answering those at once saves the wait."""
     stripped = text.strip()
     if not stripped:
         return False
+    if stripped.endswith("?"):
+        return False
     words = re.findall(r"[a-z']+", stripped.lower())
-    return stripped[-1] not in ".?!" or (bool(words) and words[-1] in _TRAILING_CONNECTORS)
+    return stripped[-1] not in ".!" or (bool(words) and words[-1] in _TRAILING_CONNECTORS)
 
 
 def unfinished_wait_seconds() -> float:
@@ -937,6 +954,20 @@ async def retell_webhook(request: Request) -> Response:
         return Response(status_code=500, content="Retell webhook processing failed")
 
 
+# Long enough for Retell to say CONNECTING_LINE (about 4 s of speech) before the call leaves the AI.
+FORWARD_AFTER_SECONDS = 5.0
+
+
+async def _hand_to_team(call_id: str, call_sid: str, caller: str) -> None:
+    await asyncio.sleep(FORWARD_AFTER_SECONDS)
+    if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id):
+        _trace(f"retell_forwarding_failed call={call_id}", error=True)
+        transfer_service.request_transfer(call_id, "Caller asked for a person; the transfer could not start", "retell_callback", 0.95,
+                                          phone_number=caller)
+    else:
+        _trace(f"retell_forwarded call={call_id} twilio={call_sid}")
+
+
 @router.websocket("/llm-websocket/{call_id}")
 async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> None:
     """Implement Retell's Custom LLM WebSocket protocol for one live call."""
@@ -967,7 +998,6 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     prefetched_text, prefetched_at = "", 0.0  # last caller words sent for an early knowledge-search embedding
     live_saves: set[asyncio.Task[None]] = set()
     services = configure_voice_services(AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b"))
-    intent_analyzer = DynamicQA(services)
 
     if not services.is_llm_configured():
         await websocket.send_json(
@@ -1053,7 +1083,12 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             return
         if event.get("interaction_type") == "reminder_required" and not caller_text:
             reply = "Is there anything else I can help you with?"
-        elif event.get("interaction_type") == "response_required" and caller_text and intent_analyzer.should_transfer_to_agent(caller_text):
+        elif event.get("interaction_type") == "response_required" and caller_text and call_forwarding.forwarding_on()                 and call_forwarding.twilio_call_for_retell(call_id) and await asyncio.to_thread(call_forwarding.wants_person, caller_text):
+            # Call forwarding is on and the caller asked for a person: say so, then ring the team once it has been said.
+            reply = call_forwarding.CONNECTING_LINE
+            twilio_call = call_forwarding.twilio_call_for_retell(call_id) or {}
+            asyncio.create_task(_hand_to_team(call_id, twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number))
+        elif event.get("interaction_type") == "response_required" and caller_text and await asyncio.to_thread(call_forwarding.asks_for_team, caller_text) == "person":
             callback_requested = True
             transfer_service.request_transfer(
                 call_id,

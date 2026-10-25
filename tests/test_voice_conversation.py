@@ -94,3 +94,22 @@ def test_first_chunk_starts_at_a_comma_after_enough_words(monkeypatch):
     assert short[:custom._next_chunk(short, first=True).end()] == "Yes, we do."   # too few words before the comma
     monkeypatch.setenv("CUSTOM_FIRST_CHUNK_WORDS", "0")
     assert text[:custom._next_chunk(text, first=True).end()].endswith("Australia.")
+
+
+def test_a_question_mark_means_the_question_is_finished():
+    # Ending on "for" / "by" would otherwise wait 0.7 s for more words that never come.
+    assert not retell_api.sounds_unfinished("Yeah. Uh, so what is Home DFO is for?")
+    assert not retell_api.sounds_unfinished("Who is it made by?")
+    assert retell_api.sounds_unfinished("I was looking for")  # no punctuation: still waits
+
+
+def test_no_store_lookup_for_clarify_yes_or_bye(monkeypatch):
+    from turn_meaning import CALLER_TURN
+    if CALLER_TURN.rank("hello") is None:
+        import pytest
+        pytest.skip("local meaning model not available")
+    import voice_turns
+    monkeypatch.setattr(voice_turns, "kind_of_turn_text", lambda t: t)
+    assert retell_api._no_lookup_turn("Sorry?")
+    assert retell_api._no_lookup_turn("Yes, please.")
+    assert not retell_api._no_lookup_turn("How much is the black basin?")

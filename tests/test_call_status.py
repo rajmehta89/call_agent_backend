@@ -42,3 +42,27 @@ def test_never_overrides_a_person(monkeypatch):
 def test_low_confidence_leaves_it(monkeypatch):
     stage, updates = run(monkeypatch, {}, {"stage": "won", "reason": "maybe", "confidence": 0.3})
     assert stage is None and not updates
+
+
+def test_later_general_question_does_not_send_it_back_to_new_lead(monkeypatch):
+    # A callback is still pending (Outreach); the next call only asked what the business sells.
+    stage, updates = run(monkeypatch, {"stage": "outreach", "stage_by": "ai"}, {"stage": "new_lead", "reason": "asked what the business sells", "confidence": 0.9})
+    assert stage is None and not updates
+
+
+def test_comes_back_to_book_a_time_moves_on(monkeypatch):
+    # Follow-up -> Scheduling is earlier in the list but a real step: the caller is ready to book.
+    stage, updates = run(monkeypatch, {"stage": "follow_up", "stage_by": "ai"}, {"stage": "scheduling", "reason": "wants to book a measure", "confidence": 0.9})
+    assert stage == "scheduling" and updates
+
+
+def test_not_interested_still_moves_to_lost(monkeypatch):
+    stage, updates = run(monkeypatch, {"stage": "outreach", "stage_by": "ai"}, {"stage": "lost", "reason": "chose another supplier", "confidence": 0.9})
+    assert stage == "lost" and updates
+
+
+def test_may_move_rules():
+    assert call_status.may_move("new_lead", "outreach")
+    assert not call_status.may_move("outreach", "new_lead")
+    assert not call_status.may_move("won", "new_lead")
+    assert call_status.may_move("follow_up", "scheduling")

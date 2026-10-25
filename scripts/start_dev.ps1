@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  Start RelayDesk locally: backend, frontend, ngrok, and point Twilio/Retell at the public URL.
+  Start RelayDesk locally: backend, frontend, and ngrok.
 
 .DESCRIPTION
   Safe to run again at any time: it stops stale servers on ports 8000/3000 (Python or Node only),
-  reuses a running ngrok tunnel, waits until everything answers, then syncs webhooks.
+  reuses a running ngrok tunnel and waits until everything answers. Provider webhooks are only
+  redirected to this PC with -SyncProviderWebhooks, so a restart cannot break production calls.
 
   Logs:  backend  call_agent_backend\logs\app.log   (follow with scripts\tail_logs.ps1)
          frontend call_agent_frontend\logs\dev.log
@@ -14,13 +15,15 @@
 
 .EXAMPLE
   .\scripts\start_dev.ps1            # start or restart everything
+  .\scripts\start_dev.ps1 -SyncProviderWebhooks  # route Twilio and Retell to this PC for local call tests
   .\scripts\start_dev.ps1 -Stop      # stop backend, frontend and ngrok
 #>
 [CmdletBinding()]
 param(
     [switch]$Stop,
     [switch]$NoBrowser,
-    [switch]$NoNgrok
+    [switch]$NoNgrok,
+    [switch]$SyncProviderWebhooks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -128,9 +131,14 @@ if (-not $NoNgrok) {
 }
 
 if ($publicUrl) {
-    Write-Step 'Pointing Twilio and Retell at the public URL'
     $syncScript = Join-Path $PSScriptRoot 'sync_public_url.py'
-    Invoke-Native { & $python $syncScript $publicUrl } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
+    if ($SyncProviderWebhooks) {
+        Write-Step 'Pointing Twilio and Retell at the local public URL'
+        Invoke-Native { & $python $syncScript $publicUrl } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
+    } else {
+        Write-Step 'Updating local public URL without changing production webhooks'
+        Invoke-Native { & $python $syncScript $publicUrl --local-only } | Where-Object { $_ -notmatch 'MongoDB|Connecting' }
+    }
 }
 
 try {

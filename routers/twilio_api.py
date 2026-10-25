@@ -323,7 +323,7 @@ async def status_callback(request: Request):
     payload = dict(await request.form())
     bind_call(payload.get("CallSid"))
     logger.info("Twilio call status: %s (duration %ss)", payload.get("CallStatus"), payload.get("CallDuration", "-"))
-    updated = update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"))
+    updated = update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"), call_duration=payload.get("CallDuration"))
     if not updated:
         # Busy / no answer / failed calls never reached a voice agent, so no record exists yet: create one.
         record_failed_call(payload.get("CallSid"), payload.get("From") or payload.get("Caller") or "unknown", payload.get("CallStatus"),

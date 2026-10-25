@@ -3,6 +3,7 @@ import io
 import os
 import re
 import secrets
+from urllib.parse import urlparse
 from fastapi import BackgroundTasks
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,7 @@ from email_policy import approval_window_open, get_email_policy, save_email_poli
 from email_templates import add_email_template, get_email_templates, normalize_draft_copy, unsupported_template_variables
 from prospect_discovery import discover_prospects, discovery_status, search_locations
 from gmail_service import gmail_service
+from private_email_service import private_email_service
 from mongo_client import mongo_client
 from shopify_service import shopify_service
 from ai_services import AIServices
@@ -284,7 +286,7 @@ def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = None, ch
             "voice": {"connected": bool(os.getenv("TWILIO_ACCOUNT_SID") and (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or os.getenv("CALLER_ID"))), "agent": brain_service.channel_config("voice")},
         },
         "shopify": shopify_service.status(),
-        "email": {"gmail": gmail_service.status(), "campaign": campaign_status(), "outbox": email_outbox},
+        "email": {"gmail": gmail_service.status(), "private_email": private_email_service.status(), "campaign": campaign_status(), "outbox": email_outbox},
         "human_workload": human_workload[:50],
         "recent_activity": _serialize(recent),
     }}
@@ -414,6 +416,35 @@ def get_tools():
 @router.get("/gmail/status")
 def get_gmail_status():
     return {"success": True, "data": gmail_service.status()}
+
+
+@router.get("/private-email/status")
+def get_private_email_status():
+    return {"success": True, "data": private_email_service.status()}
+
+
+@router.post("/private-email/verify")
+def verify_private_email(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+    if not private_email_service.configured:
+        raise HTTPException(status_code=409, detail="Set PRIVATE_EMAIL_PASSWORD on the backend first")
+    try:
+        private_email_service.verify_connection()
+    except Exception as exc:
+        logger.error("Private Email SMTP verification failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Private Email login failed. Check the mailbox password and server access") from exc
+    return {"success": True, "data": {"verified": True, "address": private_email_service.address}}
+
+
+@router.get("/private-email/inbox")
+def get_private_email_inbox(user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
+    if not private_email_service.configured:
+        raise HTTPException(status_code=409, detail="Set PRIVATE_EMAIL_PASSWORD on the backend first")
+    try:
+        messages = private_email_service.inbox()
+    except Exception as exc:
+        logger.error("Private Email inbox failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not load the Private Email inbox. Check the mailbox login") from exc
+    return {"success": True, "data": messages}
 
 
 @router.get("/email-policy")
@@ -644,16 +675,113 @@ def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
 
 
 @router.get("/email-outbox")
-def get_email_outbox(status: str = ""):
+def get_email_outbox(status: str = "", campaign_name: str = "", limit: int = Query(200, ge=1, le=1000)):
     _require_db()
-    query = {"status": status} if status.strip() else {}
-    rows = list(mongo_client.email_outbox.find(query).sort("created_at", -1).limit(200))
+    query: Dict[str, Any] = {}
+    if status.strip():
+        query["status"] = status.strip()
+    if campaign_name.strip():
+        query["campaign_name"] = campaign_name.strip()
+    rows = list(mongo_client.email_outbox.find(query).sort("created_at", -1).limit(limit))
     for row in rows:
         safe_copy = normalize_draft_copy(row)
         row["subject"] = safe_copy["subject"]
         row["body"] = safe_copy["body"]
         row["company_context"] = safe_copy["company_context"]
     return {"success": True, "data": _serialize(rows)}
+
+
+@router.get("/dubai-prospects/summary")
+def get_dubai_prospects_summary():
+    _require_db()
+    prospects = mongo_client.db["dubai_prospect_review"]
+    campaign = {"campaign_name": "Dubai voice WhatsApp CRM outreach"}
+    return {"success": True, "data": {
+        "total": prospects.count_documents({}),
+        "needs_verification": prospects.count_documents({"review_status": "needs_verification"}),
+        "pending_approval": mongo_client.email_outbox.count_documents({**campaign, "status": {"$in": ["pending_approval", "awaiting_owner_review"]}}),
+        "sent": mongo_client.email_outbox.count_documents({**campaign, "status": "sent"}),
+    }}
+
+
+@router.get("/dubai-prospects")
+def list_dubai_prospects(search: str = "", offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
+    _require_db()
+    query: Dict[str, Any] = {"review_status": "needs_verification"}
+    if search.strip():
+        query["company_name"] = {"$regex": re.escape(search.strip()[:100]), "$options": "i"}
+    collection = mongo_client.db["dubai_prospect_review"]
+    rows = list(collection.find(query, {"company_name": 1, "lead_id": 1, "industry": 1, "priority": 1, "research_email": 1, "research_source_url": 1}).sort([("priority", 1), ("lead_id", 1)]).skip(offset).limit(limit))
+    for row in rows:
+        row.update(_dubai_email_copy(row))
+    return {"success": True, "data": {"items": _serialize(rows), "total": collection.count_documents(query)}}
+
+
+def _dubai_email_copy(prospect: Dict[str, Any]) -> Dict[str, str]:
+    company = str(prospect["company_name"])
+    industry = str(prospect.get("industry") or "").lower()
+    if "real estate" in industry or "property" in industry:
+        idea = "capture buyer or tenant requirements, route the enquiry to an agent, and log the follow-up in your CRM"
+    elif "clinic" in industry or "health" in industry or "dental" in industry:
+        idea = "answer approved administrative questions, collect appointment requests, and hand clinical questions to staff"
+    elif any(word in industry for word in ("maintenance", "cleaning", "facilities", "construction")):
+        idea = "capture service requests, route urgent work to staff, and update your CRM or job system"
+    elif any(word in industry for word in ("automotive", "rental", "dealership")):
+        idea = "collect vehicle enquiry details, arrange a staff handoff, and log follow-up in your CRM"
+    elif any(word in industry for word in ("travel", "tour", "hospitality")):
+        idea = "collect travel dates and preferences, route complex questions to staff, and record follow-up in your CRM"
+    else:
+        idea = "capture incoming enquiries, route requests to the right person, and keep CRM follow-up organised"
+    return {
+        "subject": f"A voice + WhatsApp enquiry idea for {company}"[:180],
+        "body": (
+            f"Hi {company} team,\n\n"
+            "I'm Raj Mehta. I build AI voice and WhatsApp workflows for businesses. "
+            f"One possible workflow for {company} could {idea}.\n\n"
+            "Would a short example be useful?\n\n"
+            "Best,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/\n\n"
+            'If this is not relevant, reply "no thanks" and I won\'t follow up.'
+        ),
+    }
+
+
+@router.post("/dubai-prospects/{lead_id}/draft")
+def prepare_dubai_prospect_draft(lead_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
+    _require_db()
+    prospects = mongo_client.db["dubai_prospect_review"]
+    prospect = prospects.find_one({"lead_id": lead_id, "review_status": "needs_verification"})
+    if not prospect:
+        raise HTTPException(status_code=409, detail="This prospect is no longer waiting for an email address")
+    email = str(payload.value.get("email") or "").strip().lower()
+    source_url = str(payload.value.get("source_url") or "").strip()
+    parsed = urlparse(source_url)
+    if gmail_service._clean_recipients([email]) != [email] or parsed.scheme != "https" or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Add a valid business email and its official HTTPS source page")
+    if mongo_client.email_outbox.find_one({"recipient_email": email}):
+        raise HTTPException(status_code=409, detail="This address already has an outreach record")
+    company = prospect["company_name"]
+    copy = _dubai_email_copy(prospect)
+    subject = str(payload.value.get("subject") or copy["subject"]).strip()
+    body = str(payload.value.get("body") or copy["body"]).strip()
+    if not subject or not body or len(subject) > 180 or len(body) > 12000:
+        raise HTTPException(status_code=400, detail="Add a subject and email body within the allowed length")
+    now = datetime.utcnow()
+    draft = {
+        "company_name": company, "company_key": f"dubai:{lead_id.lower()}", "lead_id": lead_id,
+        "recipient_email": email, "website": source_url, "verification_url": source_url,
+        "company_context": "", "campaign_name": "Dubai voice WhatsApp CRM outreach",
+        "template_id": "", "template_name": "Dubai owner-reviewed outreach",
+        "subject": subject, "body": body, "status": "awaiting_owner_review",
+        "requires_explicit_approval": True, "source": "dubai_workbook_owner_verified",
+        "created_at": now, "updated_at": now,
+    }
+    try:
+        result = mongo_client.email_outbox.insert_one(draft)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="This company or email already has an outreach record") from exc
+    prospects.update_one({"_id": prospect["_id"]}, {"$set": {"verified_email": email, "source_url": source_url, "review_status": "awaiting_owner_review", "updated_at": now}})
+    _audit("create", "dubai_email_draft", after={"lead_id": lead_id, "recipient_email": email, "draft_id": str(result.inserted_id)})
+    return {"success": True, "data": {"id": str(result.inserted_id), "status": "awaiting_owner_review"}}
 
 
 @router.post("/email-outbox/notify")
@@ -802,8 +930,26 @@ def generate_email_context(payload: ValuePayload):
     return {"success": True, "data": {"context": str(context).strip()}}
 
 
+@router.put("/email-outbox/{draft_id}/copy")
+def update_email_draft_copy(draft_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
+    _require_db()
+    if not ObjectId.is_valid(draft_id):
+        raise HTTPException(status_code=400, detail="Invalid draft id")
+    subject = str(payload.value.get("subject") or "").strip()
+    body = str(payload.value.get("body") or "").strip()
+    if not subject or not body or len(subject) > 180:
+        raise HTTPException(status_code=400, detail="Add a subject (up to 180 characters) and email body")
+    result = mongo_client.email_outbox.update_one(
+        {"_id": ObjectId(draft_id), "status": "awaiting_owner_review"},
+        {"$set": {"subject": subject, "body": body, "updated_at": datetime.utcnow()}},
+    )
+    if not result.modified_count:
+        raise HTTPException(status_code=409, detail="This draft is no longer available to edit")
+    return {"success": True, "data": {"id": draft_id, "subject": subject, "body": body}}
+
+
 @router.put("/email-outbox/{draft_id}/decision")
-def decide_email_draft(draft_id: str, payload: ValuePayload):
+def decide_email_draft(draft_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     _require_db()
     if not ObjectId.is_valid(draft_id):
         raise HTTPException(status_code=400, detail="Invalid draft id")
@@ -812,13 +958,29 @@ def decide_email_draft(draft_id: str, payload: ValuePayload):
         raise HTTPException(status_code=404, detail="Email draft not found")
     decision = str(payload.value.get("decision", "")).strip().lower()
     if decision in {"exclude", "reject", "skip"}:
-        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "excluded", "updated_at": datetime.utcnow()}})
+        result = mongo_client.email_outbox.update_one(
+            {"_id": draft["_id"], "status": {"$in": ["pending_approval", "awaiting_owner_review", "scheduled"]}},
+            {"$set": {"status": "excluded", "updated_at": datetime.utcnow()}},
+        )
+        if not result.modified_count:
+            raise HTTPException(status_code=409, detail="This draft can no longer be excluded")
         return {"success": True, "data": {"status": "excluded", "id": draft_id}}
     if decision != "approve":
         raise HTTPException(status_code=400, detail="Decision must be approve or exclude")
-    if draft.get("status") in {"sent", "excluded"}:
+    if draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach":
+        if not private_email_service.configured:
+            raise HTTPException(status_code=409, detail="Connect raj@buildwithraj.com to the backend before approving this email")
+        try:
+            private_email_service.verify_connection()
+        except Exception as exc:
+            logger.error("Private Email approval login failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Private Email login failed. Verify the mailbox connection before approving") from exc
+    result = mongo_client.email_outbox.update_one(
+        {"_id": draft["_id"], "status": {"$in": ["pending_approval", "awaiting_owner_review", "scheduled"]}},
+        {"$set": {"status": "approved", "approved_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
+    )
+    if not result.modified_count:
         raise HTTPException(status_code=409, detail="This draft has already been completed")
-    mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "approved", "approved_at": datetime.utcnow(), "updated_at": datetime.utcnow()}})
     process_result = process_email_outbox([draft_id], limit=1)
     updated = mongo_client.email_outbox.find_one({"_id": draft["_id"]}) or {}
     status = updated.get("status", "approved")
