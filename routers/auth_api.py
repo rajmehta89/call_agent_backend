@@ -1,15 +1,16 @@
 from datetime import datetime, timedelta
-import hmac
 import logging
 import os
-import re
+import hashlib
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 
-from auth_service import ensure_roles, hash_password, invitation_hash, issue_token, public_user, require_user, role_document, verify_password
+from auth_service import hash_password, invitation_hash, issue_token, public_user, require_user, role_document, verify_password
+from email_service import email_service
 from mongo_client import mongo_client
+from notification_service import notify_team_member_registered
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ class LoginPayload(BaseModel):
     password: str
 
 
+class EmailVerificationPayload(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+
+
 class AcceptInvitePayload(BaseModel):
     token: str = Field(min_length=20)
     name: str = Field(min_length=2, max_length=120)
@@ -49,11 +54,6 @@ class ProfilePayload(BaseModel):
     language: str = Field(default="", max_length=40)
 
 
-def _workspace_id(name: str, email: str) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or email.split("@", 1)[0]
-    return base[:48]
-
-
 def _configured_workspace_name() -> str:
     configured = os.getenv("WORKSPACE_NAME", "").strip()
     if configured:
@@ -67,37 +67,37 @@ def _auth_response(user: Dict[str, Any]) -> Dict[str, Any]:
     return {"token": issue_token(user), "user": public_user(user)}
 
 
+def _verification_hash(token: str) -> str:
+    secret = os.getenv("AUTH_SECRET", "agentflow-local-development-secret")
+    return hashlib.sha256(f"{token}:{secret}".encode("utf-8")).hexdigest()
+
+
 @router.post("/signup")
 def signup(payload: SignupPayload):
-    if not mongo_client.is_connected():
-        raise HTTPException(status_code=503, detail="Database not connected")
-    email = payload.email.lower()
-    if mongo_client.users.find_one({"email": email}):
-        raise HTTPException(status_code=409, detail="An account with this email already exists")
-    ensure_roles()
-    now = datetime.utcnow()
-    is_first_user = mongo_client.users.count_documents({}) == 0
-    configured_setup_token = os.getenv("BOOTSTRAP_SETUP_TOKEN", "")
-    if is_first_user and configured_setup_token and not hmac.compare_digest(payload.setup_token, configured_setup_token):
-        raise HTTPException(status_code=403, detail="A setup token is required to create the first Admin account")
-    public_signup_enabled = os.getenv("ALLOW_PUBLIC_SIGNUP", "false").lower() in {"1", "true", "yes", "on"}
-    if not is_first_user and not public_signup_enabled:
-        raise HTTPException(status_code=403, detail="Public signup is disabled. Ask a workspace Admin for an invitation.")
-    workspace_name = _configured_workspace_name()
-    workspace_id = _workspace_id(workspace_name, email)
-    role = "admin" if is_first_user else "agent"
-    user = {"name": payload.name.strip(), "email": email, "password_hash": hash_password(payload.password), "role": role, "permissions": [], "workspace_id": workspace_id, "workspace_name": workspace_name, "active": True, "auth_version": 0, "created_at": now, "updated_at": now}
-    result = mongo_client.users.insert_one(user)
-    user["_id"] = result.inserted_id
-    if is_first_user:
-        mongo_client.platform_settings.update_one({"key": "workspace_identity"}, {"$set": {"value": {"name": workspace_name, "owner_id": str(result.inserted_id)}, "updated_at": now}, "$setOnInsert": {"created_at": now}}, upsert=True)
-    return {"success": True, "data": _auth_response(user)}
+    raise HTTPException(status_code=403, detail="Account creation is invitation-only. Ask a workspace Admin to send you an invitation.")
 
 
 @router.get("/config")
 def auth_config():
     first_account = mongo_client.users.count_documents({}) == 0 if mongo_client.is_connected() else True
-    return {"success": True, "data": {"setup_required": bool(os.getenv("BOOTSTRAP_SETUP_TOKEN")), "public_signup_enabled": os.getenv("ALLOW_PUBLIC_SIGNUP", "false").lower() in {"1", "true", "yes", "on"}, "first_account_is_admin": first_account, "workspace_name": _configured_workspace_name()}}
+    return {"success": True, "data": {"setup_required": False, "public_signup_enabled": False, "email_verification_required": email_service.configured, "first_account_is_admin": first_account, "workspace_name": _configured_workspace_name()}}
+
+
+@router.post("/verify-email")
+def verify_email(payload: EmailVerificationPayload):
+    if not mongo_client.is_connected():
+        raise HTTPException(status_code=503, detail="Database not connected")
+    user = mongo_client.users.find_one({"email_verification_hash": _verification_hash(payload.token), "email_verified": False})
+    if not user or user.get("email_verified") is not False:
+        raise HTTPException(status_code=400, detail="This verification request is invalid or already completed.")
+    if not user.get("email_verification_expires_at") or user["email_verification_expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="This verification link has expired. Start sign-up again.")
+    email = str(user.get("email", "")).lower()
+    now = datetime.utcnow()
+    mongo_client.users.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True, "active": True, "updated_at": now}, "$unset": {"email_verification_hash": "", "email_verification_expires_at": "", "email_verification_sent_at": "", "email_verification_attempts": ""}})
+    user.update({"email_verified": True, "active": True, "updated_at": now})
+    mongo_client.team_members.update_one({"email": email}, {"$set": {"user_id": user["_id"], "name": user.get("name", ""), "role": user.get("role", "agent"), "active": True, "invitation_status": "accepted", "updated_at": now}}, upsert=True)
+    return {"success": True, "data": _auth_response(user)}
 
 
 # Password guessing: after LOGIN_MAX_FAILURES wrong passwords for one email within LOGIN_WINDOW, that email is
@@ -129,6 +129,8 @@ def login(payload: LoginPayload):
         logger.warning("auth: %s is locked after %d failed sign-ins", email, LOGIN_MAX_FAILURES)
         raise HTTPException(status_code=429, detail="Too many failed sign-in attempts. Try again in 15 minutes.")
     user = mongo_client.users.find_one({"email": email})
+    if user and user.get("email_verified") is False:
+        raise HTTPException(status_code=403, detail="Please verify your email before signing in.")
     if not user or not verify_password(payload.password, user.get("password_hash", "")):
         logger.info("auth: failed sign-in for %s (%d in the last 15 min)", email, _record_failure(email))
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -194,9 +196,14 @@ def accept_invite(payload: AcceptInvitePayload):
     if mongo_client.users.find_one({"email": email}):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
     now = datetime.utcnow()
-    user = {"name": payload.name.strip(), "email": email, "password_hash": hash_password(payload.password), "role": invitation.get("role", "agent"), "permissions": invitation.get("permissions", []), "workspace_id": invitation.get("workspace_id", "default"), "workspace_name": invitation.get("workspace_name", "AgentFlow workspace"), "active": True, "auth_version": 0, "created_at": now, "updated_at": now}
+    user = {"name": payload.name.strip(), "email": email, "password_hash": hash_password(payload.password), "role": invitation.get("role", "agent"), "permissions": invitation.get("permissions", []), "workspace_id": invitation.get("workspace_id", "default"), "workspace_name": invitation.get("workspace_name", "AgentFlow workspace"), "active": True, "email_verified": True, "auth_version": 0, "created_at": now, "updated_at": now}
     result = mongo_client.users.insert_one(user)
     user["_id"] = result.inserted_id
     mongo_client.invitations.update_one({"_id": invitation["_id"]}, {"$set": {"status": "accepted", "accepted_at": now, "user_id": result.inserted_id, "updated_at": now}})
     mongo_client.team_members.update_one({"email": email}, {"$set": {"user_id": result.inserted_id, "name": user["name"], "role": user["role"], "active": True, "invitation_status": "accepted", "updated_at": now}}, upsert=True)
+    try:
+        notify_team_member_registered(name=user["name"], email=email, role=user["role"])
+    except Exception:
+        # Registration has succeeded; a notification failure must not undo the new account.
+        logger.exception("auth: failed to notify admins about new team member %s", email)
     return {"success": True, "data": _auth_response(user)}

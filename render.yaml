@@ -7,5 +7,13 @@ services:
     envVars:
       - key: MONGO_URI
         sync: false
-      - key: DB_NAME
+      - key: MONGO_DB
         value: ai_agent_assist
+      - key: APP_ENV
+        value: production
+      - key: RELAYDESK_PUBLIC_APP_URL
+        value: https://moxper.vercel.app
+      - key: CORS_ORIGINS
+        value: https://moxper.vercel.app
+      - key: AUTH_SECRET
+        sync: false

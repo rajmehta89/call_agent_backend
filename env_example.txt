@@ -79,7 +79,6 @@ PORT=8000
 AUTH_SECRET=replace-with-a-long-random-secret
 APP_ENV=production
 ALLOW_PUBLIC_SIGNUP=false
-BOOTSTRAP_SETUP_TOKEN=replace-with-a-one-time-first-setup-token
 WORKSPACE_NAME=Your business name
 PUBLIC_APP_URL=http://127.0.0.1:3000
 SMTP_HOST=

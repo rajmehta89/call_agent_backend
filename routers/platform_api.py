@@ -28,6 +28,7 @@ from mongo_client import mongo_client
 from shopify_service import shopify_service
 from ai_services import AIServices
 from campaign_registry import CAMPAIGN_TYPES, create_campaign, delete_campaign, get_campaigns, update_campaign
+from routers.inbox_api import _thread_key
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/platform", tags=["platform"], dependencies=[Depends(require_user)])  # dashboard API: sign-in required for every route
 
 ROLE_PERMISSIONS = {role["name"]: role["permissions"] for role in DEFAULT_ROLES}  # one source of truth: auth_service.DEFAULT_ROLES
+
+
+def _public_app_url() -> str:
+    configured = os.getenv("RELAYDESK_PUBLIC_APP_URL", "").strip().rstrip("/")
+    if not configured:
+        raise HTTPException(status_code=503, detail="RELAYDESK_PUBLIC_APP_URL is not configured; team invitations are disabled.")
+    parsed = urlparse(configured)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=503, detail="RELAYDESK_PUBLIC_APP_URL must be a valid http(s) URL.")
+    return configured
 
 
 class ValuePayload(BaseModel):
@@ -1169,15 +1180,89 @@ def _team_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/team")
-def get_team(user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+def get_team(user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     workspace_id = user.get("workspace_id", "default")
-    members = list(mongo_client.users.find({"workspace_id": workspace_id}).sort("name", 1))
+    members = list(mongo_client.users.find({"workspace_id": workspace_id, "$or": [{"email_verified": {"$exists": False}}, {"email_verified": True}]}).sort("name", 1))
     pending = list(mongo_client.invitations.find({"workspace_id": workspace_id, "status": "pending"}).sort("created_at", -1))
     rows = [{**_team_row(member), "member_type": "user", "invitation_status": "accepted"} for member in members]
     rows.extend({**_team_row(invite), "member_type": "invitation", "active": False, "invitation_status": "pending"} for invite in pending if not any(member.get("email") == invite.get("email") for member in members))
     logger.info("team: %s listed team (%d members, %d pending invites)", user.get("email"), len(members), len(pending))
     return {"success": True, "data": _serialize(rows)}
+
+
+@router.get("/team/performance")
+def get_team_performance(days: int = Query(30, ge=0, le=365), user: Dict[str, Any] = Depends(require_permission("manage_team"))):
+    """Admin view of workload, handled calls, and follow-up activity by team member."""
+    _require_db()
+    workspace_id = user.get("workspace_id", "default")
+    member_rows = list(mongo_client.users.find(
+        {"workspace_id": workspace_id, "active": {"$ne": False}},
+        {"name": 1, "email": 1, "role": 1, "created_at": 1},
+    ).sort("name", 1))
+    member_ids = {str(row["_id"]) for row in member_rows}
+    metrics: Dict[str, Dict[str, Any]] = {
+        str(row["_id"]): {
+            "id": str(row["_id"]), "name": row.get("name") or row.get("email", ""), "email": row.get("email", ""),
+            "role": row.get("role", "agent"), "assigned_conversations": 0, "assigned_calls": 0,
+            "handled_calls": 0, "follow_ups": 0, "open_tasks": 0, "won": 0, "assigned_leads": 0,
+            "last_activity": None,
+        }
+        for row in member_rows
+    }
+    since = datetime.utcnow() - timedelta(days=days) if days else None
+
+    def in_range(value: Any) -> bool:
+        return not since or (isinstance(value, datetime) and value >= since)
+
+    leads = list(mongo_client.leads.find({"assigned_to": {"$in": list(member_ids)}}, {"_id": 1, "assigned_to": 1})) if member_ids else []
+    lead_owners: Dict[str, str] = {}
+    for lead in leads:
+        owner = str(lead.get("assigned_to") or "")
+        if owner in metrics:
+            lead_owners[str(lead["_id"])] = owner
+            metrics[owner]["assigned_leads"] += 1
+
+    thread_query: Dict[str, Any] = {"assigned_to": {"$in": list(member_ids)}} if member_ids else {"_id": {"$in": []}}
+    threads = list(mongo_client.inbox_threads.find(thread_query, {"_id": 1, "assigned_to": 1, "assigned_at": 1, "updated_at": 1, "stage": 1, "closed_at": 1}))
+    thread_owners: Dict[str, str] = {}
+    for thread in threads:
+        owner = str(thread.get("assigned_to") or "")
+        if owner not in metrics:
+            continue
+        thread_owners[str(thread["_id"])] = owner
+        if in_range(thread.get("assigned_at") or thread.get("updated_at")):
+            metrics[owner]["assigned_conversations"] += 1
+        if not thread.get("closed_at"):
+            stage = str(thread.get("stage") or "new_lead")
+            if stage == "follow_up":
+                metrics[owner]["follow_ups"] += 1
+            if stage in {"outreach", "scheduling", "servicing", "payment_collection", "follow_up"}:
+                metrics[owner]["open_tasks"] += 1
+            if stage == "won":
+                metrics[owner]["won"] += 1
+
+    call_query: Dict[str, Any] = {}
+    if since:
+        call_query["$or"] = [{"call_date": {"$gte": since}}, {"call_date": {"$exists": False}, "created_at": {"$gte": since}}]
+    calls = list(mongo_client.calls.find(call_query, {"lead_id": 1, "status": 1, "duration": 1, "call_date": 1, "created_at": 1, "phone_number": 1}))
+    for call in calls:
+        owner = lead_owners.get(str(call.get("lead_id") or "")) or thread_owners.get(_thread_key(call))
+        if owner not in metrics:
+            continue
+        metrics[owner]["assigned_calls"] += 1
+        status = str(call.get("status") or "").lower()
+        if status in {"completed", "transferred", "answered"} or int(call.get("duration") or 0) > 0:
+            metrics[owner]["handled_calls"] += 1
+        activity = call.get("call_date") or call.get("created_at")
+        if isinstance(activity, datetime) and (not metrics[owner]["last_activity"] or activity > metrics[owner]["last_activity"]):
+            metrics[owner]["last_activity"] = activity
+
+    open_threads = list(mongo_client.inbox_threads.find({"closed_at": {"$exists": False}}, {"assigned_to": 1}))
+    unassigned = sum(1 for thread in open_threads if not thread.get("assigned_to"))
+    rows = sorted(metrics.values(), key=lambda row: (-row["assigned_calls"], str(row["name"]).lower()))
+    totals = {key: sum(row[key] for row in rows) for key in ("assigned_conversations", "assigned_calls", "handled_calls", "follow_ups", "open_tasks", "won", "assigned_leads")}
+    return {"success": True, "data": {"days": days, "members": _serialize(rows), "totals": {**totals, "active_members": len(rows), "unassigned_conversations": unassigned}}}
 
 
 @router.post("/team")
@@ -1194,6 +1279,7 @@ def invite_team_member(payload: TeamMemberPayload, background_tasks: BackgroundT
     if mongo_client.users.find_one({"email": email, "workspace_id": user.get("workspace_id", "default")}) or mongo_client.invitations.find_one({"email": email, "workspace_id": user.get("workspace_id", "default"), "status": "pending"}):
         logger.warning("team: %s tried to re-invite %s (already a member or pending)", user.get("email"), email)
         raise HTTPException(status_code=409, detail="This email already belongs to the workspace or has a pending invitation")
+    origin = _public_app_url()
     now = datetime.utcnow()
     token = secrets.token_urlsafe(32)
     workspace_id = user.get("workspace_id", "default")
@@ -1202,8 +1288,7 @@ def invite_team_member(payload: TeamMemberPayload, background_tasks: BackgroundT
     invite["_id"] = result.inserted_id
     mongo_client.team_members.update_one({"email": email}, {"$set": {"name": payload.name.strip(), "email": email, "role": role_name, "permissions": payload.permissions, "active": False, "invitation_status": "pending", "updated_at": now}, "$setOnInsert": {"created_at": now}}, upsert=True)
     _audit("invite", "team_member", after={"email": email, "role": role_name}, actor=str(user.get("email", "workspace-owner")))
-    origin = os.getenv("PUBLIC_APP_URL") or os.getenv("FRONTEND_ORIGIN_ALT") or os.getenv("FRONTEND_ORIGIN_2") or os.getenv("FRONTEND_ORIGIN") or "http://127.0.0.1:3000"
-    invite_url = f"{origin.rstrip('/')}/invite/accept?token={token}"
+    invite_url = f"{origin}/invite/accept?token={token}"
     delivery = "queued" if email_service.configured else "manual_link_required"
     if email_service.configured:
         background_tasks.add_task(email_service.send_invitation, email, payload.name.strip(), user.get("workspace_name", "My workspace"), invite_url, role.get("label", role_name))

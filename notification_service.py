@@ -63,3 +63,20 @@ def notify_recipients(
             message=message,
         ))
     return count
+
+
+def notify_team_member_registered(*, name: str, email: str, role: str, link: str = "/settings/team") -> bool:
+    """Create an admin-only notification after an invited member completes registration."""
+    if not mongo_client.is_connected() or not hasattr(mongo_client, "notifications"):
+        return False
+    mongo_client.notifications.insert_one({
+        "type": "team_member_registered",
+        "channel": "admin",
+        "recipient": "admins",
+        "title": "New team member registered",
+        "message": f"{name} ({email}) joined the workspace as {role}.",
+        "link": link,
+        "created_at": datetime.utcnow(),
+        "read": False,
+    })
+    return True
