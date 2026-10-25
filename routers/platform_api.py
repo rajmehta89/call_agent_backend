@@ -728,6 +728,30 @@ def list_dubai_prospects(search: str = "", offset: int = Query(0, ge=0), limit: 
     return {"success": True, "data": {"items": _serialize(rows), "total": collection.count_documents(query)}}
 
 
+@router.post("/dubai-prospects/discover")
+def discover_dubai_prospects(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
+    """Find additional Dubai businesses and stage only owner-reviewed drafts."""
+    query = str(payload.value.get("query") or "businesses").strip()
+    location = str(payload.value.get("location") or "Dubai, United Arab Emirates").strip()
+    max_results = max(1, min(20, int(payload.value.get("max_results", 20))))
+    try:
+        result = discover_prospects(
+            query=query,
+            location=location,
+            max_results=max_results,
+            create_drafts=True,
+            target_drafts=max_results,
+            campaign_name="Dubai voice WhatsApp CRM outreach",
+            campaign_goal="Help Dubai businesses handle enquiries, route requests, and keep follow-up organised with practical voice and WhatsApp automation.",
+            scrape_intent=f"Find new {query} businesses in Dubai with public contact details.",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "data": result}
+
+
 def _dubai_email_copy(prospect: Dict[str, Any]) -> Dict[str, str]:
     company = str(prospect["company_name"])
     industry = str(prospect.get("industry") or "").lower()

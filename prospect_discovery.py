@@ -185,7 +185,8 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
         return ""
     rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "email": email, "campaign_goal": campaign_goal, "shared_context": shared_context})
     policy = get_email_policy()
-    approval_needed = bool(policy.get("approval_required")) and approval_window_open(policy)
+    owner_review_campaign = campaign_name == "Dubai voice WhatsApp CRM outreach"
+    approval_needed = owner_review_campaign or (bool(policy.get("approval_required")) and approval_window_open(policy))
     now = datetime.utcnow()
     row = {
         "company_name": prospect["company_name"],
@@ -200,7 +201,8 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
         "template_name": str(template.get("name", "Automatic outreach template")),
         "subject": rendered["subject"],
         "body": rendered["body"],
-        "status": "pending_approval" if approval_needed else "scheduled",
+        "status": "awaiting_owner_review" if owner_review_campaign else "pending_approval" if approval_needed else "scheduled",
+        "requires_explicit_approval": owner_review_campaign,
         "source": "google_places_discovery",
         "created_at": now,
         "updated_at": now,
