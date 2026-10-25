@@ -73,7 +73,6 @@ class MongoDBClient:
             self.shopify_oauth_states = self.db.shopify_oauth_states  # one-time "Connect with Shopify" requests
             self.audit_logs = self.db.audit_logs
             self.notifications = self.db.notifications
-            self.sms_messages = self.db.sms_messages
             self.email_outbox = self.db.email_outbox
             self.campaign_prospects = self.db.campaign_prospects
             self.discovery_runs = self.db.discovery_runs
@@ -93,7 +92,6 @@ class MongoDBClient:
             self.calls.create_index("call_date")
             self.calls.create_index("status")
             self.inbox_threads.create_index("assigned_to", sparse=True)
-            self.sms_messages.create_index([("workspace_id", 1), ("lead_id", 1), ("created_at", -1)])
             self.team_messages.create_index([("workspace_id", 1), ("created_at", -1)])
             self.team_messages.create_index("mentions")
             self.team_messages.create_index("conversation_id", sparse=True)

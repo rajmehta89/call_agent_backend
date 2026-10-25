@@ -17,7 +17,3 @@ services:
         value: https://moxper.vercel.app
       - key: AUTH_SECRET
         sync: false
-      - key: TWILIO_SMS_FROM
-        sync: false
-      - key: TWILIO_DEFAULT_REGION
-        value: IN
