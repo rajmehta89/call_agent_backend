@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import logging
@@ -24,7 +25,7 @@ from logging_setup import bind_call
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
 from qa_engine import DynamicQA
-from routers.calls_api import log_call, record_failed_call, update_call_from_twilio
+from routers.calls_api import log_call, record_failed_call, update_call_from_twilio, upsert_browser_lead
 from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
@@ -286,7 +287,7 @@ async def _twilio_clock_offset() -> float:
 
 
 @router.get("/browser-token")
-async def browser_token(user: Dict[str, Any] = Depends(require_permission("handle_calls"))):
+async def browser_token(request: Request, user: Dict[str, Any] = Depends(require_permission("handle_calls"))):
     """Issue a short-lived Voice SDK token without exposing Twilio credentials."""
     missing = [
         name for name, value in {
@@ -301,6 +302,13 @@ async def browser_token(user: Dict[str, Any] = Depends(require_permission("handl
 
     user_id = str(user.get("_id", "user"))[-12:]
     identity = f"browser_{user_id}_{secrets.token_hex(4)}"
+    await asyncio.to_thread(
+        upsert_browser_lead,
+        f"client:{identity}",
+        request.query_params.get("caller_name", ""),
+        request.query_params.get("caller_email", ""),
+        request.query_params.get("caller_phone", ""),
+    )
     twilio_now = int(time.time() + await _twilio_clock_offset())
     token = AccessToken(
         TWILIO_ACCOUNT_SID,

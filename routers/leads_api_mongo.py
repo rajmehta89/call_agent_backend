@@ -6,11 +6,15 @@ from timeutil import utc_iso, utc_now
 import csv
 import io
 import logging
+import mimetypes
 import os
+from pathlib import Path as FilePath
+from uuid import uuid4
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
-from fastapi import Depends, APIRouter, File, HTTPException, Path, Query, UploadFile
+from fastapi import Depends, APIRouter, File, HTTPException, Path, Query, Request, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse
 from phonenumbers import NumberParseException, PhoneNumberFormat, format_number, is_valid_number, parse
 from pydantic import BaseModel, Field
 from twilio.base.exceptions import TwilioRestException
@@ -19,12 +23,19 @@ from twilio.rest import Client
 from env_loader import load_project_env
 from mongo_client import mongo_client
 from routers.calls_api import log_call, update_lead_status_from_call
+import realtime
+from twilio_security import verify_twilio_request
 load_project_env()
 
 from auth_service import can_assign_conversations, require_permission, require_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_permission("manage_assigned_leads"))])  # dashboard API: sign-in required for every route
+sms_router = APIRouter(prefix="/api/twilio", tags=["SMS webhooks"])
+public_router = APIRouter(prefix="/api/leads", tags=["Lead media"])
+SMS_MEDIA_ROOT = FilePath(__file__).resolve().parents[1] / "media" / "sms"
+SMS_MEDIA_TYPES = {"image/", "audio/", "video/", "application/pdf"}
+MAX_SMS_MEDIA_BYTES = 5 * 1024 * 1024
 
 
 class Lead(BaseModel):
@@ -52,7 +63,9 @@ class LeadUpdate(BaseModel):
 
 
 class SmsMessage(BaseModel):
-    body: str = Field(..., min_length=1, max_length=1600)
+    body: str = Field(default="", max_length=1600)
+    media_urls: List[str] = Field(default_factory=list, max_items=4)
+    media_names: List[str] = Field(default_factory=list, max_items=4)
 
 
 def is_valid_object_id(value: str) -> bool:
@@ -92,6 +105,53 @@ def _lead_sms_number(value: str) -> str:
     if not is_valid_number(parsed):
         raise HTTPException(status_code=400, detail={"success": False, "error": "The lead phone number is invalid"})
     return format_number(parsed, PhoneNumberFormat.E164)
+
+
+def _sms_media_public_base() -> str:
+    return (os.getenv("TWILIO_PUBLIC_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+
+
+@router.post("/{lead_id}/sms-media")
+async def upload_lead_sms_media(
+    lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$"),
+    file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(require_user),
+):
+    """Store a small MMS attachment and return a public URL Twilio can fetch."""
+    _require_db()
+    lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id), **owner_scope(user)}, {"_id": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
+    content_type = str(file.content_type or "").lower().strip()
+    if not any(content_type.startswith(prefix) for prefix in SMS_MEDIA_TYPES):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Attach an image, audio, video, or PDF file"})
+    media_base = _sms_media_public_base()
+    if not media_base.startswith("https://"):
+        raise HTTPException(status_code=503, detail={"success": False, "error": "Media messaging needs a public HTTPS URL"})
+
+    payload = await file.read(MAX_SMS_MEDIA_BYTES + 1)
+    if len(payload) > MAX_SMS_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail={"success": False, "error": "Attachments must be 5 MB or smaller"})
+    extension = FilePath(file.filename or "").suffix.lower()[:10] or mimetypes.guess_extension(content_type) or ".bin"
+    filename = f"{uuid4().hex}{extension}"
+    SMS_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+    (SMS_MEDIA_ROOT / filename).write_bytes(payload)
+    mongo_client.db.sms_media.update_one(
+        {"filename": filename},
+        {"$set": {"filename": filename, "original_name": file.filename or filename, "content_type": content_type, "lead_id": lead_id, "created_at": utc_now()}},
+        upsert=True,
+    )
+    return {"success": True, "data": {"url": f"{media_base}/api/leads/sms-media/{filename}", "name": file.filename or filename, "content_type": content_type}}
+
+
+@public_router.get("/sms-media/{filename}", include_in_schema=False)
+def get_public_sms_media(filename: str):
+    """Public, randomised media URL used by Twilio for MMS delivery."""
+    safe_name = FilePath(filename).name
+    path = SMS_MEDIA_ROOT / safe_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+    return FileResponse(path, media_type=mimetypes.guess_type(safe_name)[0] or "application/octet-stream")
 
 
 def _call_counts(lead_ids: List[Any]) -> Dict[str, int]:
@@ -320,6 +380,34 @@ def call_lead_endpoint(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")):
     raise HTTPException(status_code=410, detail="Outbound calling is disabled in this inbound-only project")
 
 
+@router.get("/{lead_id}/sms")
+def get_lead_sms(
+    lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$"),
+    user: Dict[str, Any] = Depends(require_user),
+):
+    """Return the lead's outbound SMS thread for the lead detail chat window."""
+    _require_db()
+    lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id), **owner_scope(user)}, {"_id": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
+
+    messages = list(
+        mongo_client.sms_messages.find(
+            {"lead_id": lead_id, "workspace_id": user.get("workspace_id", "default")}
+        ).sort("created_at", 1).limit(100)
+    )
+    for message in messages:
+        message["_id"] = str(message["_id"])
+        message["direction"] = message.get("direction") or "outbound"
+        message["media_urls"] = list(message.get("media_urls") or [])
+        message["media_names"] = list(message.get("media_names") or [])
+        message["media_attachments"] = [
+            {"url": url, "name": message["media_names"][index] if index < len(message["media_names"]) and message["media_names"][index] else url.rsplit("/", 1)[-1] or "Attachment"}
+            for index, url in enumerate(message["media_urls"])
+        ]
+    return {"success": True, "data": messages}
+
+
 @router.post("/{lead_id}/sms")
 def send_lead_sms(
     lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$"),
@@ -328,8 +416,8 @@ def send_lead_sms(
 ):
     """Send through Twilio to the lead's stored number, never to a team member number."""
     _require_db()
-    if payload is None or not payload.body.strip():
-        raise HTTPException(status_code=400, detail={"success": False, "error": "Message text is required"})
+    if payload is None or (not payload.body.strip() and not payload.media_urls):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Add a message or attachment"})
 
     lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id), **owner_scope(user)})
     if not lead:
@@ -343,10 +431,26 @@ def send_lead_sms(
 
     to_number = _lead_sms_number(lead.get("phone"))
     body = payload.body.strip()
+    media_urls = [str(url).strip() for url in payload.media_urls if str(url).strip()]
+    media_names = [str(name).strip()[:180] for name in payload.media_names[:len(media_urls)]]
+    media_names.extend(["" for _ in range(len(media_names), len(media_urls))])
+    for index, url in enumerate(media_urls):
+        if media_names[index] and media_names[index].lower() != "attachment":
+            continue
+        metadata = mongo_client.db.sms_media.find_one({"filename": FilePath(url.split("/", 1)[-1]).name}, {"original_name": 1})
+        media_names[index] = str((metadata or {}).get("original_name") or "Attachment")[:180]
+    media_base = _sms_media_public_base()
+    if any(not media_base or not url.startswith(f"{media_base}/api/leads/sms-media/") for url in media_urls):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Attachment URL is not valid for this workspace"})
 
     try:
         client = Client(account_sid, auth_token)
         create_kwargs = {"body": body, "from_": from_number, "to": to_number}
+        if media_urls:
+            create_kwargs["media_url"] = media_urls
+        status_base = _sms_media_public_base()
+        if status_base.startswith("https://"):
+            create_kwargs["status_callback"] = f"{status_base}/api/twilio/sms/status"
         message = client.messages.create(**create_kwargs)
     except TwilioRestException as exc:
         logger.exception("Twilio could not send lead SMS for %s", lead_id)
@@ -359,6 +463,9 @@ def send_lead_sms(
         "to": to_number,
         "from": from_number,
         "body": body,
+        "media_urls": media_urls,
+        "media_names": media_names,
+        "direction": "outbound",
         "provider": "twilio",
         "provider_message_id": message.sid,
         "num_segments": message.num_segments,
@@ -368,8 +475,85 @@ def send_lead_sms(
         "created_at": now,
     })
     mongo_client.leads.update_one({"_id": ObjectId(lead_id)}, {"$set": {"last_sms_at": now, "updated_at": now}})
+    realtime.publish("sms", key=lead.get("browser_identity") or f"lead:{lead_id}", workspace=user.get("workspace_id", "default"))
     logger.info("Lead SMS sent by %s to lead %s via Twilio (%s)", user.get("email"), lead_id, message.sid)
     return {"success": True, "data": {"message_id": message.sid, "status": message.status, "num_segments": message.num_segments, "to": to_number}}
+
+
+@sms_router.post("/sms/status", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
+async def receive_sms_status(request: Request):
+    """Update the message tick state from Twilio delivery callbacks."""
+    _require_db()
+    form = dict(await request.form())
+    provider_id = str(form.get("MessageSid") or "").strip()
+    status = str(form.get("MessageStatus") or form.get("SmsStatus") or "").strip().lower()
+    if not provider_id or not status:
+        return PlainTextResponse("<Response></Response>", media_type="text/xml")
+    result = mongo_client.sms_messages.update_one(
+        {"provider_message_id": provider_id},
+        {"$set": {"status": status, "error_code": str(form.get("ErrorCode") or ""), "updated_at": utc_now()}},
+    )
+    if result.matched_count:
+        message = mongo_client.sms_messages.find_one({"provider_message_id": provider_id}, {"lead_id": 1}) or {}
+        lead = mongo_client.leads.find_one({"_id": ObjectId(str(message.get("lead_id")))}, {"browser_identity": 1}) if ObjectId.is_valid(str(message.get("lead_id"))) else None
+        realtime.publish("sms", key=(lead or {}).get("browser_identity") or f"lead:{message.get('lead_id', '')}")
+    return PlainTextResponse("<Response></Response>", media_type="text/xml")
+
+
+@sms_router.post("/sms/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
+async def receive_inbound_sms(request: Request):
+    """Persist an inbound SMS/MMS reply in the same one-to-one lead timeline."""
+    _require_db()
+    form = dict(await request.form())
+    raw_from = str(form.get("From") or "").strip()
+    if not raw_from:
+        return PlainTextResponse("<Response></Response>", media_type="text/xml")
+    try:
+        from_number = _lead_sms_number(raw_from)
+    except HTTPException:
+        from_number = raw_from
+    lead = mongo_client.leads.find_one({"phone": {"$in": [from_number, raw_from]}})
+    now = utc_now()
+    if not lead:
+        lead = {
+            "name": str(form.get("ProfileName") or from_number),
+            "phone": from_number,
+            "email": "",
+            "company": "",
+            "notes": "Created from an inbound SMS.",
+            "status": "new",
+            "source": "sms",
+            "call_attempts": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+        lead["_id"] = mongo_client.leads.insert_one(lead).inserted_id
+    lead_id = str(lead["_id"])
+    media_urls = [str(form.get(f"MediaUrl{index}") or "").strip() for index in range(4)]
+    media_urls = [url for url in media_urls if url]
+    media_names = [str(form.get(f"MediaContentType{index}") or "Attachment").split("/")[-1].upper() + " attachment" for index in range(len(media_urls))]
+    mongo_client.sms_messages.insert_one({
+        "workspace_id": lead.get("workspace_id", "default"),
+        "lead_id": lead_id,
+        "to": str(form.get("To") or ""),
+        "from": from_number,
+        "body": str(form.get("Body") or "").strip(),
+        "media_urls": media_urls,
+        "media_names": media_names,
+        "direction": "inbound",
+        "provider": "twilio",
+        "provider_message_id": str(form.get("MessageSid") or ""),
+        "status": "received",
+        "created_at": now,
+    })
+    mongo_client.leads.update_one({"_id": lead["_id"]}, {"$set": {"last_sms_at": now, "updated_at": now}})
+    key = lead.get("browser_identity") or f"lead:{lead_id}"
+    linked_call = mongo_client.calls.find_one({"lead_id": {"$in": [lead_id, lead["_id"]]}}, {"phone_number": 1})
+    if linked_call:
+        from routers.calls_api import caller_identity
+        key = caller_identity(linked_call.get("phone_number") or "") or key
+    realtime.publish("sms", key=key)
+    return PlainTextResponse("<Response></Response>", media_type="text/xml")
 
 
 @router.get("/{lead_id}")

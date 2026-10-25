@@ -82,6 +82,7 @@ class ClosePayload(BaseModel):
 class ProfilePayload(BaseModel):
     """Contact fields editable from the inbox; a field left out is not changed."""
     name: Optional[str] = Field(default=None, max_length=120)
+    phone: Optional[str] = Field(default=None, max_length=40)
     email: Optional[str] = Field(default=None, max_length=200)
     company: Optional[str] = Field(default=None, max_length=160)
     address: Optional[str] = Field(default=None, max_length=300)
@@ -223,9 +224,13 @@ def _browser_owner_names() -> Dict[str, str]:
 
 
 def _display_name(key: str, lead: Optional[Dict[str, Any]], owners: Dict[str, str]) -> str:
+    lead_name = str((lead or {}).get("name") or "").strip()
+    lead_phone = str((lead or {}).get("phone") or "").strip()
+    if key in owners and lead_name and lead_phone and not lead_phone.startswith(("client:", "web:")):
+        return lead_name
     if key in owners:
         return f"Browser test · {owners[key]}"
-    name = (lead or {}).get("name") or ""
+    name = lead_name
     generic = not name or name.startswith(("Inbound caller", "Browser caller", "Web caller"))
     if key.startswith(("web:", "call:")):
         return name if not generic else "Web caller" if key.startswith("web:") else "Unknown caller"
@@ -255,7 +260,7 @@ def _build_threads() -> List[Dict[str, Any]]:
         grouped.setdefault(_thread_key(call), []).append(call)
 
     lead_ids = {ObjectId(str(call["lead_id"])) for call in calls if call.get("lead_id") and ObjectId.is_valid(str(call["lead_id"]))}
-    leads = {str(lead["_id"]): lead for lead in mongo_client.leads.find({"_id": {"$in": list(lead_ids)}}, {"name": 1, "company": 1})} if lead_ids else {}
+    leads = {str(lead["_id"]): lead for lead in mongo_client.leads.find({"_id": {"$in": list(lead_ids)}}, {"name": 1, "company": 1, "phone": 1})} if lead_ids else {}
     states = {state["_id"]: state for state in mongo_client.inbox_threads.find({"_id": {"$in": list(grouped)}})}
     owners = _browser_owner_names()
 
@@ -263,12 +268,14 @@ def _build_threads() -> List[Dict[str, Any]]:
     for key, items in grouped.items():
         latest = max(items, key=_when)
         lead = next((leads.get(str(call.get("lead_id"))) for call in items if leads.get(str(call.get("lead_id")))), None)
+        lead_phone = str((lead or {}).get("phone") or "").strip()
+        display_phone = lead_phone if lead_phone and not lead_phone.startswith(("client:", "web:")) else caller_identity(latest.get("phone_number") or "")
         last_line = (latest.get("messages") or [{}])[-1].get("text") or (latest.get("ai_responses") or [{}])[-1].get("content") or ""
         state = states.get(key, {})
         last_at = _utc(_when(latest))
         closed_at = state.get("closed_at")
         threads.append({
-            "key": key, "name": _display_name(key, lead, owners), "phone": caller_identity(latest.get("phone_number") or ""),
+            "key": key, "name": _display_name(key, lead, owners), "phone": display_phone,
             # Closing lasts until the caller calls again (a newer call reopens it), like Podium.
             "closed": isinstance(closed_at, datetime) and last_at <= closed_at, "closed_by_name": state.get("closed_by_name"),
             "last_at": last_at, "preview": last_line or _full_call_summary(latest), "summary": _full_call_summary(latest),
@@ -549,7 +556,7 @@ def update_profile(key: str, payload: ProfilePayload, user: Dict[str, Any] = Dep
         return {"success": True}
     now = utc_now()
     lead_id = next((str(call["lead_id"]) for call in calls if call.get("lead_id") and ObjectId.is_valid(str(call["lead_id"]))), None)
-    lead_fields = {field: changes[field] for field in ("name", "email", "company") if field in changes}
+    lead_fields = {field: changes[field] for field in ("name", "phone", "email", "company") if field in changes}
     if lead_id and lead_fields:
         mongo_client.leads.update_one({"_id": ObjectId(lead_id)}, {"$set": {**lead_fields, "updated_at": now}})
     lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id)}, {"phone": 1}) if lead_id else None
@@ -611,7 +618,7 @@ def _profile(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     lead = (mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id else None) or {}
     phone = lead.get("phone") or calls[-1].get("phone_number")
     customer = (mongo_client.customers.find_one({"phone": phone}) if phone else None) or {}
-    return {"name": lead.get("name") or customer.get("name"), "email": lead.get("email") or customer.get("email"), "company": lead.get("company"),
+    return {"name": lead.get("name") or customer.get("name"), "phone": phone, "email": lead.get("email") or customer.get("email"), "company": lead.get("company"),
             "address": customer.get("location"), "tags": customer.get("tags") or [],
             "source": lead.get("source") or ("Web call" if str(phone or "").startswith("client:") else "Phone"),
             "lead_status": lead.get("status") or customer.get("lead_status"), "created_at": _utc(lead.get("created_at") or customer.get("created_at") or _when(calls[0])),

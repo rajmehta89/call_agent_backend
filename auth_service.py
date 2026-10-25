@@ -123,8 +123,14 @@ def role_document(role_name: str) -> Optional[Dict[str, Any]]:
 
 
 def permissions_for(user: Dict[str, Any]) -> List[str]:
-    role = role_document(str(user.get("role", "agent"))) or {}
-    return list(dict.fromkeys((role.get("permissions") or []) + (user.get("permissions") or [])))
+    role_name = str(user.get("role", "agent")).strip().lower()
+    role = role_document(role_name) or {}
+    configured = list(role.get("permissions") or []) + list(user.get("permissions") or [])
+    # Owner/Admin are built-in full-access roles. Keep that invariant even when an older
+    # deployment has not created or refreshed its built-in role documents yet.
+    if role_name in {"owner", "admin"}:
+        configured.insert(0, "*")
+    return list(dict.fromkeys(configured))
 
 
 def has_permission(user: Dict[str, Any], permission: str) -> bool:

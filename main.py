@@ -40,7 +40,7 @@ from timeutil import api_time
 fastapi.encoders.ENCODERS_BY_TYPE[datetime] = api_time
 
 from routers import auth_api, call_forwarding_api, calls_api, config_api, custom_twilio_voice_api, data_reset_api, inbox_api, overview_api, platform_api, retell_api, shopify_api, transfer_api, twilio_api, voice_provider_api
-from routers.leads_api_mongo import router as leads_router
+from routers.leads_api_mongo import public_router as leads_public_router, router as leads_router, sms_router
 import realtime
 
 # Create FastAPI app
@@ -117,6 +117,8 @@ app.include_router(retell_api.router)
 app.include_router(transfer_api.router)
 app.include_router(call_forwarding_api.router)
 app.include_router(leads_router)
+app.include_router(leads_public_router)
+app.include_router(sms_router)
 app.include_router(voice_provider_api.router)
 app.include_router(realtime.router)
 

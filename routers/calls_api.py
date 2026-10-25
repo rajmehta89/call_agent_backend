@@ -163,6 +163,50 @@ class LogCallRequest(BaseModel):
     call_data: Optional[Dict[str, Any]] = None
 
 
+def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", phone: str = "") -> Optional[str]:
+    """Save the caller details collected before a browser test call starts."""
+    if not mongo_client.is_connected():
+        return None
+
+    identity = caller_identity(browser_phone)
+    clean_name = re.sub(r"\s+", " ", str(name or "").strip())[:120]
+    clean_email = str(email or "").strip()[:180]
+    clean_phone = re.sub(r"[^\d+]", "", str(phone or "").strip())[:40]
+    now = utc_now()
+    existing = mongo_client.leads.find_one({"$or": [{"browser_identity": identity}, {"phone": identity}]})
+    if not existing and clean_phone:
+        existing = mongo_client.leads.find_one({"phone": clean_phone})
+
+    values = {
+        "browser_identity": identity,
+        "updated_at": now,
+    }
+    if clean_name:
+        values["name"] = clean_name
+    if clean_email:
+        values["email"] = clean_email
+    if clean_phone:
+        values["phone"] = clean_phone
+
+    if existing:
+        mongo_client.leads.update_one({"_id": existing["_id"]}, {"$set": values})
+        return str(existing["_id"])
+
+    values.update({
+        "name": clean_name or "Browser caller",
+        "phone": clean_phone or identity,
+        "email": clean_email,
+        "company": "",
+        "notes": "Automatically captured from a browser voice test.",
+        "status": "new",
+        "source": "voice",
+        "call_attempts": 0,
+        "created_at": now,
+    })
+    inserted = mongo_client.leads.insert_one(values)
+    return str(inserted.inserted_id)
+
+
 def update_lead_status_from_call(phone_number: str, lead_id: Optional[str], call_data: Dict[str, Any]) -> None:
     """
     Update lead status based on call activity and interest analysis
@@ -266,7 +310,8 @@ def _ensure_inbound_lead(
 
     session_id = str(data.get("call_session_id") or "").strip()
     lead_phone = f"web:{session_id}" if raw_identifier.lower() == "web caller" and session_id else raw_identifier
-    existing = mongo_client.leads.find_one({"phone": lead_phone})
+    existing = mongo_client.leads.find_one({"browser_identity": raw_identifier}) if raw_identifier.startswith("client:browser_") else None
+    existing = existing or mongo_client.leads.find_one({"phone": lead_phone})
     if existing:
         return str(existing["_id"]), existing
 

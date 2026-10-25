@@ -53,6 +53,7 @@ coverage.xml
 # Logs and miscellaneous
 *.log
 logs/
+media/
 *.tmp
 
 # Local configuration files
