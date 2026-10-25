@@ -958,9 +958,9 @@ async def retell_webhook(request: Request) -> Response:
 FORWARD_AFTER_SECONDS = 5.0
 
 
-async def _hand_to_team(call_id: str, call_sid: str, caller: str) -> None:
+async def _hand_to_team(call_id: str, call_sid: str, caller: str, requested_text: str = "") -> None:
     await asyncio.sleep(FORWARD_AFTER_SECONDS)
-    if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id):
+    if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id, requested_text):
         _trace(f"retell_forwarding_failed call={call_id}", error=True)
         transfer_service.request_transfer(call_id, "Caller asked for a person; the transfer could not start", "retell_callback", 0.95,
                                           phone_number=caller)
@@ -1075,6 +1075,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             transfer_service.append_message(call_id, "user", caller_text)
 
         streamed = False
+        transfer_intent = await asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if caller_text else ""
+        specific_agent = await asyncio.to_thread(call_forwarding.requested_agent, caller_text) if caller_text and transfer_intent in {"callback", "unclear"} else None
         if event.get("interaction_type") == "response_required" and caller_text and call_is_over(caller_text, last_agent_text(transcript)):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             _trace(f"retell_call_over call={call_id} response_id={response_id} caller={caller_text!r}")
@@ -1083,12 +1085,14 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             return
         if event.get("interaction_type") == "reminder_required" and not caller_text:
             reply = "Is there anything else I can help you with?"
-        elif event.get("interaction_type") == "response_required" and caller_text and call_forwarding.forwarding_on()                 and call_forwarding.twilio_call_for_retell(call_id) and await asyncio.to_thread(call_forwarding.wants_person, caller_text):
+        elif event.get("interaction_type") == "response_required" and caller_text and call_forwarding.forwarding_on()                 and call_forwarding.twilio_call_for_retell(call_id) and transfer_intent == "live":
             # Call forwarding is on and the caller asked for a person: say so, then ring the team once it has been said.
             reply = call_forwarding.CONNECTING_LINE
             twilio_call = call_forwarding.twilio_call_for_retell(call_id) or {}
-            asyncio.create_task(_hand_to_team(call_id, twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number))
-        elif event.get("interaction_type") == "response_required" and caller_text and await asyncio.to_thread(call_forwarding.asks_for_team, caller_text) == "person":
+            asyncio.create_task(_hand_to_team(call_id, twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number, caller_text))
+        elif event.get("interaction_type") == "response_required" and caller_text and (
+            transfer_intent == "live" or specific_agent
+        ):
             callback_requested = True
             transfer_service.request_transfer(
                 call_id,
@@ -1097,8 +1101,17 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 0.95,
                 phone_number=caller_number,
             )
+            destination = await asyncio.to_thread(
+                call_forwarding.create_callback_outreach,
+                caller_number,
+                caller_text,
+                call_id,
+                specific_agent.get("name") if specific_agent else "",
+                f"The caller asked to speak with a specific team member, but a live transfer was not available. Please follow up.",
+            )
+            transfer_service.update_transfer(call_id, "requested", destination)
             _trace(f"retell_human_callback_requested call={call_id} response_id={response_id}")
-            reply = "I have marked your request for a human callback. Our team will contact you using this number as soon as possible."
+            reply = f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
         else:
             answer_parts: List[str] = []
             async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required"):
@@ -1229,7 +1242,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     "sentiment": "neutral",
                     "transfer_requested": callback_requested,
                     "transfer_status": transfer_status,
-                    "transfer_destination": "Callback queue" if callback_requested else None,
+                    "transfer_destination": handoff.get("transfer_destination") or ("Callback queue" if callback_requested else None),
                     "transfer_succeeded": False,
                     "call_session_id": call_id,
                     "provider": "retell",

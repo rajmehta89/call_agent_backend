@@ -775,7 +775,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if not pending_mark:
                 break
             await asyncio.sleep(0.1)
-        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller):
+        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, "", text):
             logger.info("custom voice: call=%s handed to the team %.2fs after the caller asked", call_sid, perf_counter() - heard_at)
             return
         transfer_pending = False
@@ -795,6 +795,25 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             transfer_pending = True
             drop_reply(prepared)
             await forward_to_team(text, heard_at)
+        elif intent in {"callback", "unclear"} and await asyncio.to_thread(call_forwarding.requested_agent, text):
+            # A named request should never disappear into a generic callback queue, even when a live transfer
+            # is unavailable or the caller did not clearly say "now". Create the outreach for that person.
+            earlier_handoff_text = ""
+            drop_reply(prepared)
+            destination = await asyncio.to_thread(
+                call_forwarding.create_callback_outreach,
+                caller,
+                text,
+                call_sid,
+                "",
+                "The caller asked to speak with a specific team member. Please follow up with this caller.",
+            )
+            line = f"I have noted your request for {destination}. They or the team will contact you using this number."
+            spoke_at = utc_iso()
+            await speak(line)
+            memory.add(text, line)
+            responses.append({"content": line, "timestamp": spoke_at})
+            save_progress()
         elif intent == "unclear":
             if len(text.split()) > 2:
                 earlier_handoff_text = text

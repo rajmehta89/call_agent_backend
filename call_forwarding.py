@@ -1,10 +1,10 @@
 """Live call forwarding to the human team.
 
 An admin turns it on and lists the agents' phone numbers (Settings > Call forwarding). When it is on and a caller asks
-to talk to a person, the AI says it is connecting them and the call is moved off the AI: every available agent's phone
-rings at once, and the first phone to answer is connected. If nobody answers in time, the caller hears that the team will call back, and the call
-is saved as a callback request (Outreach). When it is off, nothing changes: the AI handles the call and a request for a
-person becomes a callback request.
+to talk to a person, the AI says it is connecting them and the call is moved off the AI. If the caller names a configured
+team member, only that member is rung; otherwise every available agent rings at once and the first phone to answer is
+connected. If nobody answers in time, the caller hears that the team will call back, and the call is saved as a callback
+request (Outreach). When it is off, nothing changes: the AI handles the call and a request for a person becomes a callback request.
 
 Works for both voice paths: the custom stack knows the Twilio call itself; for Retell the Twilio call is remembered
 when Retell is given the call (remember_retell_call), since Retell only tells us its own call id.
@@ -66,8 +66,15 @@ def _clean_agents(agents: Any) -> List[Dict[str, Any]]:
     for item in agents if isinstance(agents, list) else []:
         if not isinstance(item, dict):
             continue
-        cleaned.append({"name": str(item.get("name") or "").strip()[:80], "phone": str(item.get("phone") or "").strip()[:32],
-                        "enabled": bool(item.get("enabled", True))})
+        aliases = item.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [part.strip() for part in aliases.split(",") if part.strip()]
+        cleaned_item = {"name": str(item.get("name") or "").strip()[:80], "phone": str(item.get("phone") or "").strip()[:32],
+                        "enabled": bool(item.get("enabled", True))}
+        cleaned_aliases = [str(alias).strip()[:80] for alias in aliases if str(alias).strip()][:8]
+        if cleaned_aliases:
+            cleaned_item["aliases"] = cleaned_aliases
+        cleaned.append(cleaned_item)
     return cleaned[:MAX_AGENTS]
 
 
@@ -95,7 +102,10 @@ def validate(payload: Dict[str, Any]) -> Dict[str, Any]:
         number = normalize_number(agent["phone"])
         if not number:
             raise ValueError(f"Agent {index} ({agent['name'] or 'no name'}): '{agent['phone']}' is not a valid phone number")
-        agents.append({"name": agent["name"] or f"Agent {index}", "phone": number, "enabled": agent["enabled"]})
+        saved_agent = {"name": agent["name"] or f"Agent {index}", "phone": number, "enabled": agent["enabled"]}
+        if agent.get("aliases"):
+            saved_agent["aliases"] = agent["aliases"]
+        agents.append(saved_agent)
     numbers = [agent["phone"] for agent in agents]
     if len(numbers) != len(set(numbers)):
         raise ValueError("The same phone number is listed twice")
@@ -127,6 +137,30 @@ def save_settings(payload: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, An
 def active_agents(settings: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     settings = settings or get_settings()
     return [agent for agent in settings["agents"] if agent["enabled"] and agent["phone"]]
+
+
+def requested_agent(caller_text: str, settings: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Return the enabled agent named by the caller, using a full name, first name, or configured alias."""
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(caller_text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    agents = active_agents(settings)
+    candidates: List[tuple[int, Dict[str, Any], str]] = []
+    for agent in agents:
+        name = str(agent.get("name") or "").strip().lower()
+        aliases = agent.get("aliases") or []
+        terms = [name, *[str(alias).strip().lower() for alias in aliases]]
+        parts = name.split()
+        if len(parts) > 1 and parts[0] not in {"team", "human", "agent"}:
+            # A first name is convenient in a live call, but only wins if it is unique among active agents.
+            same_first_name = sum(1 for other in agents if str(other.get("name") or "").strip().lower().split()[:1] == parts[:1])
+            if same_first_name == 1:
+                terms.append(parts[0])
+        for term in {term for term in terms if len(term) >= 2}:
+            if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", normalized):
+                candidates.append((len(term), agent, term))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 _ON_CACHE: Dict[str, Any] = {"at": -1e9, "on": False, "refreshing": False}
@@ -278,14 +312,16 @@ def _caller_id(caller: str) -> str:
     return (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
 
 
-def transfer_twiml(caller: str, settings: Optional[Dict[str, Any]] = None) -> str:
-    """Ring every active agent at once and bridge the first answer to the caller."""
+def transfer_twiml(caller: str, settings: Optional[Dict[str, Any]] = None, requested_text: str = "") -> str:
+    """Ring the named agent when matched, otherwise ring every active agent."""
     settings = settings or get_settings()
     base = _base_url()
     agents = active_agents(settings)
-    if not agents or not base:
-        raise RuntimeError("call forwarding has no active agents" if not agents else "TWILIO_PUBLIC_BASE_URL is not set")
-    numbers = "".join(f'<Number>{html.escape(agent["phone"])}</Number>' for agent in agents)
+    matched = requested_agent(requested_text, settings)
+    targets = [matched] if matched else agents
+    if not targets or not base:
+        raise RuntimeError("call forwarding has no active agents" if not targets else "TWILIO_PUBLIC_BASE_URL is not set")
+    numbers = "".join(f'<Number>{html.escape(agent["phone"])}</Number>' for agent in targets)
     caller_id = _caller_id(caller)
     caller_attr = f' callerId="{html.escape(caller_id, quote=True)}"' if caller_id else ""
     result = html.escape(f"{base}/api/call-forwarding/dial-result", quote=True)
@@ -366,29 +402,67 @@ def dial_result_twiml(accepted: bool) -> str:
 
 
 # ---- Moving a live call to the team, and recording what happened
-def transfer(call_sid: str, caller: str, session_id: str = "") -> bool:
+def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: str = "") -> bool:
     """Take the live call away from the AI and ring the team. False when it could not be started (the AI carries on).
     `session_id`: the id the call is stored under when it is not the Twilio call (Retell)."""
     from routers.twilio_api import _get_twilio_client
     client = _get_twilio_client()
     if client is None or not call_sid:
         logger.warning("call forwarding: Twilio is not configured; cannot transfer %s", call_sid)
+        create_callback_outreach(caller, requested_text, session_id or call_sid,
+                                 message="A caller asked to speak with a team member, but the live transfer was unavailable.")
         return False
     settings = get_settings()
+    matched = requested_agent(requested_text, settings)
+    destination = matched.get("name") if matched else "Human team"
     try:
-        twiml = transfer_twiml(caller, settings)
+        twiml = transfer_twiml(caller, settings, requested_text)
         client.calls(call_sid).update(twiml=twiml)
     except Exception as error:
         logger.warning("call forwarding: could not transfer %s: %s", call_sid, error)
+        create_callback_outreach(caller, requested_text, session_id or call_sid, destination=destination,
+                                 message=f"A caller asked to speak with {destination}, but the live transfer could not start.")
         return False
-    targets = [{"name": agent["name"], "phone": agent["phone"], "status": "requested"} for agent in active_agents(settings)]
+    targets = [{"name": agent["name"], "phone": agent["phone"], "status": "requested"}
+               for agent in ([matched] if matched else active_agents(settings))]
     _record(call_sid, {"transfer_requested": True, "transfer_status": "ringing", "transfer_mode": MODE, "twilio_call_sid": call_sid,
                        "transfer_targets": targets,
-                       "status": "transfer_requested", "transfer_destination": "Human team", "transfer_started_at": datetime.utcnow()},
+                       "status": "transfer_requested", "transfer_destination": destination, "requested_agent": destination if matched else None,
+                       "transfer_started_at": datetime.utcnow()},
             session_id or call_sid)
-    _timeline(call_sid, caller, f"Caller asked for a person: ringing {len(active_agents(settings))} team member(s)")
-    logger.info("call forwarding: %s moved to the team (%d agent(s), %ss)", call_sid, len(active_agents(settings)), settings["ring_seconds"])
+    _timeline(call_sid, caller, f"Caller asked for {destination}: ringing {destination if matched else f'{len(targets)} team member(s)'}")
+    try:
+        create_callback_outreach(caller, requested_text, session_id or call_sid, destination=destination,
+                                 message=f"A caller is being connected to {destination}.", notify_only=True)
+    except Exception as error:
+        logger.warning("call forwarding: could not notify %s about %s: %s", destination, call_sid, error)
+    logger.info("call forwarding: %s moved to %s (%d agent(s), %ss)", call_sid, destination, len(targets), settings["ring_seconds"])
     return True
+
+
+def create_callback_outreach(
+    caller: str,
+    requested_text: str,
+    session_id: str = "",
+    destination: str = "",
+    message: str = "",
+    notify_only: bool = False,
+) -> str:
+    """Create the in-app outreach notification for a named request or the general human team."""
+    settings = get_settings()
+    matched = requested_agent(requested_text, settings)
+    recipient = destination or (matched.get("name") if matched else "Human team")
+    from notification_service import notify_human_assignment
+    notify_human_assignment(
+        channel="voice",
+        customer=caller or "caller",
+        recipient=recipient,
+        call_session_id=session_id or None,
+        message=message or f"A caller asked to speak with {recipient}. Please follow up.",
+    )
+    if not notify_only:
+        logger.info("call forwarding: outreach created for %s (%s)", recipient, session_id)
+    return recipient
 
 
 def agent_accepted(parent_call_sid: str, agent_number: str) -> None:
@@ -454,8 +528,9 @@ def dial_finished(call_sid: str, dial_status: str, caller: str, dial_call_sid: s
     try:
         from notification_service import notify_human_assignment
         number = caller or (call or {}).get("phone_number") or ""
-        notify_human_assignment(channel="voice", customer=number, recipient="Human team", call_session_id=call_sid,
-                                message=f"{number or 'A caller'} asked for a person but nobody was free: please call them back.")
+        destination = str((call or {}).get("transfer_destination") or "Human team")
+        notify_human_assignment(channel="voice", customer=number, recipient=destination, call_session_id=call_sid,
+                                message=f"{number or 'A caller'} asked to speak with {destination} but nobody was free: please call them back.")
     except Exception as error:
         logger.warning("call forwarding: could not notify the team about %s: %s", call_sid, error)
     logger.info("call forwarding: %s not accepted (%s); callback requested", call_sid, status)
