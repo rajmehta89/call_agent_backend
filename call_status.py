@@ -79,7 +79,9 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n"
         f"System-validated contact number: {contact_phone or '(none)'}. If present, it is valid and overrides any agent guess that it was short or incomplete.\n"
         f"System transfer result: requested={bool(call.get('transfer_requested'))}, status={call.get('transfer_status') or 'not attempted'}, "
-        f"connected={bool(call.get('transfer_succeeded'))}. This system result is authoritative; an AI promise to transfer is not proof of a connection.\n"
+        f"connected={bool(call.get('transfer_succeeded'))}. This system result is authoritative; an AI promise to transfer is not proof of a connection. "
+        "When requested=false, no dial was initiated: say 'no live transfer was attempted' if describing the outcome. "
+        "Never say a transfer was attempted or completed unless the system result confirms it.\n"
         "If the caller asked to speak with someone now, describe it as a live transfer request, even if the agent incorrectly offered a later callback.\n\n"
         f"Transcript:\n{transcript or '(none)'}\n\n"
         'Answer with JSON only: {"stage": "<one stage id>", "reason": "<one short sentence for the team, quoting what the caller wanted>", '
