@@ -119,15 +119,39 @@ def _normalize_agent(agent: Dict[str, Any]) -> Dict[str, Any]:
     aliases = agent.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [item.strip() for item in aliases.split(",") if item.strip()]
+    preferred_languages = []
+    for value in agent.get("preferred_languages") or agent.get("languages") or []:
+        code = normalize_language(value)
+        if str(value or "").strip().lower() in {"en", "ar", "ur"} and code not in preferred_languages:
+            preferred_languages.append(code)
     return {
         "name": str(agent.get("name", "")).strip(),
         "phone_number": str(agent.get("phone_number", "")).strip(),
         "enabled": bool(agent.get("enabled", True)),
         "aliases": [str(item).strip().lower() for item in aliases if str(item).strip()],
+        "preferred_languages": preferred_languages,
     }
 
 
 def _get_transfer_settings() -> Dict[str, Any]:
+    # The dedicated Call forwarding screen is the source of truth once it has
+    # been saved. Keep the older Voice Agent config as a backwards-compatible
+    # fallback for workspaces that have never opened that screen.
+    if call_forwarding.has_saved_settings():
+        forwarding = call_forwarding.get_settings()
+        return {
+            "enabled": forwarding.get("enabled", False),
+            "agents": [
+                {
+                    "name": agent.get("name", ""),
+                    "phone_number": agent.get("phone", ""),
+                    "enabled": agent.get("enabled", True),
+                    "aliases": agent.get("aliases", []),
+                    "preferred_languages": agent.get("preferred_languages", []),
+                }
+                for agent in forwarding.get("agents", [])
+            ],
+        }
     channel_settings = brain_service.channel_config("voice")
     settings = channel_settings.get("human_transfer") or agent_config.get_human_transfer()
     if not isinstance(settings, dict):
@@ -508,13 +532,14 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     )
                     transfer_twiml = _build_team_transfer_twiml([dedicated_agent])
                 elif active_agents:
+                    routed_agents = call_forwarding.language_matched_agents(active_agents, session.get("preferred_language", "en"))
                     transfer_destination = "Human team"
                     transfer_service.append_message(
                         session["session_id"],
                         "system",
-                        f"Routing to human team: {', '.join(agent['name'] for agent in active_agents if agent.get('name'))}",
+                        f"Routing to {session.get('preferred_language', 'en')} team: {', '.join(agent['name'] for agent in routed_agents if agent.get('name'))}",
                     )
-                    transfer_twiml = _build_team_transfer_twiml(active_agents)
+                    transfer_twiml = _build_team_transfer_twiml(routed_agents)
                 elif TWILIO_HUMAN_AGENT_NUMBER:
                     transfer_destination = "Human agent"
                     transfer_twiml = _build_transfer_twiml()
@@ -525,7 +550,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 notification_recipients = (
                     [dedicated_agent.get("name") or "Human agent"]
                     if dedicated_agent else
-                    [agent.get("name") or "Human team" for agent in active_agents]
+                    [agent.get("name") or "Human team" for agent in (routed_agents if active_agents else [])]
                     if active_agents else
                     ["Human team"]
                 )

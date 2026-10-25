@@ -833,7 +833,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if not pending_mark:
                 break
             await asyncio.sleep(0.1)
-        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, "", text):
+        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, "", text, preferred_language):
             logger.info("custom voice: call=%s handed to the team %.2fs after the caller asked", call_sid, perf_counter() - heard_at)
             return
         transfer_pending = False

@@ -81,6 +81,34 @@ def test_rings_every_active_agent_and_connects_on_answer(db):
     assert 'callerId="+61400000000"' in twiml  # the agent sees who is calling
 
 
+def test_language_match_rings_the_best_team_members(db):
+    settings = call_forwarding.save_settings({"enabled": True, "agents": [
+        {"name": "English desk", "phone": "0412345678", "preferred_languages": ["en"]},
+        {"name": "Arabic desk", "phone": "+61398765432", "preferred_languages": ["ar"]},
+        {"name": "No preference", "phone": "+61400001111"},
+    ]}, ADMIN)
+    twiml = call_forwarding.transfer_twiml("+61400000000", settings, preferred_language="ar")
+    assert "+61398765432" in twiml and "+61412345678" not in twiml and "+61400001111" not in twiml
+
+
+def test_named_agent_wins_over_language_match(db):
+    settings = call_forwarding.save_settings({"enabled": True, "agents": [
+        {"name": "English desk", "phone": "0412345678", "preferred_languages": ["en"]},
+        {"name": "Arabic desk", "phone": "+61398765432", "preferred_languages": ["ar"]},
+    ]}, ADMIN)
+    twiml = call_forwarding.transfer_twiml("+61400000000", settings, "Please connect me to English desk", "ar")
+    assert "+61412345678" in twiml and "+61398765432" not in twiml
+
+
+def test_language_routing_falls_back_to_the_active_team(db):
+    settings = call_forwarding.save_settings({"enabled": True, "agents": [
+        {"name": "English desk", "phone": "0412345678", "preferred_languages": ["en"]},
+        {"name": "Arabic desk", "phone": "+61398765432", "preferred_languages": ["ar"]},
+    ]}, ADMIN)
+    twiml = call_forwarding.transfer_twiml("+61400000000", settings, preferred_language="ur")
+    assert "+61412345678" in twiml and "+61398765432" in twiml
+
+
 def test_browser_test_call_shows_the_business_number(db, monkeypatch):
     monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+18178092336")
     call_forwarding.save_settings({"enabled": True, "agents": [{"name": "Sam", "phone": "0412345678"}]}, ADMIN)

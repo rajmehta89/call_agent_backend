@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import phonenumbers
 
 from mongo_client import mongo_client
+from voice_languages import SUPPORTED_LANGUAGES, effective_language, normalize_language
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,18 @@ def _clean_agents(agents: Any) -> List[Dict[str, Any]]:
         aliases = item.get("aliases") or []
         if isinstance(aliases, str):
             aliases = [part.strip() for part in aliases.split(",") if part.strip()]
+        raw_languages = item.get("preferred_languages") or item.get("languages") or []
+        if isinstance(raw_languages, str):
+            raw_languages = [part.strip() for part in raw_languages.split(",") if part.strip()]
+        preferred_languages = []
+        for value in raw_languages if isinstance(raw_languages, list) else []:
+            code = normalize_language(value)
+            if str(value or "").strip().lower() in SUPPORTED_LANGUAGES and code not in preferred_languages:
+                preferred_languages.append(code)
         cleaned_item = {"name": str(item.get("name") or "").strip()[:80], "phone": str(item.get("phone") or "").strip()[:32],
                         "enabled": bool(item.get("enabled", True))}
+        if preferred_languages:
+            cleaned_item["preferred_languages"] = preferred_languages
         cleaned_aliases = [str(alias).strip()[:80] for alias in aliases if str(alias).strip()][:8]
         if cleaned_aliases:
             cleaned_item["aliases"] = cleaned_aliases
@@ -93,6 +104,16 @@ def get_settings() -> Dict[str, Any]:
     }
 
 
+def has_saved_settings() -> bool:
+    """Whether the admin Call forwarding screen has saved its shared settings document."""
+    if not mongo_client.is_connected():
+        return False
+    try:
+        return bool(mongo_client.platform_settings.find_one({"_id": SETTINGS_ID}, {"_id": 1}))
+    except Exception:
+        return False
+
+
 def validate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Check and normalise settings from the admin page. Raises ValueError with a message the admin can act on."""
     agents = []
@@ -103,6 +124,8 @@ def validate(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not number:
             raise ValueError(f"Agent {index} ({agent['name'] or 'no name'}): '{agent['phone']}' is not a valid phone number")
         saved_agent = {"name": agent["name"] or f"Agent {index}", "phone": number, "enabled": agent["enabled"]}
+        if agent.get("preferred_languages"):
+            saved_agent["preferred_languages"] = agent["preferred_languages"]
         if agent.get("aliases"):
             saved_agent["aliases"] = agent["aliases"]
         agents.append(saved_agent)
@@ -137,6 +160,28 @@ def save_settings(payload: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, An
 def active_agents(settings: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     settings = settings or get_settings()
     return [agent for agent in settings["agents"] if agent["enabled"] and agent["phone"]]
+
+
+def language_matched_agents(agents: List[Dict[str, Any]], preferred_language: str = "") -> List[Dict[str, Any]]:
+    """Prefer every active teammate who speaks the caller's language, or everyone when no match exists."""
+    active = [agent for agent in agents if agent.get("enabled", True) and (agent.get("phone") or agent.get("phone_number"))]
+    if not active:
+        return []
+    code = effective_language(preferred_language or "en")
+    matches = [agent for agent in active if code in {
+        normalize_language(value) for value in (agent.get("preferred_languages") or agent.get("languages") or [])
+        if str(value or "").strip().lower() in SUPPORTED_LANGUAGES
+    }]
+    return matches or active
+
+
+def forwarding_targets(settings: Optional[Dict[str, Any]] = None, requested_text: str = "", preferred_language: str = "") -> List[Dict[str, Any]]:
+    """Return the exact phones to ring: a named person first, then language affinity, then the whole team."""
+    settings = settings or get_settings()
+    matched = requested_agent(requested_text, settings)
+    if matched:
+        return [matched]
+    return language_matched_agents(active_agents(settings), preferred_language)
 
 
 def requested_agent(caller_text: str, settings: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -406,13 +451,12 @@ def _caller_id(caller: str) -> str:
     return (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
 
 
-def transfer_twiml(caller: str, settings: Optional[Dict[str, Any]] = None, requested_text: str = "") -> str:
-    """Ring the named agent when matched, otherwise ring every active agent."""
+def transfer_twiml(caller: str, settings: Optional[Dict[str, Any]] = None, requested_text: str = "", preferred_language: str = "") -> str:
+    """Ring the named agent when matched; otherwise prefer teammates who speak the caller's language."""
     settings = settings or get_settings()
     base = _base_url()
     agents = active_agents(settings)
-    matched = requested_agent(requested_text, settings)
-    targets = [matched] if matched else agents
+    targets = forwarding_targets(settings, requested_text, preferred_language)
     if not targets or not base:
         raise RuntimeError("call forwarding has no active agents" if not targets else "TWILIO_PUBLIC_BASE_URL is not set")
     numbers = "".join(f'<Number>{html.escape(agent["phone"])}</Number>' for agent in targets)
@@ -496,7 +540,7 @@ def dial_result_twiml(accepted: bool) -> str:
 
 
 # ---- Moving a live call to the team, and recording what happened
-def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: str = "") -> bool:
+def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: str = "", preferred_language: str = "") -> bool:
     """Take the live call away from the AI and ring the team. False when it could not be started (the AI carries on).
     `session_id`: the id the call is stored under when it is not the Twilio call (Retell)."""
     from routers.twilio_api import _get_twilio_client
@@ -508,19 +552,26 @@ def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: s
         return False
     settings = get_settings()
     matched = requested_agent(requested_text, settings)
+    if not preferred_language:
+        try:
+            from voice_languages import language_for_phone
+            preferred_language = language_for_phone(caller)
+        except Exception:
+            preferred_language = "en"
+    targets = forwarding_targets(settings, requested_text, preferred_language)
     destination = matched.get("name") if matched else "Human team"
     try:
-        twiml = transfer_twiml(caller, settings, requested_text)
+        twiml = transfer_twiml(caller, settings, requested_text, preferred_language)
         client.calls(call_sid).update(twiml=twiml)
     except Exception as error:
         logger.warning("call forwarding: could not transfer %s: %s", call_sid, error)
         create_callback_outreach(caller, requested_text, session_id or call_sid, destination=destination,
                                  message=f"A caller asked to speak with {destination}, but the live transfer could not start.")
         return False
-    targets = [{"name": agent["name"], "phone": agent["phone"], "status": "requested"}
-               for agent in ([matched] if matched else active_agents(settings))]
+    targets = [{"name": agent["name"], "phone": agent["phone"], "preferred_languages": agent.get("preferred_languages", []), "status": "requested"}
+               for agent in targets]
     _record(call_sid, {"transfer_requested": True, "transfer_status": "ringing", "transfer_mode": MODE, "twilio_call_sid": call_sid,
-                       "transfer_targets": targets,
+                       "transfer_targets": targets, "transfer_language": effective_language(preferred_language),
                        "status": "transfer_requested", "transfer_destination": destination, "requested_agent": destination if matched else None,
                        "transfer_started_at": datetime.utcnow()},
             session_id or call_sid)

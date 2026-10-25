@@ -36,6 +36,7 @@ import live_transcript
 from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
+from voice_languages import language_for_phone
 
 logger = logging.getLogger(__name__)
 
@@ -968,9 +969,10 @@ async def retell_webhook(request: Request) -> Response:
 FORWARD_AFTER_SECONDS = 5.0
 
 
-async def _hand_to_team(call_id: str, call_sid: str, caller: str, requested_text: str = "") -> None:
+async def _hand_to_team(call_id: str, call_sid: str, caller: str, requested_text: str = "", preferred_language: str = "") -> None:
     await asyncio.sleep(FORWARD_AFTER_SECONDS)
-    if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id, requested_text):
+    language = preferred_language or await asyncio.to_thread(language_for_phone, caller)
+    if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id, requested_text, language):
         _trace(f"retell_forwarding_failed call={call_id}", error=True)
         transfer_service.request_transfer(call_id, "Caller asked for a person; the transfer could not start", "retell_callback", 0.95,
                                           phone_number=caller)

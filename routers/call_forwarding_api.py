@@ -22,6 +22,7 @@ class AgentPayload(BaseModel):
     name: str = ""
     phone: str = ""
     enabled: bool = True
+    preferred_languages: List[str] = []
 
 
 class ForwardingPayload(BaseModel):
