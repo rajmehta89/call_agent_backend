@@ -616,7 +616,7 @@ def _with_full_call_recording(twiml: str, base: str) -> str:
 @router.post("/inbound", response_class=PlainTextResponse, dependencies=[Depends(verify_twilio_request)])
 async def custom_inbound(request: Request) -> PlainTextResponse:
     """Single call router: Retell or the custom stack when selected, otherwise the default Twilio agent."""
-    providers = provider_snapshot()
+    providers = await asyncio.to_thread(provider_snapshot)
     bind_call((await request.form()).get("CallSid"))
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
@@ -643,7 +643,11 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     call_sid = html.escape(str(form.get("CallSid") or ""), quote=True)
     logger.info("custom voice stack answering call %s from %s", call_sid, caller)
     # Twilio opens the media stream about a second from now: have the greeting audio ready by then.
-    asyncio.create_task(_warm_audio_cache((_greeting_text(),), custom_voice_engine()))
+    async def warm_greeting() -> None:
+        greeting = await asyncio.to_thread(_greeting_text)
+        await _warm_audio_cache((greeting,), custom_voice_engine())
+
+    asyncio.create_task(warm_greeting())
     return PlainTextResponse(_with_full_call_recording(
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Connect><Stream url=\"" + html.escape(stream_url, quote=True) + "\">"
@@ -657,10 +661,10 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
 @router.websocket("/media")
 async def custom_media_stream(websocket: WebSocket) -> None:
     """Bridge Twilio mulaw/8k audio to Deepgram and ElevenLabs."""
-    if not custom_stack_enabled():
+    if not await asyncio.to_thread(custom_stack_enabled):
         await websocket.close(code=1008, reason="Custom Twilio voice is disabled")
         return
-    custom = _active_custom(provider_snapshot())
+    custom = _active_custom(await asyncio.to_thread(provider_snapshot))
     engine = custom_voice_engine()  # chosen once per call: "deepgram" or "elevenlabs"
     speaker = _DeepgramSpeaker() if engine == "deepgram" else None  # one live voice line for the whole call
     leveller = _level_matcher()  # one steady voice loudness for the whole call
@@ -1134,8 +1138,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     deepgram: Any = None
     audio_backlog: List[bytes] = []   # caller audio that arrived before Deepgram finished connecting
     transcript_task: Optional[asyncio.Task[Any]] = None
+    embedding_task: Optional[asyncio.Task[Any]] = None
 
     async def receive_transcripts(connection: Any) -> None:
+        nonlocal embedding_task
         async for raw in connection:
             try:
                 payload = json.loads(raw)
@@ -1170,7 +1176,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 nonlocal prefetched_at
                 if payload.get("is_final") or perf_counter() - prefetched_at > 0.4:
                     prefetched_at = perf_counter()
-                    brain_service.prefetch_query_embedding(" ".join([*utterance, text]))
+                    if embedding_task is None or embedding_task.done():
+                        embedding_task = asyncio.create_task(asyncio.to_thread(
+                            brain_service.prefetch_query_embedding, " ".join([*utterance, text])))
                 if payload.get("is_final"):
                     utterance.append(text)
                     if payload.get("speech_final"):
@@ -1223,7 +1231,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
                             await websocket.close(code=1008)
                             return
-                        greeting = _greeting_text()
+                        greeting = await asyncio.to_thread(_greeting_text)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)
                         responses.append({"content": greeting, "timestamp": utc_iso()})
                         memory.add_assistant(greeting)

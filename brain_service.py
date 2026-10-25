@@ -106,7 +106,10 @@ def _local_embedder() -> Any:
     global _LOCAL_EMBEDDER, _LOCAL_EMBEDDER_FAILED
     if _LOCAL_EMBEDDER is not None or _LOCAL_EMBEDDER_FAILED:
         return _LOCAL_EMBEDDER
-    if os.getenv("LOCAL_EMBEDDINGS", "true").strip().lower() in {"0", "false", "no", "off"}:
+    # Render's small instances cannot reliably load the ONNX model during a live call.
+    # Keep semantic retrieval there through the configured network embedding provider.
+    default = "false" if os.getenv("RENDER_EXTERNAL_URL") else "true"
+    if os.getenv("LOCAL_EMBEDDINGS", default).strip().lower() in {"0", "false", "no", "off"}:
         return None
     with _LOCAL_EMBEDDER_LOCK:
         if _LOCAL_EMBEDDER is None and not _LOCAL_EMBEDDER_FAILED:
