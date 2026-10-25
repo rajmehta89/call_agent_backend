@@ -13,13 +13,15 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 # Routes that must stay reachable without a sign-in or a Twilio signature.
 PUBLIC_ROUTES = {
     "/", "/health",
-    "/api/auth/login", "/api/auth/signup", "/api/auth/config", "/api/auth/invite/{token}", "/api/auth/accept-invite",
+    "/api/auth/login", "/api/auth/signup", "/api/auth/config", "/api/auth/invite/{token}", "/api/auth/accept-invite", "/api/auth/verify-email",
     # These verify the caller themselves: stream token, Retell secret, or Retell signature.
     "/api/custom-voice/media", "/api/twilio/ws", "/api/retell/llm-websocket/{call_id}", "/api/retell/webhook",
     # Checks the sign-in token itself (passed in the URL: browsers' EventSource cannot send headers).
     "/api/realtime/events",
     # Shopify's redirect after "Connect with Shopify": checked by HMAC with the app secret and a one-time state.
     "/api/platform/shopify/oauth/callback",
+    # Twilio fetches stored MMS media directly using its randomised public URL.
+    "/api/leads/sms-media/{filename}",
 }
 GUARDS = {"require_user", "dependency", "verify_twilio_request"}
 
