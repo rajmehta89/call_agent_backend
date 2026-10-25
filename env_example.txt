@@ -109,6 +109,9 @@ TWILIO_ACCOUNT_SID=ACxxxxxxxx
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
 TWILIO_PHONE_NUMBER=+1xxxxxxxxxx
 TWILIO_CALLER_ID=+1xxxxxxxxxx
+# SMS sender; use a Twilio number or approved sender that can send to Australian mobiles.
+TWILIO_SMS_FROM=+61xxxxxxxxx
+TWILIO_DEFAULT_REGION=AU
 TWILIO_PUBLIC_BASE_URL=https://your-public-ngrok-domain.ngrok-free.app
 TWILIO_CONVERSATION_LANG=en-US
 TWILIO_HUMAN_AGENT_NUMBER=+1xxxxxxxxxx
