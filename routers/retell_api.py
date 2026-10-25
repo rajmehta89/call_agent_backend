@@ -245,6 +245,7 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
         "transcription": callers,
         "ai_responses": agents,
         "summary": analysis.get("call_summary") or "Retell call completed.",
+        "summary_language": "en",
         "sentiment": analysis.get("user_sentiment", "neutral"),
         "transfer_requested": human_requested,
         "transfer_status": transfer_status,

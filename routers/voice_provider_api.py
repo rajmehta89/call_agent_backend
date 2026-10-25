@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from auth_service import require_permission
+from voice_languages import language_options, set_enabled_language_codes
 from voice_provider_settings import SUPPORTED_PROVIDERS, provider_snapshot, set_provider_enabled
 
 
@@ -16,9 +17,32 @@ class ProviderTogglePayload(BaseModel):
     enabled: bool
 
 
+class LanguageSettingsPayload(BaseModel):
+    enabled_languages: list[str]
+
+
 @router.get("")
 async def list_voice_providers(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return {"success": True, "data": {"providers": list(provider_snapshot().values())}}
+
+
+@router.get("/languages")
+async def list_voice_languages(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+    return {"success": True, "data": {"languages": language_options()}}
+
+
+@router.put("/languages")
+async def update_voice_languages(
+    payload: LanguageSettingsPayload,
+    user: Dict[str, Any] = Depends(require_permission("manage_integrations")),
+):
+    try:
+        set_enabled_language_codes(payload.enabled_languages, str(user.get("_id", "")))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"success": True, "data": {"languages": language_options()}}
 
 
 @router.put("/{provider}")

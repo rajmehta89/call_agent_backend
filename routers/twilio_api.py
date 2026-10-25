@@ -30,7 +30,7 @@ from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
 from conversation_memory import ConversationMemory
-from voice_languages import language_config, language_for_call, language_greeting, normalize_language
+from voice_languages import effective_language, language_config, language_for_call, language_greeting, language_enabled, normalize_language
 import call_forwarding
 
 load_project_env()
@@ -247,6 +247,7 @@ def _serialize_messages(messages: List[Dict[str, Any]], speaker: str) -> List[Di
             "type": speaker,
             "content": item["content"],
             "timestamp": item["timestamp"],
+            **({"language": item["language"]} if item.get("language") else {}),
         }
         for item in messages
     ]
@@ -453,7 +454,9 @@ async def twilio_conversation_ws(websocket: WebSocket):
 
             detected_language = str(data.get("lang") or "").strip()
             if detected_language:
-                session["preferred_language"] = normalize_language(detected_language)
+                detected_code = normalize_language(detected_language)
+                if language_enabled(detected_code):
+                    session["preferred_language"] = effective_language(detected_code)
                 await websocket.send_text(json.dumps({
                     "type": "language",
                     "ttsLanguage": language_config(session["preferred_language"])["locale"],
@@ -461,7 +464,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 }))
 
             timestamp = utc_iso()
-            user_transcript.append({"content": caller_text, "timestamp": timestamp})
+            user_transcript.append({"content": caller_text, "timestamp": timestamp, "language": session.get("preferred_language", "en")})
             transfer_service.append_message(session["session_id"], "user", caller_text)
 
             transfer_intent = bot.analyze_transfer_intent(caller_text, history)
@@ -481,7 +484,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     if TWILIO_HUMAN_AGENT_NUMBER else
                     "I have recorded your request for a human follow-up. Our team will call you back using the number associated with this call."
                 )
-                ai_responses.append({"content": handoff_text, "timestamp": utc_iso()})
+                ai_responses.append({"content": handoff_text, "timestamp": utc_iso(), "language": session.get("preferred_language", "en")})
                 transfer_service.append_message(session["session_id"], "assistant", handoff_text)
                 await _send_text(websocket, handoff_text, language=session.get("preferred_language", "en"))
 
@@ -560,7 +563,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
 
             if bot.is_exit_intent(caller_text):
                 exit_text = bot.get_exit_message()
-                ai_responses.append({"content": exit_text, "timestamp": utc_iso()})
+                ai_responses.append({"content": exit_text, "timestamp": utc_iso(), "language": session.get("preferred_language", "en")})
                 transfer_service.append_message(session["session_id"], "assistant", exit_text)
                 await _send_text(websocket, exit_text, language=session.get("preferred_language", "en"))
                 break
@@ -575,7 +578,7 @@ async def twilio_conversation_ws(websocket: WebSocket):
             ) or "I'm sorry, the AI service is not available right now."
             memory.add(caller_text, reply)
             history = memory.history()
-            ai_responses.append({"content": reply, "timestamp": utc_iso()})
+            ai_responses.append({"content": reply, "timestamp": utc_iso(), "language": session.get("preferred_language", "en")})
             transfer_service.append_message(session["session_id"], "assistant", reply)
             await _send_text(websocket, reply, language=session.get("preferred_language", "en"))
 
@@ -618,6 +621,9 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     "transcription": _serialize_messages(user_transcript, "user"),
                     "ai_responses": _serialize_messages(ai_responses, "bot"),
                     "summary": summary,
+                    "preferred_language": session.get("preferred_language", "en"),
+                    "languages_used": sorted({item.get("language", "en") for item in [*user_transcript, *ai_responses]}),
+                    "summary_language": "en",
                     "sentiment": "neutral",
                     "transfer_requested": transfer_requested,
                     "transfer_status": transfer_status,

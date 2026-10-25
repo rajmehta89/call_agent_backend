@@ -73,6 +73,7 @@ SUMMARY_PROMPT = (
     "industry, location, tools or CRM, requirements, numbers, budget, dates, preferences, objections, "
     "agreed next steps, and questions still open. Mention the agent only for commitments it made, in a few "
     "words. Do not restate the agent's explanations. Replace outdated facts instead of repeating them. "
+    "Write the notes in English even when the caller speaks Arabic, Urdu, or another language. "
     "Write compact plain text, at most 70 words. Return only the notes."
 )
 

@@ -63,6 +63,9 @@ EXTRA_CALL_FIELDS = (
     "provider_started_at",
     "provider_ended_at",
     "messages",  # ordered transcript written live during the call (live_transcript.py)
+    "preferred_language",
+    "languages_used",
+    "summary_language",
 )
 
 _BROWSER_CALLER = re.compile(r"^client:(browser_[A-Za-z0-9]+)_[A-Za-z0-9]+$")

@@ -37,7 +37,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
 from routers.twilio_api import _build_conversation_twiml, _get_request_base_url
-from voice_languages import language_for_call, language_greeting, normalize_language
+from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language
 
 logger = logging.getLogger(__name__)
 
@@ -725,6 +725,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         return
     custom = _active_custom(await asyncio.to_thread(provider_snapshot))
     preferred_language = normalize_language(websocket.query_params.get("preferred_language"))
+    languages_used = {preferred_language}
     engine = custom_voice_engine()  # chosen once per call: "deepgram" or "elevenlabs"
     speaker = _DeepgramSpeaker(preferred_language) if _tts_engine_for_language(engine, preferred_language) == "deepgram" else None  # one live voice line for the whole call
     leveller = _level_matcher()  # one steady voice loudness for the whole call
@@ -826,7 +827,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         spoke_at = utc_iso()
         await speak(line)
         memory.add(text, line)
-        responses.append({"content": line, "timestamp": spoke_at})
+        responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
         save_progress()
         for _ in range(80):  # the line has finished playing (its mark came back); at most ~8 s
             if not pending_mark:
@@ -839,7 +840,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         fallback = "Sorry, I couldn't put you through just now. I've noted that you'd like to talk to someone, and our team will call you back."
         await speak(fallback)
         memory.add(text, fallback)
-        responses.append({"content": fallback, "timestamp": utc_iso()})
+        responses.append({"content": fallback, "timestamp": utc_iso(), "language": preferred_language})
         save_progress()
 
     async def answer_or_forward(text: str, heard_at: float, prepared: Optional[Dict[str, Any]]) -> None:
@@ -869,7 +870,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             spoke_at = utc_iso()
             await speak(line)
             memory.add(text, line)
-            responses.append({"content": line, "timestamp": spoke_at})
+            responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
             save_progress()
         elif intent == "unclear":
             if len(text.split()) > 2:
@@ -880,7 +881,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             spoke_at = utc_iso()
             await speak(line)
             memory.add(text, line)
-            responses.append({"content": line, "timestamp": spoke_at})
+            responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
             save_progress()
         else:
             earlier_handoff_text = ""
@@ -1073,7 +1074,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if spoken:
                 reply = " ".join(spoken)
                 memory.add(text, reply)
-                responses.append({"content": reply, "timestamp": spoke_at or utc_iso()})
+                responses.append({"content": reply, "timestamp": spoke_at or utc_iso(), "language": preferred_language})
                 save_progress()
                 asyncio.get_running_loop().run_in_executor(None, _log_voice_activity, text, reply, caller, perf_counter() - heard_at)
 
@@ -1200,14 +1201,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             return
         if transfer_pending:
             drop_reply(prepared)
-            transcript.append({"content": text, "timestamp": utc_iso()})
+            transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
             logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
             save_progress()
             return
         if not unanswered_text and not (reply_task and not reply_task.done()) and call_is_over(text, last_agent_text(memory.history())):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             drop_reply(prepared)
-            transcript.append({"content": text, "timestamp": utc_iso()})
+            transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
             save_progress()
             logger.info("custom voice: both said goodbye, ending call=%s: %s", call_sid, text[:120])
             asyncio.create_task(end_call_after_playback())
@@ -1227,7 +1228,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         elif reply_task and not reply_task.done():
             reply_task.cancel()
         unanswered_text = text
-        transcript.append({"content": text, "timestamp": utc_iso()})
+        transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
         save_progress()
         if call_sid and call_forwarding.forwarding_on():  # a cached flag: no waiting here
@@ -1268,8 +1269,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 detected_languages = alternative.get("languages") or []
                 if auto_language and detected_languages:
                     detected = normalize_language(detected_languages[0])
-                    if detected in {"en", "ar", "ur"}:
+                    if detected in {"en", "ar", "ur"} and language_enabled(detected):
                         preferred_language = detected
+                        languages_used.add(detected)
                 text = str(alternative.get("transcript") or "").strip()
                 if not text:
                     # Deepgram can end a turn with an empty final transcript for a short word it showed in the partial
@@ -1333,7 +1335,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         call_sid = str(start.get("callSid") or "")
                         params = start.get("customParameters") or {}
                         caller = str(params.get("caller") or caller)
-                        preferred_language = normalize_language(params.get("preferred_language"))
+                        preferred_language = effective_language(params.get("preferred_language"))
+                        languages_used.add(preferred_language)
                         call_sid = str(params.get("call_sid") or call_sid)
                         bind_call(call_sid)
                         if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):
@@ -1342,7 +1345,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             return
                         greeting = await asyncio.to_thread(_greeting_text, preferred_language)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)
-                        responses.append({"content": greeting, "timestamp": utc_iso()})
+                        responses.append({"content": greeting, "timestamp": utc_iso(), "language": preferred_language})
                         memory.add_assistant(greeting)
                         save_progress()
                         reply_task = asyncio.create_task(speak(greeting, cache_key=_audio_cache_key(greeting, engine, preferred_language)))
@@ -1403,6 +1406,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "messages": live_transcript.ordered_from_lists(transcript, responses),
                 "contact_phone": contact_phone,
                 "summary": memory.summary or f"Custom Twilio voice call with {len(transcript)} caller turns and {len(responses)} AI responses.",
+                "preferred_language": preferred_language,
+                "languages_used": sorted(languages_used),
+                "summary_language": "en",
                 "sentiment": "neutral",
                 "call_session_id": call_sid or stream_sid,
             })
