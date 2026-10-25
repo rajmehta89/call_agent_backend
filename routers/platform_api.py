@@ -959,6 +959,72 @@ def update_email_draft_copy(draft_id: str, payload: ValuePayload, user: Dict[str
     return {"success": True, "data": {"id": draft_id, "subject": subject, "body": body}}
 
 
+@router.put("/email-outbox/bulk-decision")
+def decide_email_drafts_bulk(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
+    """Approve or exclude a bounded set of already prepared drafts.
+
+    Approval remains explicit: this endpoint never discovers prospects or creates
+    copy. The normal campaign limits and send window still control delivery.
+    """
+    _require_db()
+    requested_ids = [str(item).strip() for item in (payload.value.get("draft_ids") or []) if str(item).strip()]
+    if not requested_ids:
+        raise HTTPException(status_code=400, detail="Select at least one email draft")
+    if len(requested_ids) > 100:
+        raise HTTPException(status_code=400, detail="Select no more than 100 email drafts at a time")
+    valid_ids = [ObjectId(item) for item in requested_ids if ObjectId.is_valid(item)]
+    if len(valid_ids) != len(requested_ids):
+        raise HTTPException(status_code=400, detail="One or more email draft ids are invalid")
+    decision = str(payload.value.get("decision") or "").strip().lower()
+    if decision not in {"approve", "exclude"}:
+        raise HTTPException(status_code=400, detail="Decision must be approve or exclude")
+
+    drafts = list(mongo_client.email_outbox.find({
+        "_id": {"$in": valid_ids},
+        "status": {"$in": ["pending_approval", "awaiting_owner_review", "scheduled"]},
+    }))
+    if not drafts:
+        raise HTTPException(status_code=409, detail="None of the selected drafts are still awaiting review")
+    if decision == "exclude":
+        result = mongo_client.email_outbox.update_many(
+            {"_id": {"$in": [draft["_id"] for draft in drafts]}, "status": {"$in": ["pending_approval", "awaiting_owner_review", "scheduled"]}},
+            {"$set": {"status": "excluded", "updated_at": datetime.utcnow()}},
+        )
+        _audit("exclude", "email_drafts", after={"ids": [str(draft["_id"]) for draft in drafts], "count": result.modified_count})
+        return {"success": True, "data": {"status": "excluded", "excluded": result.modified_count, "sent": 0, "queued": 0}}
+
+    # Dubai drafts use the verified Private Email mailbox. Verify it once before
+    # changing any status so a failed login cannot leave a half-approved batch.
+    if any(draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach" for draft in drafts):
+        if not private_email_service.configured:
+            raise HTTPException(status_code=409, detail="Connect raj@buildwithraj.com to the backend before approving these emails")
+        try:
+            private_email_service.verify_connection()
+        except Exception as exc:
+            logger.error("Private Email bulk approval login failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Private Email login failed. Verify the mailbox connection before approving") from exc
+
+    ids = [draft["_id"] for draft in drafts]
+    now = datetime.utcnow()
+    result = mongo_client.email_outbox.update_many(
+        {"_id": {"$in": ids}, "status": {"$in": ["pending_approval", "awaiting_owner_review", "scheduled"]}},
+        {"$set": {"status": "approved", "approved_at": now, "updated_at": now}},
+    )
+    approved_ids = [str(draft_id) for draft_id in ids]
+    process_result = process_email_outbox(approved_ids, limit=len(approved_ids))
+    final_rows = list(mongo_client.email_outbox.find({"_id": {"$in": ids}}, {"status": 1}))
+    sent = sum(1 for row in final_rows if row.get("status") == "sent")
+    queued = sum(1 for row in final_rows if row.get("status") in {"approved", "scheduled"})
+    failed = sum(1 for row in final_rows if row.get("status") == "error")
+    if sent:
+        _audit("send", "email_drafts", after={"ids": approved_ids, "sent": sent, "queued": queued, "failed": failed})
+    return {"success": True, "data": {
+        "status": "sent" if sent and not queued and not failed else "queued" if queued else "completed",
+        "selected": len(drafts), "approved": result.modified_count, "sent": sent,
+        "queued": queued, "failed": failed, "processed": process_result,
+    }}
+
+
 @router.put("/email-outbox/{draft_id}/decision")
 def decide_email_draft(draft_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     _require_db()
