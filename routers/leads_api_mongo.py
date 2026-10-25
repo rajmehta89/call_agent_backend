@@ -5,11 +5,15 @@ from datetime import datetime
 from timeutil import utc_iso, utc_now
 import csv
 import io
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 from fastapi import Depends, APIRouter, File, HTTPException, Path, Query, UploadFile
-from pydantic import BaseModel
+from phonenumbers import NumberParseException, PhoneNumberFormat, format_number, is_valid_number, parse
+from pydantic import BaseModel, Field
+from twilio.rest import Client
 
 from env_loader import load_project_env
 from mongo_client import mongo_client
@@ -18,6 +22,7 @@ load_project_env()
 
 from auth_service import can_assign_conversations, require_permission, require_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_permission("manage_assigned_leads"))])  # dashboard API: sign-in required for every route
 
 
@@ -45,6 +50,10 @@ class LeadUpdate(BaseModel):
     status: Optional[str] = None
 
 
+class SmsMessage(BaseModel):
+    body: str = Field(..., min_length=1, max_length=1600)
+
+
 def is_valid_object_id(value: str) -> bool:
     return isinstance(value, str) and len(value) == 24 and all(c in "0123456789abcdefABCDEF" for c in value)
 
@@ -68,6 +77,20 @@ def owner_scope(user: Dict[str, Any]) -> Dict[str, Any]:
 def _serialize_lead(lead_doc: Dict[str, Any]) -> Dict[str, Any]:
     lead_doc["_id"] = str(lead_doc["_id"])
     return lead_doc
+
+
+def _lead_sms_number(value: str) -> str:
+    """Normalize a lead's stored phone number for Twilio; never accept a separate recipient."""
+    raw = str(value or "").strip()
+    if not raw or raw.lower().startswith(("web:", "client:")):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "This lead does not have an SMS-capable phone number"})
+    try:
+        parsed = parse(raw, os.getenv("TWILIO_DEFAULT_REGION", "IN"))
+    except NumberParseException as exc:
+        raise HTTPException(status_code=400, detail={"success": False, "error": "The lead phone number is invalid"}) from exc
+    if not is_valid_number(parsed):
+        raise HTTPException(status_code=400, detail={"success": False, "error": "The lead phone number is invalid"})
+    return format_number(parsed, PhoneNumberFormat.E164)
 
 
 def _call_counts(lead_ids: List[Any]) -> Dict[str, int]:
@@ -294,6 +317,42 @@ def health_check():
 @router.post("/{lead_id}/call")
 def call_lead_endpoint(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$")):
     raise HTTPException(status_code=410, detail="Outbound calling is disabled in this inbound-only project")
+
+
+@router.post("/{lead_id}/sms")
+def send_lead_sms(lead_id: str = Path(..., pattern=r"^[0-9a-fA-F]{24}$"), payload: SmsMessage = None,
+                  user: Dict[str, Any] = Depends(require_user)):
+    """Send an SMS to the lead's stored phone number, never to a team member number."""
+    _require_db()
+    if payload is None or not payload.body.strip():
+        raise HTTPException(status_code=400, detail={"success": False, "error": "Message text is required"})
+    lead = mongo_client.leads.find_one({"_id": ObjectId(lead_id), **owner_scope(user)})
+    if not lead:
+        raise HTTPException(status_code=404, detail={"success": False, "error": "Lead not found"})
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    from_number = (os.getenv("TWILIO_SMS_FROM") or os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
+    if not account_sid or not auth_token or not from_number:
+        raise HTTPException(status_code=503, detail={"success": False, "error": "SMS is not configured. Add Twilio credentials and TWILIO_SMS_FROM."})
+
+    to_number = _lead_sms_number(lead.get("phone"))
+    body = payload.body.strip()
+    try:
+        message = Client(account_sid, auth_token).messages.create(body=body, from_=from_number, to=to_number)
+    except Exception as exc:
+        logger.exception("Twilio could not send lead SMS for %s", lead_id)
+        raise HTTPException(status_code=502, detail={"success": False, "error": "Twilio could not send the SMS"}) from exc
+
+    now = utc_now()
+    mongo_client.sms_messages.insert_one({
+        "workspace_id": user.get("workspace_id", "default"), "lead_id": lead_id, "to": to_number,
+        "from": from_number, "body": body, "provider": "twilio", "provider_sid": message.sid,
+        "status": message.status, "created_by": str(user.get("_id")), "created_at": now,
+    })
+    mongo_client.leads.update_one({"_id": ObjectId(lead_id)}, {"$set": {"last_sms_at": now, "updated_at": now}})
+    logger.info("lead SMS sent by %s to lead %s via Twilio (%s)", user.get("email"), lead_id, message.sid)
+    return {"success": True, "data": {"sid": message.sid, "status": message.status, "to": to_number}}
 
 
 @router.get("/{lead_id}")
