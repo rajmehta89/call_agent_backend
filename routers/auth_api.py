@@ -140,7 +140,9 @@ def login(payload: LoginPayload):
 
 @router.get("/me")
 def me(user: Dict[str, Any] = Depends(require_user)):
-    return {"success": True, "data": public_user(user)}
+    # Refresh the browser/PWA session whenever the workspace boots. The current token
+    # must still be valid; expired or revoked sessions continue to require sign-in.
+    return {"success": True, "data": {**public_user(user), "token": issue_token(user)}}
 
 
 @router.put("/profile")

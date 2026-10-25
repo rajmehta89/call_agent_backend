@@ -138,7 +138,14 @@ def public_user(user: Dict[str, Any]) -> Dict[str, Any]:
 
 def issue_token(user: Dict[str, Any]) -> str:
     now = datetime.utcnow()
-    payload = {"sub": str(user["_id"]), "workspace_id": user.get("workspace_id", "default"), "auth_version": int(user.get("auth_version", 0)), "iat": int(now.timestamp()), "exp": int((now + timedelta(days=7)).timestamp())}
+    # The browser/PWA stores this session locally so reopening the installed app does not
+    # require a password every time. Keep the lifetime configurable for deployments that
+    # need a shorter security window.
+    try:
+        ttl_days = max(1, min(365, int(os.getenv("AUTH_TOKEN_TTL_DAYS", "30"))))
+    except ValueError:
+        ttl_days = 30
+    payload = {"sub": str(user["_id"]), "workspace_id": user.get("workspace_id", "default"), "auth_version": int(user.get("auth_version", 0)), "iat": int(now.timestamp()), "exp": int((now + timedelta(days=ttl_days)).timestamp())}
     body = _encode(payload)
     signature = hmac.new(_secret(), body.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{body}.{signature}"
