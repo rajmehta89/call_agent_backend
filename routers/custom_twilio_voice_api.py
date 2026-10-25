@@ -110,11 +110,15 @@ def _flux_url(language: str = "en") -> str:
     )
 
 
-def _elevenlabs_request(language: str = "en") -> tuple[str, Dict[str, str], str]:
-    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+def _elevenlabs_voice(language: str = "en") -> str:
     code = normalize_language(language)
     voice_variable = {"ar": "ELEVENLABS_VOICE_AR", "ur": "ELEVENLABS_VOICE_UR"}.get(code, "ELEVENLABS_VOICE_ID")
-    voice_id = os.getenv(voice_variable, "").strip() or os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+    return os.getenv(voice_variable, "").strip() or os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+
+
+def _elevenlabs_request(language: str = "en") -> tuple[str, Dict[str, str], str]:
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    voice_id = _elevenlabs_voice(language)
     model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"
     if not api_key or not voice_id:
         raise RuntimeError("ElevenLabs voice is not configured")
@@ -187,15 +191,36 @@ async def _elevenlabs_speech(text: str, language: str = "en") -> bytes:
 
 
 async def _deepgram_tts_stream(text: str, language: str = "en") -> AsyncIterator[bytes]:
-    """Deepgram Aura-2 voice in the caller's format (mulaw/8k, no container), streamed over the kept-alive pool."""
+    """Stream an Aura REST response or a Flux TTS WebSocket response in Twilio's format."""
     api_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Deepgram voice is not configured")
-    url = f"https://api.deepgram.com/v1/speak?model={deepgram_voice(language)}&encoding=mulaw&sample_rate=8000&container=none"
     try:
         gain_db = float(os.getenv("DEEPGRAM_TTS_GAIN_DB", "7"))
     except ValueError:
         gain_db = 7.0
+    model = deepgram_voice(language)
+    if model.lower().startswith("flux-"):
+        url = f"wss://api.deepgram.com/v2/speak?model={model}&encoding=mulaw&sample_rate=8000"
+        async with websockets.connect(url, additional_headers={"Authorization": f"Token {api_key}"}, open_timeout=10, ping_interval=20) as ws:
+            await ws.send(json.dumps({"type": "Speak", "text": text}))
+            await ws.send(json.dumps({"type": "Flush"}))
+            async for message in ws:
+                if isinstance(message, (bytes, bytearray)):
+                    yield adjust_ulaw_gain(bytes(message), gain_db)
+                    continue
+                payload = json.loads(message)
+                kind = payload.get("type")
+                if kind in {"SpeechMetadata", "Flushed"}:
+                    break
+                if kind in {"Error", "Warning"}:
+                    raise RuntimeError(f"Deepgram Flux TTS {kind}: {str(payload)[:300]}")
+            try:
+                await ws.send(json.dumps({"type": "Close"}))
+            except Exception:
+                pass
+        return
+    url = f"https://api.deepgram.com/v1/speak?model={model}&encoding=mulaw&sample_rate=8000&container=none"
     async with _elevenlabs_client().stream("POST", url, headers={"Authorization": f"Token {api_key}", "Content-Type": "application/json"}, json={"text": text}) as response:
         response.raise_for_status()
         async for chunk in response.aiter_bytes(1600):
@@ -223,7 +248,7 @@ def _deepgram_gain_db() -> float:
 
 
 class _DeepgramSpeaker:
-    """One live Deepgram Aura-2 connection per call (opened while the greeting plays). Each sentence is sent down the
+    """One live Deepgram TTS connection per call (opened while the greeting plays). Each sentence is sent down the
     open line: about 0.6-0.7 s to first audio, steadily, where a separate web request per sentence took 1-2 s from
     here. If the caller interrupts mid-sentence the line is dropped and reopened, so stale audio never plays later."""
 
@@ -235,7 +260,9 @@ class _DeepgramSpeaker:
 
     async def _ensure(self) -> Any:
         if self.ws is None:
-            url = f"wss://api.deepgram.com/v1/speak?model={deepgram_voice(self.language)}&encoding=mulaw&sample_rate=8000"
+            model = deepgram_voice(self.language)
+            version = "v2" if model.lower().startswith("flux-") else "v1"
+            url = f"wss://api.deepgram.com/{version}/speak?model={model}&encoding=mulaw&sample_rate=8000"
             self.ws = await websockets.connect(url, additional_headers={"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY', '').strip()}"},
                                                open_timeout=10, ping_interval=20)
         return self.ws
@@ -285,7 +312,7 @@ class _DeepgramSpeaker:
                         yield adjust_ulaw_gain(bytes(message), gain_db)
                     else:
                         kind = json.loads(message).get("type")
-                        if kind == "Flushed":
+                        if kind in {"Flushed", "SpeechMetadata"}:
                             finished = True
                             return
                         if kind in {"Warning", "Error"}:
@@ -516,7 +543,7 @@ def _filler_after_seconds() -> float:
 
 
 def _audio_cache_key(text: str, engine: str, language: str = "en") -> str:
-    voice = deepgram_voice(language) if engine == "deepgram" else os.getenv("ELEVENLABS_VOICE_ID", "")
+    voice = deepgram_voice(language) if engine == "deepgram" else _elevenlabs_voice(language)
     return f"{engine}:{normalize_language(language)}:{voice}:{text}"
 
 

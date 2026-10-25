@@ -42,10 +42,20 @@ def custom_voice_engine() -> str:
 
 
 def deepgram_voice(language: str = "en") -> str:
-    """Return the configured Aura voice for a call language, with English as the safe fallback."""
+    """Return the configured Deepgram voice/model for a call language.
+
+    Aura-2 is used for English. Urdu has a supported Flux model by default;
+    Arabic falls back to the configured English Aura model because Deepgram's
+    current Flux TTS catalog does not list an Arabic voice.
+    """
     code = str(language or "en").strip().lower()
     variable = {"ar": "DEEPGRAM_TTS_VOICE_AR", "ur": "DEEPGRAM_TTS_VOICE_UR"}.get(code, "DEEPGRAM_TTS_VOICE")
-    return os.getenv(variable, "").strip() or os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-theia-en").strip() or "aura-2-theia-en"
+    configured = os.getenv(variable, "").strip()
+    if configured:
+        return configured
+    if code == "ur":
+        return "flux-ambreen-ur"
+    return os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-theia-en").strip() or "aura-2-theia-en"
 
 
 def _load_controls() -> Dict[str, bool]:
