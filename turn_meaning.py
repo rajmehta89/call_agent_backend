@@ -259,7 +259,11 @@ AGENT_FAREWELL = Classifier("agent farewell", {
 
 WAIT_QUESTION = Classifier("complete question for delayed reply", {
     "complete": ["What is your Home DFO business for?", "Can you tell me what your company does?",
-                 "What are the product prices and delivery options?", "Could you explain how this works?"],
+                 "What are the product prices and delivery options?", "Could you explain how this works?",
+                 "I just bought a new house. What can I do to make it nicer?",
+                 "Where should I start with the drawing room?", "What would you recommend for this room?",
+                 "Can you help me choose what would suit my home?", "What options should I consider?",
+                 "Could you tell me what would work best for this?"],
     "other": ["Could you please tell me about", "Can you check the", "I would like to ask you for",
               "My email is john at gmail dot com.", "What email should the team use?",
               "My order arrived broken and I want a refund.", "Yes, please."],

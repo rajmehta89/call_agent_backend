@@ -41,7 +41,7 @@ def pause_reply(caller_text: str) -> str:
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:
-    """Use the fast model for non-product conversation and the main model for product/order data.
+    """Use the fast model for ordinary conversation and the main model for clear product/order data.
 
     Both decisions use semantic classifiers. If either classifier cannot decide, keep the main model. General
     business questions still receive retrieved business knowledge; only live product and order turns need the
@@ -64,10 +64,20 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
     try:
         import store_intent
         store_context = " ".join(" ".join(part for part in (earlier, agent_text) if part).split()[-25:])
-        store_kinds = store_intent.wanted(caller_text, store_context)
+        ranked = store_intent.rank(caller_text, store_context)
     except Exception:
         return None
-    if store_kinds is None or {"product", "order"}.intersection(store_kinds):
+    if ranked is None:
+        return None
+    scores = dict(ranked)
+    none_score = scores.get("none", 0.0)
+    order_score = scores.get("order", 0.0)
+    product_score = scores.get("product", 0.0)
+    if order_score >= store_intent.STORE.min_score and order_score - none_score >= store_intent.CLEAR_LEAD:
+        return None
+    # Keep clearly identified catalogue questions on the careful model. Weak product matches often come from
+    # broad home, room, and renovation questions; those are ordinary business conversations and should stay fast.
+    if product_score >= store_intent.STORE.min_score and product_score - none_score >= 0.08:
         return None
     return fast
 
@@ -904,22 +914,24 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     phrase = bridge_phrase(caller_text, recent, earlier)
     if phrase:
         return phrase
-    # Full knowledge questions sometimes run slowly too. Short replies, contact details and unfinished
-    # fragments never get a generic status just because a provider is slow.
-    point = main_sentence(caller_text)
-    from turn_meaning import CALLER_TURN, WAIT_QUESTION
-    if WAIT_QUESTION.best(kind_of_turn_text(caller_text)) == "complete":
+    # A complete question or request may need a generic status while its answer is prepared. Short replies,
+    # contact details and unfinished fragments do not get one merely because a provider is slow.
+    from turn_meaning import CALLER_TURN, TURN_COMPLETION, WAIT_QUESTION
+    question_probe = f"{' '.join((earlier or '').split()[-35:])} {kind_of_turn_text(caller_text)}".strip()
+    kind = CALLER_TURN.best(kind_of_turn_text(caller_text))
+    complete_question = WAIT_QUESTION.best(question_probe) == "complete"
+    complete_request = kind in {"question", "search", "request"} and TURN_COMPLETION.best(caller_text) == "complete"
+    if complete_question or complete_request:
         return status_phrase(recent)
     return ""
 
 
 def bridge_model_seconds() -> float:
-    """VOICE_BRIDGE_MODEL_MS: how long the small model may take to write the "let me check" line (counted from the end
-    of the caller's turn); slower than this, a fixed LOOKUP_BRIDGES phrase is said instead."""
+    """VOICE_BRIDGE_MODEL_MS: hard limit for the small model to select a safe wait line while the answer runs."""
     try:
-        return max(0.1, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "900"))) / 1000
+        return max(0.1, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "450"))) / 1000
     except ValueError:
-        return 0.9
+        return 0.45
 
 
 # The small model only phrases what to say while the store lookup runs; it is given no facts and must not answer.
@@ -958,14 +970,13 @@ def bridge_note(bridge: str) -> str:
 
 
 FAST_TURN_NOTE = (
-    "Reply in one or two short sentences. Never repeat anything you already said earlier in the call (no second 'check "
-    "our website'), and do not repeat the caller's answer back to them ('You're looking for something specific'). If the "
-    "caller just said yes, okay or yeah to your question, take the next step: ask for the detail "
-    "you asked about, or ask one short new question that moves the conversation on; never answer a yes with 'Not yet'. "
-    "If you are taking the caller's details for a callback, ask for the next missing detail only: their name, then their "
-    "phone number ONLY if there is no caller ID (with caller ID the number is already saved: never ask for it). Never say "
-    "anything is arranged, booked or passed on until you have a way to reach them (caller ID or a number they gave). If the caller "
-    "is saying goodbye or thanks at the end, just say a warm goodbye."
+    "Answer the caller's latest point directly in one or two short spoken sentences. Use the supplied business facts; "
+    "if a fact is missing, say the team can confirm it. Do not explain your reasoning, add a preamble or holding line, "
+    "or repeat earlier replies or the caller's words. Answer the request before asking a follow-up. If they accept an "
+    "offer, deliver it; if they agree to provide a detail, ask for it. For a callback, ask "
+    "only for the next missing detail: their name, then their phone number ONLY if "
+    "there is no caller ID. Never claim anything is arranged, booked or passed on until the team can reach them by "
+    "caller ID or a number they gave. If they are saying goodbye, give a warm goodbye."
 )
 
 

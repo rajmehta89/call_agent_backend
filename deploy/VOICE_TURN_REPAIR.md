@@ -290,3 +290,26 @@ call can now show whether any remaining delay is turn detection, semantic
 eligibility, retrieval or model generation.
 
 Production health must show `2026-10-27-voice-bridge-prefetch-16` after deployment.
+
+## Release 17: use Llama for a bounded bridge while the answer runs
+
+The latest custom Twilio call on 27 October had 2.87-5.59 seconds of Nova turn
+detection on its slower turns. The main model then took about 0.73-0.95 seconds
+after prompt preparation. The longest open-ended home and room questions had no
+bridge because the delayed-question examples did not cover them. Weak semantic
+product matches also sent broad renovation questions to the main model.
+
+Complete questions and requests can now receive an approved neutral wait line,
+including open-ended advice questions with relevant earlier caller context.
+When the answer misses the bridge deadline, the Llama model may select among
+those approved lines while the real answer continues independently. The model
+cannot answer, invent, or stop the main response; its request is capped at 450 ms
+and the preselected semantic line is used if it times out or fails. Fast answers
+still win the race. Clearly identified product and order questions keep the
+careful model; broad questions with only a weak product match use Llama with the
+same retrieved business facts. Call timings record whether Llama was attempted,
+whether it selected a line or timed out, and the bridge and answer timings.
+
+Production health must show `2026-10-27-voice-bridge-async-17` after deployment.
+A new call should confirm bridge selection and main-answer timings separately,
+and show whether the remaining wait is Nova turn detection or response work.

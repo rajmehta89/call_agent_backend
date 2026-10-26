@@ -31,7 +31,7 @@ from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_wait import with_wait_bridge
+from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, complete_nova_turn
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -1160,10 +1160,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if not candidate:
             diagnostics.update(bridge_selector="none", bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
-        # wait_bridge_phrase already selected an approved, semantically appropriate line. A second Llama call only
-        # chooses between approved phrases and can consume most of the time the bridge is meant to save.
-        diagnostics.update(bridge_selector="semantic_candidate", bridge_ready_ms=round((perf_counter() - started) * 1000))
-        return candidate
+        bridge_services = services or await asyncio.to_thread(_voice_services)
+        selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent_bridges[-3:], diagnostics)
+        diagnostics["bridge_ready_ms"] = round((perf_counter() - started) * 1000)
+        return selected
 
     def start_reply(text: str, bridge_ready=None, bridge_diagnostics=None) -> Dict[str, Any]:
         """Prepare the real answer independently of semantic bridge selection."""

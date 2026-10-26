@@ -62,7 +62,16 @@ def test_choose_voice_model(monkeypatch):
                 or ("small" in text.lower() and "size is the room" in earlier.lower())):
             return ["product"]
         return []
+    def store_rank(text, earlier=""):
+        text = text.lower()
+        if (any(term in text for term in ("basin", "bathroom actually"))
+                or ("small" in text and "size is the room" in earlier.lower())):
+            return [("product", 0.82), ("none", 0.62), ("order", 0.40), ("policy", 0.35)]
+        if "can i do" in text or "drawing room" in text:
+            return [("product", 0.666), ("none", 0.633), ("order", 0.611), ("policy", 0.35)]
+        return [("none", 0.82), ("product", 0.55), ("order", 0.40), ("policy", 0.35)]
     monkeypatch.setattr(store_intent, "wanted", store_kinds)
+    monkeypatch.setattr(store_intent, "rank", store_rank)
     monkeypatch.setenv("VOICE_FAST_MODEL", "")
     assert choose_voice_model("It's Raj.") is None
     fast = "meta-llama/llama-3.1-8b-instruct"
@@ -71,6 +80,8 @@ def test_choose_voice_model(monkeypatch):
     assert choose_voice_model("Okay. Cool. Bye.") == fast                                   # acknowledgement / goodbye
     assert choose_voice_model("No, that's all, thanks.") == fast
     assert choose_voice_model("What basins do you have?") is None
+    assert choose_voice_model("What can I do?", earlier="I just bought a new house.") == fast
+    assert choose_voice_model("Where should I start with the drawing room?") == fast
     # Product intent keeps the careful model; a business question can use the fast model with retrieved facts.
     assert choose_voice_model("Yeah, I'm doing up my bathroom actually.", "Are you after a particular type?") is None
     assert choose_voice_model("It's quite small.", "What size is the room?") is None
@@ -83,10 +94,10 @@ def test_product_follow_up_stays_on_main_model_using_prior_caller_context(monkey
     import store_intent
     seen = {}
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
-    def wanted(text, earlier=""):
+    def ranked(text, earlier=""):
         seen.update(text=text, earlier=earlier)
-        return ["product"] if earlier else []
-    monkeypatch.setattr(store_intent, "wanted", wanted)
+        return [("product", 0.82), ("none", 0.55)] if earlier else [("none", 0.8), ("product", 0.4)]
+    monkeypatch.setattr(store_intent, "rank", ranked)
     assert choose_voice_model("And the price?", earlier="I'm looking for a matte black basin.") is None
     assert seen["earlier"] == "I'm looking for a matte black basin."
 
@@ -378,11 +389,41 @@ def test_product_shopping_statement_gets_lookup_bridge_even_when_classified_as_d
 
 def test_delayed_question_bridge_still_excludes_short_replies_and_contact_details(monkeypatch):
     import voice_turns
-    monkeypatch.setattr(voice_turns, "bridge_kind", lambda *args: "")
+    monkeypatch.setattr(voice_turns, "bridge_kind", lambda text, *args: "status" if text == "__status__" else "")
     assert voice_turns.wait_bridge_phrase("What is your Home DFO business for?") in voice_turns.STATUS_PHRASES
     for text in ("No. So so.", "Sorry. Sorry.", "Yes, please.", "my email is john at gmail dot com",
                  "Could you please tell me about"):
         assert voice_turns.wait_bridge_phrase(text) == ""
+
+
+def test_completed_open_request_gets_a_bridge_when_answer_is_still_running(monkeypatch):
+    import voice_turns
+    from turn_meaning import CALLER_TURN, TURN_COMPLETION, WAIT_QUESTION
+    monkeypatch.setattr(voice_turns, "bridge_kind", lambda text, *args: "status" if text == "__status__" else "")
+    monkeypatch.setattr(voice_turns, "pause_request", lambda *args: False)
+    monkeypatch.setattr(voice_turns, "is_acknowledgement", lambda *args: False)
+    monkeypatch.setattr(CALLER_TURN, "best", lambda *args: "question")
+    monkeypatch.setattr(TURN_COMPLETION, "best", lambda *args: "unfinished")
+    probes = []
+    def complete_from_context(text):
+        probes.append(text)
+        return "complete" if "new house" in text.lower() else "other"
+    monkeypatch.setattr(WAIT_QUESTION, "best", complete_from_context)
+    line = voice_turns.wait_bridge_phrase("What can I do?", earlier="I just bought a new house.")
+    assert line in voice_turns.STATUS_PHRASES, (line, probes)
+    assert "new house" in probes[0].lower() and "what can i do" in probes[0].lower()
+
+
+def test_complete_semantic_question_can_bridge_without_a_template_match(monkeypatch):
+    import voice_turns
+    from turn_meaning import CALLER_TURN, TURN_COMPLETION, WAIT_QUESTION
+    monkeypatch.setattr(voice_turns, "bridge_kind", lambda *args: "")
+    monkeypatch.setattr(voice_turns, "pause_request", lambda *args: False)
+    monkeypatch.setattr(voice_turns, "is_acknowledgement", lambda *args: False)
+    monkeypatch.setattr(CALLER_TURN, "best", lambda *args: "question")
+    monkeypatch.setattr(TURN_COMPLETION, "best", lambda *args: "complete")
+    monkeypatch.setattr(WAIT_QUESTION, "best", lambda *args: "other")
+    assert voice_turns.wait_bridge_phrase("Could you explain what I should do next?") in voice_turns.STATUS_PHRASES
 
 
 def test_a_scrambled_readback_of_the_callers_number_is_replaced_by_their_exact_digits():

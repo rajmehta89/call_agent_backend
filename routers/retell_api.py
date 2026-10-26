@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
-from voice_wait import with_wait_bridge
+from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
@@ -1225,9 +1225,10 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
                 " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
             if candidate:
-                timing.update(bridge_candidate=True, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000),
-                              bridge_ready_ms=round((perf_counter() - bridge_started) * 1000),
-                              bridge_selector="semantic_candidate")
+                timing.update(bridge_candidate=True, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000))
+                selected = await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent, timing)
+                timing["bridge_ready_ms"] = round((perf_counter() - bridge_started) * 1000)
+                return selected
             else:
                 timing.update(bridge_candidate=False, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000),
                               bridge_ready_ms=round((perf_counter() - bridge_started) * 1000),

@@ -121,3 +121,84 @@ def test_slow_bridge_model_falls_back_and_caller_interruption_cancels_both():
         assert source_cancelled.is_set() and bridge_cancelled.is_set()
 
     asyncio.run(run())
+
+
+def test_fast_model_selects_only_an_approved_wait_line(monkeypatch):
+    from types import SimpleNamespace
+    import voice_turns
+    from voice_wait import wait_message
+
+    seen = {}
+    class Client:
+        def with_options(self, **options):
+            seen["options"] = options
+            return self
+
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    seen["request"] = kwargs
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 1}'))])
+
+    services = SimpleNamespace(openai_client=Client(), _openrouter_extra_body=lambda model: {"model": model})
+    fallback = "Let's see what would work best for you."
+    diagnostics = {}
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    monkeypatch.setattr(voice_turns, "bridge_model_seconds", lambda: 0.4)
+    line = asyncio.run(wait_message(services, fallback, "What should I do with the drawing room?", diagnostics=diagnostics))
+
+    assert line in voice_turns.STATUS_PHRASES
+    assert seen["request"]["model"] == "meta-llama/llama-3.1-8b-instruct"
+    assert seen["request"]["max_tokens"] == 12
+    assert seen["options"] == {"timeout": 0.4, "max_retries": 0}
+    assert diagnostics["bridge_selector"] == "fast_model"
+    assert diagnostics["bridge_model_status"] == "selected"
+
+
+def test_wait_line_falls_back_when_fast_model_is_unavailable(monkeypatch):
+    from types import SimpleNamespace
+    from voice_wait import wait_message
+
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    services = SimpleNamespace(openai_client=None)
+    diagnostics = {}
+    fallback = "Just putting that together for you."
+    assert asyncio.run(wait_message(services, fallback, "What options should I consider?", diagnostics=diagnostics)) == fallback
+    assert diagnostics == {"bridge_selector": "semantic_fallback", "bridge_model_attempted": False,
+                           "bridge_model_status": "unavailable", "bridge_model_ms": 0}
+
+
+def test_slow_bridge_selection_uses_the_semantic_line_within_its_budget(monkeypatch):
+    import time
+    from types import SimpleNamespace
+    import voice_turns
+    from voice_wait import wait_message
+
+    class Client:
+        def with_options(self, **options):
+            return self
+
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    time.sleep(0.25)  # Simulate a provider ignoring its own request timeout.
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 1}'))])
+
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    monkeypatch.setattr(voice_turns, "bridge_model_seconds", lambda: 0.1)
+    services = SimpleNamespace(openai_client=Client(), _openrouter_extra_body=lambda model: None)
+    diagnostics = {}
+    fallback = "Let's see what would work best for you."
+    async def run():
+        started = time.perf_counter()
+        line = await wait_message(services, fallback, "What should I do?", diagnostics=diagnostics)
+        return line, time.perf_counter() - started
+
+    line, elapsed = asyncio.run(run())
+
+    assert line == fallback
+    assert elapsed < 0.18
+    assert diagnostics["bridge_selector"] == "semantic_fallback"
+    assert diagnostics["bridge_model_status"] == "timeout"
