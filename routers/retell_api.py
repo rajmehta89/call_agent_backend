@@ -21,7 +21,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
-from voice_turns import prepare_turn_meaning
+from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
@@ -735,6 +735,49 @@ def unfinished_wait_seconds() -> float:
         return 0.7
 
 
+class _SemanticPrefetch:
+    """Prepare stable caller words early, with one worker and no partial-text queue."""
+
+    STABLE_SECONDS = 0.25
+
+    def __init__(self, prepare=None):
+        self.prepare = prepare or prepare_turn_meaning
+        self.pending = None
+        self.last = None
+        self.updated_at = 0.0
+        self.task = None
+
+    def schedule(self, caller_text: str, agent_text: str) -> None:
+        payload = (caller_text, agent_text)
+        if not caller_text or payload == self.last:
+            return
+        self.last = self.pending = payload
+        self.updated_at = perf_counter()
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._run())
+
+    def discard_pending(self) -> None:
+        self.pending = None
+
+    async def _run(self) -> None:
+        while self.pending is not None:
+            remaining = self.STABLE_SECONDS - (perf_counter() - self.updated_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            payload, self.pending = self.pending, None
+            try:
+                await asyncio.to_thread(self.prepare, *payload)
+            except Exception as error:
+                logger.debug("semantic prefetch failed: %s", type(error).__name__)
+
+    async def close(self) -> None:
+        self.discard_pending()
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+
+
 def voice_temperature() -> float:
     """VOICE_TEMPERATURE: how freely the model words a spoken reply (0 = most literal, sticks closest to the knowledge)."""
     try:
@@ -761,6 +804,7 @@ async def _stream_reply(
     response_id: int,
     reminder: bool = False,
     started_at: Optional[float] = None,
+    timings: Optional[Dict[str, Any]] = None,
 ):
     """Yield model deltas while recording the latency of each voice turn."""
     request_started = started_at if started_at is not None else perf_counter()
@@ -768,15 +812,11 @@ async def _stream_reply(
     if not caller_text:
         yield "Could you please tell me how I can help?"
         return
-    if not reminder and sounds_unfinished(caller_text):
-        # The caller probably paused mid-sentence: wait a moment. If they go on, Retell asks again with the whole
-        # sentence and this reply is cancelled before a word of it is spoken (no half-started answer).
-        await asyncio.sleep(unfinished_wait_seconds())
-
     if _log_content_enabled():
         _trace(f"retell_llm_request call={call_id} response_id={response_id} caller={caller_text!r}")
 
     prompt_started = perf_counter()
+    prepared_prompt = None
     if reminder:
         turn_model, (details_note, details_problem), places = None, ("", False), ""
     else:
@@ -785,25 +825,38 @@ async def _stream_reply(
         def check_places():
             return place_note(caller_text, brain_service.knowledge_text(), last_agent_text(transcript))
 
-        turn_model, (details_note, details_problem), places = await asyncio.gather(
+        def prepare_question():
+            if needs_facts(caller_text):
+                return _system_prompt(search_text(caller_text, transcript), caller_number, "", transcript, True)
+            return None
+
+        turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
             asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript)),
             asyncio.to_thread(contact_check, caller_text, last_agent_text(transcript),
                               earlier_caller_texts(transcript, caller_text), caller_region(caller_number)),
             asyncio.to_thread(check_places),
+            asyncio.to_thread(prepare_question),
         )
+    if not reminder and sounds_unfinished(caller_text):
+        # Preprocessing already gave the caller time to continue. Only wait for
+        # the remainder, instead of adding another full pause after that work.
+        remaining = unfinished_wait_seconds() - (perf_counter() - request_started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
     bridge = ""
     prompt_task = None
     if not reminder and bridges_enabled() and turn_model is None:
-        # Said at once ("Sure, let me check."), before any database or model work: Retell speaks it while the
-        # knowledge search and the model run (~1.5 s).
+        # A short acknowledgement while the model works; non-question lookups
+        # can still prepare their prompt while this phrase is selected.
         said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
         recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
         bridge = bridge_phrase(caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
         if bridge:
-            # The knowledge search and store lookup start now, while the bridge is chosen and spoken.
-            prompt_task = asyncio.ensure_future(asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, True))
+            # Reuse a question prompt already prepared alongside the checks.
+            if prepared_prompt is None:
+                prompt_task = asyncio.ensure_future(asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, True))
             if bridge in LOOKUP_BRIDGES:
                 bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), bridge, call_id, response_id)
             else:
@@ -813,9 +866,13 @@ async def _stream_reply(
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
     if prompt_task is not None:
         system_prompt = await prompt_task  # built with the knowledge, as a bridged turn always uses the main model
+    elif prepared_prompt is not None and (turn_model is None or places):
+        system_prompt = prepared_prompt
     else:
         system_prompt = await asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, turn_model is None or bool(places))
     retrieval_ms = (perf_counter() - prompt_started) * 1000
+    if timings is not None:
+        timings.update(preparation_ms=round(retrieval_ms), model=turn_model or services.config.OPENROUTER_MODEL)
     reminder_text = voice_turn_reminder()
     messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
@@ -862,6 +919,9 @@ async def _stream_reply(
             spoken = numbers.feed(guard.feed(chunk))
             if spoken and not first_token_logged:
                 first_token_logged = True
+                if timings is not None:
+                    timings.update(first_model_text_ms=round((perf_counter() - request_started) * 1000),
+                                   model_wait_ms=round((perf_counter() - model_started) * 1000))
                 _trace(
                     f"retell_llm_first_token call={call_id} response_id={response_id} "
                     f"elapsed_ms={(perf_counter() - request_started) * 1000:.0f} "
@@ -1024,6 +1084,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     agent_messages: List[Dict[str, str]] = []
     live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
     prefetched_text, prefetched_at = "", 0.0  # last caller words sent for an early knowledge-search embedding
+    semantic_prefetch = _SemanticPrefetch()
+    voice_turn_timings: List[Dict[str, Any]] = []
     live_saves: set[asyncio.Task[None]] = set()
     services = configure_voice_services(AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b"))
 
@@ -1100,6 +1162,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     async def handle_response(event: Dict[str, Any], response_id: int) -> None:
         nonlocal callback_requested, user_messages, handoff_pending
         turn_started = perf_counter()
+        timing: Dict[str, Any] = {"response_id": response_id, "pipeline": "retell"}
         if handoff_pending:
             await send_event({"response_type": "response", "response_id": response_id,
                               "content": "", "content_complete": True})
@@ -1120,6 +1183,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         if caller_text:
             semantic_started = perf_counter()
             await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
+            timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
             _trace(f"retell_semantic_prepared call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - semantic_started) * 1000:.0f}")
             transfer_intent, ending = await asyncio.gather(
                 asyncio.to_thread(call_forwarding.handoff_intent, caller_text),
@@ -1167,11 +1231,13 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             reply = f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
         else:
             answer_parts: List[str] = []
-            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required", started_at=turn_started):
+            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required", started_at=turn_started, timings=timing):
                 if response_id != latest_response_id:
                     _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
                     return
                 answer_parts.append(chunk)
+                if not streamed:
+                    timing["first_text_ms"] = round((perf_counter() - turn_started) * 1000)
                 streamed = True
                 await send_event(
                     {
@@ -1200,6 +1266,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 "content_complete": True,
             }
         )
+        timing.setdefault("first_text_ms", round((perf_counter() - turn_started) * 1000))
+        voice_turn_timings.append(timing)
 
     def consume_response_task(task: asyncio.Task[None]) -> None:
         response_tasks.discard(task)
@@ -1238,12 +1306,15 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 # could otherwise take seconds).
                 asyncio.create_task(asyncio.to_thread(warm_model_connection, services))
                 asyncio.create_task(asyncio.to_thread(_system_prompt, "hello", caller_number, ""))
+                asyncio.create_task(asyncio.to_thread(prepare_turn_meaning, "", begin_message))
                 continue
 
             if interaction_type == "update_only":
                 # The caller is still talking: start the knowledge-search embedding for what they have said so
                 # far, so it is usually ready (cached) when Retell asks for the reply.
                 spoken = _last_user_message(_transcript_as_messages(transcript))
+                if not handoff_pending:
+                    semantic_prefetch.schedule(spoken, last_agent_text(_transcript_as_messages(transcript)))
                 if spoken and spoken != prefetched_text and perf_counter() - prefetched_at > 0.3:
                     prefetched_text, prefetched_at = spoken, perf_counter()
                     brain_service.prefetch_query_embedding(spoken)
@@ -1258,6 +1329,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             if not isinstance(response_id, int):
                 continue
             latest_response_id = response_id
+            semantic_prefetch.discard_pending()
             for older in list(response_tasks):
                 # Retell only plays the newest response; finishing older ones would waste a model call each.
                 older.cancel()
@@ -1270,6 +1342,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     except Exception as exc:
         _trace(f"retell_ws_error call={call_id} error={type(exc).__name__}: {exc}", error=True)
     finally:
+        await semantic_prefetch.close()
         for response_task in response_tasks:
             response_task.cancel()
         if response_tasks:
@@ -1301,6 +1374,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     "provider": "retell",
                     "started_at": started_at.isoformat(),
                     "messages": live_messages,
+                    "voice_turn_timings": voice_turn_timings[-200:],
                 },
             )
             _trace(f"retell_ws_fallback_call_saved call={call_id} messages={len(user_messages) + len(agent_messages)} callback={callback_requested}")

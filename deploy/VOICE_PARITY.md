@@ -1,6 +1,6 @@
 # Match production voice performance to the measured local baseline
 
-Prepared 26 October 2026. These changes are tested locally and have not been deployed to Render.
+Prepared 26 October 2026. The original fixes and batching release are now confirmed live on Render as `2026-10-26-voice-latency-2`. See `VOICE_FIRST_REPLY.md` for the latest call, additional changes and the next deployment marker. Production environment settings still need verification.
 
 ## Measured baseline
 

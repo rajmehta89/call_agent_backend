@@ -85,6 +85,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     monkeypatch.setattr(custom, "valid_stream_token", lambda *a: True)
     monkeypatch.setattr(custom.websockets, "connect", fake_connect)
     monkeypatch.setattr(custom, "_voice_sentences", fake_sentences)
+    monkeypatch.setattr(custom, "prepare_turn_meaning", lambda *args: None)
     monkeypatch.setattr(custom, "_tts_stream", tts or fake_tts)
     monkeypatch.setattr(custom, "_voice_services", lambda: Services())
     monkeypatch.setattr(custom, "_system_prompt", lambda *a, **k: "")

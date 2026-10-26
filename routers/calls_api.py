@@ -50,6 +50,7 @@ EXTRA_CALL_FIELDS = (
     "public_log_url",
     "call_cost",
     "latency",
+    "voice_turn_timings",
     "end_to_end_latency_ms",
     "provider_metadata",
     "dynamic_variables",

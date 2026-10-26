@@ -27,6 +27,8 @@ from brain_service import brain_service
 from auth_service import require_user
 from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
+from routers.retell_api import _SemanticPrefetch
+from voice_turns import prepare_turn_meaning, needs_facts
 from conversation_memory import ConversationMemory, voice_history_token_budget
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -445,14 +447,33 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     bridge: the phrase being spoken right now ("Sure, let me check."); the reply continues from it."""
     phone = caller if caller.startswith("+") else "unknown"
     started = perf_counter()
-    turn_model = choose_voice_model(text, last_agent_text(history))
-    details_note, details_problem = contact_check(text, last_agent_text(history), earlier_caller_texts(history, text), caller_region(caller))
+    agent_text = last_agent_text(history)
+    await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
+
+    def check_places():
+        return place_note(text, brain_service.knowledge_text(), agent_text)
+
+    def prepare_question():
+        if needs_facts(text):
+            return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, True, language)
+        return None
+
+    turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
+        asyncio.to_thread(choose_voice_model, text, agent_text),
+        asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
+        asyncio.to_thread(check_places),
+        asyncio.to_thread(prepare_question),
+    )
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
-    places = place_note(text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(history))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    system = await asyncio.to_thread(_system_prompt, search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places), language)
+    if prepared_prompt is not None and (turn_model is None or places):
+        system = prepared_prompt
+    else:
+        def prepare_selected_prompt():
+            return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places), language)
+        system = await asyncio.to_thread(prepare_selected_prompt)
     if call_forwarding.forwarding_on():
         system += ("\n\n# Live team transfer on this call\n"
                    "A live transfer to the human team is available. If the caller asks to speak with the team now, "
@@ -762,6 +783,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     pending_saves: set[asyncio.Task[Any]] = set()
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
     prefetched_at = 0.0
+    semantic_prefetch = _SemanticPrefetch(prepare_turn_meaning)
+    voice_turn_timings: List[Dict[str, Any]] = []
     call_started = perf_counter()
     heard_text = ""             # the caller's words so far in this turn (final parts + the latest partial)
     heard_changed_at = 0.0      # when those words last changed
@@ -850,6 +873,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         """Forwarding is on: hand the call to the team if the caller asked for a person (a meaning check, off the
         event loop), otherwise answer as usual."""
         nonlocal transfer_pending, earlier_handoff_text, unanswered_text
+        await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(memory.history()))
         intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
         if intent == "live":
             earlier_handoff_text = ""
@@ -953,6 +977,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             phone = caller if caller.startswith("+") else "unknown"
             await asyncio.gather(
                 asyncio.to_thread(warm_model_connection, services),
+                asyncio.to_thread(prepare_turn_meaning, "", last_agent_text(memory.history())),
                 asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
@@ -963,16 +988,30 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     def start_reply(text: str) -> Dict[str, Any]:
         """Start preparing the reply to `text` (knowledge search + model), without speaking anything yet."""
         history = memory.history()
-        bridge = ""
-        if bridges_enabled() and choose_voice_model(text, last_agent_text(history)) is None:
-            # This turn needs the knowledge search and the main model (~1.5 s): a short, fitting phrase ("Sure, let me
-            # check.") is said while they run, so the caller hears someone is there. Only recorded phrases (instant).
-            candidate = bridge_phrase(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
-            if candidate and _audio_cache_key(candidate, engine, preferred_language) in _cached_audio:
-                bridge = candidate
-        sentences = _voice_sentences(services, text, history, caller, memory.summary, bridge, contact_phone, preferred_language).__aiter__()
-        return {"text": text, "bridge": bridge, "sentences": sentences, "first": asyncio.ensure_future(sentences.__anext__()),
-                "started": perf_counter()}
+        def choose_bridge():
+            if bridges_enabled() and choose_voice_model(text, last_agent_text(history)) is None:
+                candidate = bridge_phrase(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
+                if candidate and _audio_cache_key(candidate, engine, preferred_language) in _cached_audio:
+                    return candidate
+            return ""
+
+        async def prepare_bridge():
+            if not bridges_enabled():
+                return ""
+            await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history))
+            return await asyncio.to_thread(choose_bridge)
+
+        bridge_ready = asyncio.create_task(prepare_bridge())
+
+        async def stream():
+            bridge = await bridge_ready
+            async with contextlib.aclosing(_voice_sentences(services, text, history, caller, memory.summary, bridge, contact_phone, preferred_language)) as source:
+                async for sentence in source:
+                    yield sentence
+
+        sentences = stream().__aiter__()
+        return {"text": text, "bridge_ready": bridge_ready, "sentences": sentences,
+                "first": asyncio.ensure_future(sentences.__anext__()), "started": perf_counter()}
 
     def drop_reply(prepared: Optional[Dict[str, Any]]) -> None:
         """Throw away a reply that was prepared early but will not be used (the caller said something else)."""
@@ -1010,16 +1049,18 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice early start used call=%s: reply began %.2fs before the end of the turn", call_sid, heard_at - prepared["started"])
         # The model and the knowledge search start now (or already started), before anything is spoken.
         prepared = prepared or start_reply(text)
-        bridge, sentences, first = prepared["bridge"], prepared["sentences"], prepared["first"]
+        sentences, first = prepared["sentences"], prepared["first"]
         filler_after = _filler_after_seconds()
         spoken: List[str] = []
         spoke_at = ""
         try:
+            bridge = await prepared["bridge_ready"]
             if sounds_unfinished(text):
                 # Probably a pause mid-sentence ("what are the popular ..."): give the caller a moment to finish. The
                 # model is already working meanwhile; if they go on, finish_utterance cancels this and answers it all.
-                waited = unfinished_wait_seconds()
-                await asyncio.sleep(waited)
+                waited = max(0.0, unfinished_wait_seconds() - (perf_counter() - prepared["started"]))
+                if waited:
+                    await asyncio.sleep(waited)
                 if filler_after:
                     filler_after = max(0.05, filler_after - waited)
             filler_spoken = False
@@ -1066,6 +1107,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             spoken.append(sentence)
             spoke_at = spoke_at or utc_iso()  # the transcript shows when the agent started speaking, not when it finished
             first_audio = await speak(sentence)
+            voice_turn_timings.append({"pipeline": "custom_twilio", "tts_engine": engine,
+                                       "first_sentence_ms": round(brain_seconds * 1000),
+                                       "tts_first_audio_ms": round(first_audio * 1000),
+                                       "first_audio_ms": round((brain_seconds + first_audio) * 1000)})
             logger.info("custom voice turn call=%s first_sentence=%.2fs first_audio=%.2fs total=%.2fs", call_sid, brain_seconds, first_audio, brain_seconds + first_audio)
             async for sentence in sentences:
                 spoken.append(sentence)
@@ -1090,6 +1135,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal heard_text, heard_changed_at, early_reply
         if text != heard_text:
             heard_text, heard_changed_at = text, perf_counter()
+            if not transfer_pending:
+                semantic_prefetch.schedule(text, last_agent_text(memory.history()))
             if early_reply and not _same_words(early_reply["text"], text):
                 drop_reply(early_reply)
                 early_reply = None
@@ -1187,6 +1234,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     def finish_utterance() -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
+        semantic_prefetch.discard_pending()
         bind_call(call_sid)
         text = " ".join(utterance).strip()
         if not re.search(r"[A-Za-z0-9]", text):
@@ -1387,6 +1435,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     except Exception as error:
         logger.error("custom Twilio voice websocket error: %s", error)
     finally:
+        await semantic_prefetch.close()
         if contact_tasks:
             try:
                 await asyncio.wait_for(asyncio.gather(*contact_tasks, return_exceptions=True), timeout=5)
@@ -1407,6 +1456,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],
                 "messages": live_transcript.ordered_from_lists(transcript, responses),
+                "voice_turn_timings": voice_turn_timings[-200:],
                 "contact_phone": contact_phone,
                 "summary": memory.summary or f"Custom Twilio voice call with {len(transcript)} caller turns and {len(responses)} AI responses.",
                 "preferred_language": preferred_language,

@@ -22,7 +22,7 @@ load_project_env()
 from ai_services import warm_model_connection
 from brain_service import brain_service, _local_embedder
 from meaning import Classifier
-from routers.custom_twilio_voice_api import _voice_services, _voice_sentences, _tts_stream, _warm_tts_connection
+from routers.custom_twilio_voice_api import _voice_services, _voice_sentences, _tts_stream, _warm_tts_connection, _DeepgramSpeaker
 from routers.retell_api import _system_prompt
 import turn_meaning
 
@@ -43,13 +43,17 @@ async def benchmark(args):
         warm_model_connection(services)
 
     await asyncio.to_thread(warm)
-    if args.audio:
+    speaker = _DeepgramSpeaker() if args.audio and args.engine == "deepgram" else None
+    if speaker is not None:
+        await speaker.warm()
+    elif args.audio:
         await _warm_tts_connection(args.engine)
     report = {"started_at": datetime.now(timezone.utc).isoformat(),
               "model": services.config.OPENROUTER_MODEL,
               "local_embeddings": _local_embedder() is not None,
               "warmup_ms": round((perf_counter() - warm_started) * 1000),
               "tts_engine": args.engine if args.audio else None,
+              "tts_transport": "persistent_websocket" if speaker else "http" if args.audio else None,
               "scope": "Completed transcript to first generated sentence/audio; excludes speech recognition and phone network",
               "results": []}
     for repeat in range(args.repeats):
@@ -62,18 +66,25 @@ async def benchmark(args):
                 row = {"question": question, "repeat": repeat + 1,
                        "first_sentence_ms": round(first_sentence * 1000)}
                 if args.audio:
-                    speech = _tts_stream(sentence, args.engine)
+                    speech = speaker.stream(sentence) if speaker else _tts_stream(sentence, args.engine)
                     try:
                         audio = await anext(speech)
                         if not audio:
                             raise RuntimeError("TTS returned empty audio")
                         row["first_audio_ms"] = round((perf_counter() - started) * 1000)
+                        if speaker is not None:
+                            # Live calls finish the utterance and reuse this connection.
+                            # Closing at the first byte would discard it between trials.
+                            async for _ in speech:
+                                pass
                     finally:
                         await speech.aclose()
                 report["results"].append(row)
                 print(json.dumps(row), flush=True)
             finally:
                 await stream.aclose()
+    if speaker is not None:
+        await speaker.close()
     field = "first_audio_ms" if args.audio else "first_sentence_ms"
     report["median_ms"] = round(statistics.median(row[field] for row in report["results"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
