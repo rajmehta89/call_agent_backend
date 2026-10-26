@@ -61,6 +61,22 @@ def test_ineligible_turn_does_not_get_a_generic_bridge():
     asyncio.run(run())
 
 
+def test_slow_eligibility_decision_is_preserved_without_inventing_a_fallback():
+    async def run():
+        async def source():
+            await asyncio.sleep(0.28)
+            yield "The answer."
+
+        async def choose():
+            await asyncio.sleep(0.22)
+            return "Let me check that."
+
+        result = [part async for part in with_wait_bridge(source(), choose, "", 0.001, perf_counter())]
+        assert result == ["Let me check that. ", "The answer."]
+
+    asyncio.run(run())
+
+
 def test_answer_wins_while_bridge_model_is_still_working():
     async def run():
         bridge_cancelled = asyncio.Event()

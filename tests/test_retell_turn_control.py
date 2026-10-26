@@ -118,3 +118,44 @@ def test_explicit_later_callback_is_queued_without_more_contact_questions(app, m
         assert response["content_complete"] is True
         assert "marked your request" in response["content"]
         assert queued.get("transfer") is True
+
+
+def test_slow_retell_answer_gets_one_wait_bridge_then_the_answer(app, monkeypatch):
+    monkeypatch.setattr(retell, "bridges_enabled", lambda: True)
+    monkeypatch.setattr(retell, "status_after_seconds", lambda: 0.01)
+    monkeypatch.setattr(retell, "wait_bridge_phrase", lambda *args: "Just putting that together for you.")
+
+    async def answer(*args, **kwargs):
+        await asyncio.sleep(0.08)
+        yield "Here are the round basins."
+
+    monkeypatch.setattr(retell, "_stream_reply", answer)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-wait-bridge") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "I'm looking for a round basin."}]})
+        bridge = socket.receive_json()
+        reply = socket.receive_json()
+        complete = socket.receive_json()
+        assert bridge["content"].strip() == "Just putting that together for you."
+        assert reply["content"] == "Here are the round basins."
+        assert complete["content_complete"] is True and complete["content"] == ""
+
+
+def test_slow_short_retell_reply_does_not_receive_generic_filler(app, monkeypatch):
+    monkeypatch.setattr(retell, "bridges_enabled", lambda: True)
+    monkeypatch.setattr(retell, "status_after_seconds", lambda: 0.01)
+
+    async def answer(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        yield "Go ahead."
+
+    monkeypatch.setattr(retell, "_stream_reply", answer)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-short-no-bridge") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "No. So so."}]})
+        assert socket.receive_json()["content"] == "Go ahead."
+        assert socket.receive_json()["content_complete"] is True

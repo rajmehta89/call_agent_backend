@@ -880,6 +880,8 @@ def bridge_kind(caller_text: str, earlier: str = "") -> str:
     words = re.findall(r"[a-z']+", caller_text.lower())
     if len(words) < 4:
         return ""  # "Hello?", "Yes", "So what?": answer straight away
+    if pause_request(caller_text) or is_acknowledgement(caller_text) or _SENSITIVE.search(caller_text):
+        return ""
     from turn_meaning import CALLER_TURN
     turn_text = kind_of_turn_text(caller_text)
     kind = CALLER_TURN.best(turn_text)
@@ -891,12 +893,12 @@ def bridge_kind(caller_text: str, earlier: str = "") -> str:
         kind = "question"
     if kind in ("clarify", "request", "problem"):
         return kind
+    if kind not in ("acknowledge", "closing", "sensitive") and not _EMAIL_CONTEXT.search(caller_text) and store_lookup_runs(caller_text, earlier):
+        return "lookup"  # A shopping statement can be labelled "detail" even though it starts a catalogue lookup.
     if kind in ("", "acknowledge", "closing", "detail", "sensitive"):
         return ""
     if len(words) >= 22 or len(re.findall(r"\b(?:and|also|plus)\b", caller_text.lower())) >= 2:
         return "detail"  # a long message with several things in it
-    if kind in ("search", "question") and needs_facts(caller_text) and store_lookup_runs(caller_text, earlier):
-        return "lookup"  # "How much is the Lydia mixer?" reads as a search, but it is a question the store answers
     if kind == "search":
         return "search"
     return "" if kind == "question" else "statement"
@@ -957,6 +959,24 @@ def bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
 
 def status_phrase(recent=()) -> str:
     return bridge_phrase("__status__", recent)
+
+
+def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
+    """Choose one acknowledgement only after the reply has actually missed its wait deadline."""
+    if pause_request(caller_text) or is_acknowledgement(caller_text):
+        return ""
+    phrase = bridge_phrase(caller_text, recent, earlier)
+    if phrase:
+        return phrase
+    # Full knowledge questions sometimes run slowly too. Short replies, contact details and unfinished
+    # fragments never get a generic status just because a provider is slow.
+    point = main_sentence(caller_text)
+    unfinished = not point.endswith("?") and re.search(
+        r"\b(?:about|the|a|an|and|or|to|for|with|your|my|because|if)[.!]?$", point, re.I)
+    if (len(point.split()) >= 6 and _QUESTION_START.match(point) and not _EMAIL_CONTEXT.search(point)
+            and not _SENSITIVE.search(point) and not unfinished):
+        return status_phrase(recent)
+    return ""
 
 
 def bridge_model_seconds() -> float:

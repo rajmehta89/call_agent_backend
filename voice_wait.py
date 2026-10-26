@@ -16,6 +16,10 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
             if not done:
                 choice = asyncio.create_task(make_bridge())
                 done, _ = await asyncio.wait({first, choice}, timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
+                if first not in done and choice not in done and not fallback:
+                    # Eligibility may itself need a semantic check. Without an approved fallback, keep racing
+                    # the answer against that decision instead of inventing filler or dropping a late decision.
+                    done, _ = await asyncio.wait({first, choice}, return_when=asyncio.FIRST_COMPLETED)
                 if first not in done and not first.done():
                     line = fallback
                     if choice in done:

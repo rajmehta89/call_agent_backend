@@ -316,6 +316,23 @@ def test_acknowledgements_never_repeat_the_last_few_and_only_lookups_say_check()
     assert not any("check" in phrase.lower() or "look" in phrase.lower() or "question" in phrase.lower() for phrase in others)
 
 
+def test_product_shopping_statement_gets_lookup_bridge_even_when_classified_as_detail(monkeypatch):
+    import voice_turns
+    from turn_meaning import CALLER_TURN
+    monkeypatch.setattr(CALLER_TURN, "best", lambda text: "detail")
+    monkeypatch.setattr(voice_turns, "store_lookup_runs", lambda *args: True)
+    assert voice_turns.bridge_phrase("I'm looking for a round basin.") in voice_turns.LOOKUP_BRIDGES
+
+
+def test_delayed_question_bridge_still_excludes_short_replies_and_contact_details(monkeypatch):
+    import voice_turns
+    monkeypatch.setattr(voice_turns, "bridge_kind", lambda *args: "")
+    assert voice_turns.wait_bridge_phrase("What is your Home DFO business for?") in voice_turns.STATUS_PHRASES
+    for text in ("No. So so.", "Sorry. Sorry.", "Yes, please.", "my email is john at gmail dot com",
+                 "Could you please tell me about"):
+        assert voice_turns.wait_bridge_phrase(text) == ""
+
+
 def test_a_scrambled_readback_of_the_callers_number_is_replaced_by_their_exact_digits():
     # From a real call: the caller said 8866631491 and the model read back "+91 8866663149".
     spoken = say_digits("8866631491")

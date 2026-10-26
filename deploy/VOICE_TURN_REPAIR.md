@@ -130,3 +130,33 @@ still loading. Follow-up price/detail searches retain the recent caller product
 phrase, including when speech recognition garbles the newest product word.
 
 Production health must show 2026-10-26-voice-turn-repair-9 after deployment.
+
+## Wait bridges and turn boundaries on both voice paths
+
+The 13:15 IST call returned live product details, but no bridge. Its stored
+post-turn response-to-audio measurements were 1.394–2.682 seconds; TTS added
+80–93 ms. Those old measurements did not include the STT end-of-turn delay.
+
+Custom voice no longer serializes answer preparation behind bridge selection
+or requires bridge audio to have been warmed first. Both custom and Retell
+race the answer against one qualified wait acknowledgement. A ready answer wins,
+shopping statements classified as detail can still qualify for a live-lookup
+bridge, and slow full knowledge questions may get a status update. Short replies,
+contact details and explicit interruptions remain excluded. An undecided bridge
+classifier no longer results in an unqualified generic fallback.
+
+Nova ignores old UtteranceEnd events when newer words have arrived and preserves
+the newest interim continuation when its watchdog ends a stalled turn. Flux's
+handoff check no longer blocks the speculation/watchdog loop. Non-Latin turns
+are retained rather than treated as empty speech.
+
+New custom timing records identify the actual STT engine and turn-end trigger,
+bridge audio time, and first audible response. When provider word timestamps
+are available, they also estimate turn-detection delay from the inbound audio
+timeline and the interval from speech end to the first audible response.
+
+Production health must show 2026-10-26-voice-turn-repair-10 after deployment.
+
+Turn-boundary references:
+- https://developers.deepgram.com/docs/understand-endpointing-interim-results
+- https://developers.deepgram.com/docs/flux/configuration

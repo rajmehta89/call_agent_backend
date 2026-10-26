@@ -25,6 +25,7 @@ from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import with_wait_bridge
+from voice_turns import wait_bridge_phrase
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
@@ -1264,13 +1265,13 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                       for phrase in ALL_BRIDGES if str(item.get("content", "")).startswith(phrase)][-3:]
 
             async def make_bridge():
-                candidate = await asyncio.to_thread(bridge_phrase, caller_text, recent,
+                candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
                     " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
                 if candidate in LOOKUP_BRIDGES:
                     return await _lookup_bridge(services, caller_text, last_agent_text(transcript), candidate, call_id, response_id, delay_seconds=0)
                 return candidate
 
-            fallback = status_phrase(recent) or "One moment, please."
+            fallback = ""  # make_bridge supplies a phrase only after this turn has qualified.
             def record_bridge(line):
                 timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
             stream = with_wait_bridge(source, make_bridge, fallback,

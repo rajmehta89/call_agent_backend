@@ -39,6 +39,9 @@ class FakeDeepgram:
         for at, *message in self.script:
             await asyncio.sleep(max(0.0, at - (time.perf_counter() - started)))
             if isinstance(message[0], dict):  # a Flux TurnInfo message
+                if "type" in message[0]:
+                    yield json.dumps(message[0])
+                    continue
                 self.last_text = message[0].get("transcript") or self.last_text
                 yield json.dumps({"type": "TurnInfo", **message[0]})
                 continue
@@ -54,13 +57,14 @@ class FakeDeepgram:
         await asyncio.sleep(30)
 
 
-def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0):
+def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0,
+             bridges=False, model_seconds=0.6, bridge_selector=None, logged=None):
     starts, finished = [], []
 
     async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en"):
         starts.append((round(time.perf_counter() - t0, 2), text))
         try:
-            await asyncio.sleep(0.6)  # the model thinking
+            await asyncio.sleep(model_seconds)
             yield "Here is the answer."
             finished.append(text)
         except asyncio.CancelledError:
@@ -92,10 +96,13 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     monkeypatch.setattr(custom, "warm_model_connection", lambda *a, **k: None)
     monkeypatch.setattr(custom, "_warm_tts_connection", no_op)
     monkeypatch.setattr(custom, "_warm_audio_cache", no_op)
-    monkeypatch.setattr(custom, "log_call", lambda *a, **k: None)
+    monkeypatch.setattr(custom, "log_call", lambda *a, **k: logged.append(a[2]) if logged is not None else None)
     monkeypatch.setattr(custom, "_log_voice_activity", lambda *a, **k: None)
     monkeypatch.setattr(custom.live_transcript, "save_live", lambda *a, **k: None)
-    monkeypatch.setattr(custom, "bridges_enabled", lambda: False)
+    monkeypatch.setattr(custom, "bridges_enabled", lambda: bridges)
+    if bridge_selector is not None:
+        monkeypatch.setattr(custom, "wait_bridge_phrase", bridge_selector)
+        monkeypatch.setattr(custom, "choose_voice_model", lambda *args: None)
     # The live server loads the local search model at startup; here its first load would block the test's event loop.
     monkeypatch.setattr(custom.brain_service, "prefetch_query_embedding", lambda *a, **k: None)
     monkeypatch.setenv("CUSTOM_FILLER_AFTER_SECONDS", "0")
@@ -128,6 +135,76 @@ def test_reply_starts_before_the_turn_ends_and_is_used(monkeypatch):
     assert starts[0][1] == "what do you sell"
     assert starts[0][0] < 1.7                          # before the end of the turn was confirmed
     assert finished == ["what do you sell"]
+
+
+def test_slow_product_answer_gets_one_bridge_even_when_audio_was_not_warmed(monkeypatch):
+    spoken, logged = [], []
+    monkeypatch.setenv("VOICE_STATUS_AFTER_MS", "60")
+    monkeypatch.setenv("VOICE_BRIDGE_DELAY_MS", "0")
+    monkeypatch.setattr(custom, "_cached_audio", {})
+
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+
+    run_call(monkeypatch, [(0.3, "I'm looking for a round basin.", True, True)],
+             tts=tts, bridges=True, model_seconds=0.3, call_seconds=1.2,
+             bridge_selector=lambda *args: "Let me check that for you.", logged=logged)
+    assert spoken.count("Let me check that for you.") == 1
+    assert spoken.index("Let me check that for you.") < spoken.index("Here is the answer.")
+    timing = logged[-1]["voice_turn_timings"][0]
+    assert timing["bridge_first_audio_ms"] < timing["first_audio_ms"]
+    assert timing["stt_engine"] == "nova"
+    assert timing["turn_end_trigger"] == "nova_speech_final"
+
+
+def test_slow_bridge_classifier_does_not_delay_a_ready_answer(monkeypatch):
+    spoken = []
+    monkeypatch.setenv("VOICE_STATUS_AFTER_MS", "20")
+    monkeypatch.setenv("VOICE_BRIDGE_DELAY_MS", "0")
+
+    def slow_bridge(*args):
+        time.sleep(0.7)
+        return "Let me check that for you."
+
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+
+    starts, finished = run_call(monkeypatch, [(0.3, "I'm looking for a round basin.", True, True)],
+                               tts=tts, bridges=True, model_seconds=0.04, call_seconds=1.25,
+                               bridge_selector=slow_bridge)
+    assert finished == ["I'm looking for a round basin."]
+    assert "Here is the answer." in spoken
+    assert "Let me check that for you." not in spoken
+    assert starts[0][0] < 0.6
+
+
+def test_nova_fallback_preserves_the_newer_interim_after_a_final_prefix(monkeypatch):
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "350")
+    script = [(0.3, "I'm looking for", True, False),
+              (0.4, "a round basin", False, False)]
+    starts, finished = run_call(monkeypatch, script, call_seconds=1.9)
+    assert finished == ["I'm looking for a round basin"], (starts, finished)
+
+
+def test_non_latin_caller_turn_is_not_discarded_as_silence(monkeypatch):
+    text = "\u0623\u0631\u064a\u062f \u0645\u0639\u0631\u0641\u0629 \u0627\u0644\u0633\u0639\u0631."
+    _, finished = run_call(monkeypatch, [(0.3, text, True, True)], call_seconds=1.5)
+    assert finished == [text]
+    assert not custom._same_words(text, "\u0623\u0631\u064a\u062f \u062d\u0648\u0636\u0627")
+
+
+def test_stale_nova_gap_does_not_end_a_newer_caller_continuation(monkeypatch):
+    def result(text, end, final=False, speech_final=False):
+        return {"type": "Results", "is_final": final, "speech_final": speech_final,
+                "channel": {"alternatives": [{"transcript": text, "words": [{"end": end}]}]}}
+    script = [(0.2, result("I'm looking for", 0.2, final=True)),
+              (0.3, result("a round basin", 0.3)),
+              (0.4, {"type": "UtteranceEnd", "last_word_end": 0.2}),
+              (0.8, result("a round basin.", 0.7, final=True, speech_final=True))]
+    starts, finished = run_call(monkeypatch, script, call_seconds=1.8)
+    assert len(finished) == 1 and custom._same_words(finished[0], "I'm looking for a round basin."), (starts, finished)
 
 
 def test_one_word_sorry_cancels_the_pending_answer_without_a_new_product_lookup(monkeypatch):
@@ -229,6 +306,23 @@ def test_flux_force_end_without_reply_answers_partial_transcript(monkeypatch):
     starts, finished = run_call(monkeypatch, script, stt="flux", answer_force=False, call_seconds=3.6)
     assert FakeDeepgram.sent_controls == ["ForceEndTurn"]
     assert finished == ["I am talking about what are your services like"], (starts, finished)
+
+
+def test_slow_handoff_check_does_not_stall_the_flux_turn_watchdog(monkeypatch):
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "800")
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: True)
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
+
+    def slow_handoff(*args):
+        time.sleep(1.5)
+        return False
+
+    monkeypatch.setattr(custom.call_forwarding, "wants_person", slow_handoff)
+    FakeDeepgram.sent_controls.clear()
+    script = [(0.2, {"event": "Update", "transcript": "I'm looking for a round basin."})]
+    starts, finished = run_call(monkeypatch, script, stt="flux", model_seconds=0.1, call_seconds=1.9)
+    assert FakeDeepgram.sent_controls == ["ForceEndTurn"]
+    assert finished == ["I'm looking for a round basin."], (starts, finished)
 
 
 def test_forwarding_off_does_not_force_end_an_unfinished_turn(monkeypatch):
