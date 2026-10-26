@@ -327,6 +327,7 @@ def test_close_tie_can_still_be_a_later_callback(monkeypatch):
     ("Yes, please.", "Would you like someone to call you back?", False, "callback"),
     ("Yes, please.", "Would you like to connect now or have someone call you back later?", False, "unclear"),
     ("No, thanks.", "Would you like me to connect you with the team?", False, "declined"),
+    ("Yeah.", "Are you looking for a specific style or size?", True, None),
     ("Okay.", "Anything else?", False, ""),
     ("Can you transfer me please?", "", False, "live"),
     ("Can you transfer my call tomorrow?", "", False, "callback"),

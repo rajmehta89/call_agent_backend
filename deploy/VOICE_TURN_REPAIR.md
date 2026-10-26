@@ -234,3 +234,28 @@ same semantic classifier. Regression coverage includes the saved transcript and
 Production health must show `2026-10-26-voice-turn-repair-13` after deployment.
 A fresh call should confirm the agent answers ordinary questions without
 starting a transfer and still transfers on a clear request.
+
+## Release 14: validate Nova's fixed-gap signal and callback context
+
+The 15:11 UTC custom call on 26 October is consistent with an early split: its
+saved transcript contains the fragment "Yes. So what" before the completed
+business question. A callback notification was saved without a callback
+response in the transcript, and a later "Yeah" was acknowledged as callback
+acceptance after the agent had returned to basin details. This points to
+Nova's fixed-gap signal closing an incomplete prefix and the callback state
+then carrying into an unrelated product turn.
+
+Nova speech-final and utterance-end signals are now candidates rather than
+immediate turn closures. Confidently complete turns still close as soon as the
+semantic check is ready; an incomplete turn waits for the existing watchdog so
+the caller can finish the thought. Callback acknowledgements also require the
+last agent message to semantically confirm the pending callback. Calls record
+audio seconds, Deepgram connection state, and transcript/final/end event counts
+to distinguish future silence from missing STT results.
+
+The 15:31 UTC call has only the greeting, no caller transcript, and no stored
+STT counters, so the record cannot tell whether the caller stayed silent or
+Nova missed their audio. Release 14 adds the counters needed to distinguish
+those cases on a later call.
+
+Production health must show `2026-10-26-voice-turn-repair-14` after deployment.

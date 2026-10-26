@@ -406,7 +406,7 @@ def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_r
     Run off the event loop. None leaves substantive requests to handoff_intent;
     an empty string means no new handoff. No lexical intent rules are used.
     """
-    from turn_meaning import HANDOFF_OFFER, HANDOFF_REPLY, AGENT_ASKED
+    from turn_meaning import CALLBACK_ACK_CONTEXT, HANDOFF_OFFER, HANDOFF_REPLY, AGENT_ASKED
     from meaning import vectors
     try:
         vectors([part for part in (caller_text, agent_text) if part.strip()])
@@ -420,7 +420,9 @@ def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_r
         return None
     if callback_requested and reply == "accept":
         # Agreement is not a phone number when we still need a reachable number.
-        return "" if AGENT_ASKED.best(agent_text) == "phone" else "callback_ack"
+        if AGENT_ASKED.best(agent_text) == "phone":
+            return ""
+        return "callback_ack" if CALLBACK_ACK_CONTEXT.best(agent_text) == "confirmed" else None
     offer = HANDOFF_OFFER.best(agent_text) if agent_text else "other"
     if offer not in {"live", "callback", "choice"}:
         return "" if reply in {"accept", "decline"} else None

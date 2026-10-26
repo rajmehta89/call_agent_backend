@@ -812,10 +812,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     early_handoff_task: Optional[asyncio.Task[Any]] = None
     completion_task: Optional[asyncio.Task[Any]] = None
     completion_text = ""
+    nova_speech_final_text = ""
     speculation_task: Optional[asyncio.Task[Any]] = None
     flux_turn_started = 0.0     # when the current Flux turn began (for logging turns that stay open long)
     flux_turn_logged = False
     audio_received_seconds = 0.0
+    stt_result_events = 0
+    stt_final_events = 0
+    stt_speech_final_events = 0
+    stt_flux_end_of_turn_events = 0
     latest_word_end = 0.0
     turn_word_end = 0.0
 
@@ -1291,9 +1296,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     def heard_changed(text: str) -> None:
         """The caller's words so far changed: an early reply for different words is no longer any use."""
-        nonlocal heard_text, heard_changed_at, early_reply
+        nonlocal heard_text, heard_changed_at, early_reply, nova_speech_final_text
         cancel_silence_reminder()
         if text != heard_text:
+            if nova_speech_final_text and not _same_words(text, nova_speech_final_text):
+                nova_speech_final_text = ""
             heard_text, heard_changed_at = text, perf_counter()
             if not transfer_pending:
                 semantic_prefetch.schedule(text, last_agent_text(memory.history()))
@@ -1321,22 +1328,31 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal completion_task, completion_text
         wait = _speculate_after_seconds()
         stuck_after = _turn_timeout_seconds()
+        incomplete_after = _env_number("CUSTOM_NOVA_INCOMPLETE_WAIT_MS", 1800, 1000, 5000) / 1000
         while active:
             await asyncio.sleep(0.05)
             quiet_for = perf_counter() - heard_changed_at
             if not flux and heard_text and not bot_busy():
                 try:
-                    complete_after = max(0.3, float(os.getenv("CUSTOM_COMPLETE_TURN_MS", "900")) / 1000)
+                    complete_after = max(0.3, float(os.getenv("CUSTOM_COMPLETE_TURN_MS", "450")) / 1000)
                 except ValueError:
-                    complete_after = 0.9
+                    complete_after = 0.45
+                speech_final_pending = bool(nova_speech_final_text and _same_words(nova_speech_final_text, heard_text))
                 if completion_task is not None and completion_task.done():
                     try:
                         complete = completion_task.result()
                     except Exception:
-                        complete = False
+                        complete = None
                     completion_task = None
-                    if complete and completion_text == heard_text and quiet_for >= complete_after:
+                    if (completion_text == heard_text and complete is True
+                            and (speech_final_pending or quiet_for >= complete_after)):
                         await finish_utterance("nova_semantic_complete")
+                        continue
+                    if (completion_text == heard_text and complete is None
+                            and (speech_final_pending or quiet_for >= complete_after)
+                            and nova_speech_final_text and _same_words(nova_speech_final_text, heard_text)):
+                        # Without a confident meaning result, retain Deepgram's final signal as the fallback.
+                        await finish_utterance("nova_speech_final")
                         continue
                 if completion_task is None and quiet_for >= complete_after and completion_text != heard_text:
                     completion_text = heard_text
@@ -1381,11 +1397,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 continue
             # With Nova-3 the same safeguard ends the turn here directly. The ¼-second early start applies to both (on a
             # real call Flux's EagerEndOfTurn mostly came together with EndOfTurn, giving no head start on its own).
-            if not flux and heard_text and stuck_after and quiet_for >= stuck_after and not bot_busy():
+            speech_final_pending = bool(nova_speech_final_text and _same_words(nova_speech_final_text, heard_text))
+            timeout_after = max(stuck_after, incomplete_after) if speech_final_pending else stuck_after
+            if not flux and heard_text and timeout_after and quiet_for >= timeout_after and not bot_busy():
                 # The caller's words have not changed for a while and Deepgram never said the turn ended: end it
-                # ourselves rather than leave the caller waiting in silence.
-                logger.info("custom voice: no end of turn from Deepgram after %.1fs; answering: %s", quiet_for, heard_text[:120])
-                await finish_utterance("nova_timeout")
+                # ourselves rather than leave the caller waiting in silence. After a final signal, incomplete
+                # wording gets a short grace period so a pause between clauses is not routed as a separate request.
+                trigger = "nova_speech_final" if speech_final_pending else "nova_timeout"
+                logger.info("custom voice: closing Nova turn after %.1fs (%s): %s", quiet_for, trigger, heard_text[:120])
+                await finish_utterance(trigger)
                 continue
             if wait and quiet_for >= wait:
                 start_early()
@@ -1431,7 +1451,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def finish_utterance_locked(trigger: str = "local") -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
-        nonlocal turn_word_end, completion_text, completion_task
+        nonlocal turn_word_end, completion_text, completion_task, nova_speech_final_text
         completion_text = ""
         if completion_task is not None:
             completion_task.cancel()
@@ -1457,6 +1477,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             # No final words, but the partial transcript showed what the caller said: use that.
             logger.info("custom voice: Deepgram gave no final words; using what it heard: %s", heard_text[:120])
             text = heard_text
+        nova_speech_final_text = ""
         utterance.clear()
         prepared, early_reply, heard_text = early_reply, None, ""
         if not text:
@@ -1519,7 +1540,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def receive_transcripts(connection: Any) -> None:
         nonlocal preferred_language
-        nonlocal embedding_task, latest_word_end, turn_word_end, heard_changed_at
+        nonlocal embedding_task, latest_word_end, turn_word_end, heard_changed_at, nova_speech_final_text
+        nonlocal completion_task, completion_text
+        nonlocal stt_result_events, stt_final_events, stt_speech_final_events, stt_flux_end_of_turn_events
         def record_words(words):
             nonlocal latest_word_end, turn_word_end, heard_changed_at
             end = max((float(word.get("end") or 0) for word in words or []), default=0.0)
@@ -1536,6 +1559,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     heard_changed_at = perf_counter()
                     continue
                 if kind == "TurnInfo":  # Deepgram Flux
+                    if payload.get("event") == "EndOfTurn":
+                        stt_flux_end_of_turn_events += 1
                     record_words(payload.get("words"))
                     words = str(payload.get("transcript") or "").split()
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
@@ -1551,10 +1576,16 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if kind == "UtteranceEnd":
                     if float(payload.get("last_word_end") or 0) + 0.001 < latest_word_end:
                         continue  # A delayed gap signal from an older finalized segment; the caller has continued.
-                    await finish_utterance("nova_utterance_end")
+                    if not flux and heard_text:
+                        # Treat the fixed-gap signal as a candidate end. Semantic completion or the
+                        # incomplete-turn grace period decides whether the caller is actually done.
+                        nova_speech_final_text = heard_text
                     continue
                 if kind != "Results":
                     continue
+                stt_result_events += 1
+                stt_final_events += int(bool(payload.get("is_final")))
+                stt_speech_final_events += int(bool(payload.get("speech_final")))
                 alternative = ((payload.get("channel") or {}).get("alternatives") or [{}])[0]
                 record_words(alternative.get("words"))
                 detected_languages = alternative.get("languages") or []
@@ -1566,9 +1597,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 text = str(alternative.get("transcript") or "").strip()
                 if not text:
                     # Deepgram can end a turn with an empty final transcript for a short word it showed in the partial
-                    # one ("kitchen"): still end the turn, answering what it showed, instead of waiting forever.
+                    # one ("kitchen"): keep the final signal so semantic completion or the watchdog can use it.
                     if payload.get("is_final") and payload.get("speech_final") and heard_text and not bot_busy():
-                        await finish_utterance("nova_empty_final")
+                        nova_speech_final_text = heard_text
                     continue
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
                 if bot_busy():
@@ -1586,7 +1617,17 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     utterance.append(text)
                     heard_changed(" ".join(utterance))
                     if payload.get("speech_final"):
-                        await finish_utterance("nova_speech_final")
+                        if not flux:
+                            nova_speech_final_text = heard_text
+                            # The fixed-gap signal is a candidate end. Start meaning-based
+                            # validation immediately so complete answers stay fast.
+                            if completion_text != heard_text:
+                                if completion_task is not None and not completion_task.done():
+                                    completion_task.cancel()
+                                completion_text = heard_text
+                                completion_task = asyncio.create_task(asyncio.to_thread(complete_nova_turn, heard_text))
+                            elif completion_task is None:
+                                completion_task = asyncio.create_task(asyncio.to_thread(complete_nova_turn, heard_text))
                 else:
                     heard_changed(" ".join([*utterance, text]))
             except Exception as error:
@@ -1709,6 +1750,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                                      "stt_connected": deepgram is not None,
+                                      "input_audio_seconds": round(audio_received_seconds, 1),
+                                      "stt_result_events": stt_result_events,
+                                      "stt_final_events": stt_final_events,
+                                      "stt_speech_final_events": stt_speech_final_events,
+                                      "stt_flux_end_of_turn_events": stt_flux_end_of_turn_events,
                                       **({"stream_error": stream_failure} if stream_failure else {})},
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],

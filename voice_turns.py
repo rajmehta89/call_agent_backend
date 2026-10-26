@@ -995,15 +995,28 @@ def caller_country_line(caller_id: str) -> str:
             "country the number is in.")
 
 
-def complete_nova_turn(caller_text: str) -> bool:
+def complete_nova_turn(caller_text: str) -> Optional[bool]:
     """A confident complete meaning may close a stalled Nova turn after real silence.
 
     Contact dictation keeps the longer watchdog so a pause cannot cut a number
-    or email in half. No keyword or phrase rules decide completion.
+    or email in half. None means there was no confident semantic decision, so
+    callers can fall back to Deepgram's end-of-speech signal. No phrase rules decide completion.
     """
     from turn_meaning import TURN_COMPLETION, CONTACT
-    if CONTACT.best(caller_text) in {"phone", "email"}:
+    contact = CONTACT.best(caller_text)
+    if contact is None:
+        return None
+    if contact in {"phone", "email"}:
         return False
     ranked = TURN_COMPLETION.rank(kind_of_turn_text(caller_text))
-    return bool(ranked and ranked[0][0] == "complete" and ranked[0][1] >= TURN_COMPLETION.min_score
-                and ranked[0][1] - ranked[1][1] >= 0.04)
+    if ranked is None:
+        return None
+    if not ranked:
+        return None
+    # Only a confident result may override Nova's fixed-gap signal. A close
+    # or low-confidence result falls back to that signal so multilingual calls
+    # keep their normal response time.
+    if (ranked[0][1] < TURN_COMPLETION.min_score
+            or ranked[0][1] - ranked[1][1] < 0.04):
+        return None
+    return ranked[0][0] == "complete"

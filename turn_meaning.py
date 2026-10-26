@@ -227,6 +227,20 @@ HANDOFF_REPLY = Classifier("caller response to handoff offer", {
               "Can you help with this product?", "Please explain the options.", "Kitchen."],
 }, min_score=0.7, close_call=0.04)
 
+# A short "yes" can acknowledge a callback confirmation, but it must not
+# inherit stale callback state after the agent has moved on to another topic.
+CALLBACK_ACK_CONTEXT = Classifier("callback confirmation context", {
+    "confirmed": ["I've noted your callback request. The team will call you on this number.",
+                  "Your callback request is already with the team.",
+                  "I've asked the team to call you back after this call.",
+                  "The team will get back to you about your callback request.",
+                  "A live transfer isn't available right now. I've noted your callback request."],
+    "other": ["Are you looking for a specific style or size?", "Would you like a particular basin size?",
+              "We have a range of basins in different sizes and finishes.", "What number should the team call?",
+              "Can I get your phone number?", "Would you like me to connect you now?",
+              "Here are the product options.", "Is there anything else I can help you with?"],
+}, min_score=0.58, close_call=0.03)
+
 
 PAUSE_TURN = Classifier("caller pause", {
     "pause": ["Sorry. Sorry.", "Wait a second.", "Please stop.", "Hold on a moment.",
@@ -255,10 +269,14 @@ WAIT_QUESTION = Classifier("complete question for delayed reply", {
 TURN_COMPLETION = Classifier("caller sentence completion", {
     "unfinished": ["Could you arrange a call to your", "Could you please tell me about",
                    "I am looking for", "What are the popular", "I need to know whether",
-                   "I was wondering if", "Can you check the", "My email is", "Can you tell me about the."],
+                   "I was wondering if", "Can you check the", "My email is", "Can you tell me about the.",
+                   "Yes. So what", "Yes, so what?", "Yes, so what is", "So what is", "Could you tell me what", "Do you have a",
+                   "I just wanted to know", "أريد أن أعرف إذا", "هل لديكم", "مجھے جاننا ہے کہ", "کیا آپ کے پاس"],
     "complete": ["What is it for?", "Who is it by?", "What are your services like?",
                  "I'm looking for a round basin.", "Kitchen.", "Someone call me later.",
                  "Yes, please.", "My number is eight eight six six six three one four nine one.",
                  "I want to know about your business.", "Can you help with this product?",
-                 "Do you sell kitchen sinks?"],
+                 "Do you sell kitchen sinks?", "Yes.", "Yeah.", "Okay.", "No, thanks.",
+                 "What do you sell?", "Do you have a basin?", "أريد معرفة السعر.", "نعم.", "تمام.",
+                 "مجھے قیمت جاننی ہے۔", "جی ہاں۔", "کیا آپ کے پاس بیسن ہے؟"],
 }, min_score=0.62)

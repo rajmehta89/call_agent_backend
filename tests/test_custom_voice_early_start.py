@@ -169,7 +169,12 @@ def test_slow_product_answer_gets_one_bridge_even_when_audio_was_not_warmed(monk
     timing = logged[-1]["voice_turn_timings"][0]
     assert timing["bridge_first_audio_ms"] < timing["first_audio_ms"]
     assert timing["stt_engine"] == "nova"
-    assert timing["turn_end_trigger"] == "nova_speech_final"
+    assert timing["turn_end_trigger"] == "nova_semantic_complete"
+    telemetry = logged[-1]["provider_metadata"]
+    assert telemetry["stt_connected"] is True
+    assert telemetry["stt_result_events"] == 1
+    assert telemetry["stt_final_events"] == 1
+    assert telemetry["stt_speech_final_events"] == 1
 
 
 def test_slow_bridge_classifier_does_not_delay_a_ready_answer(monkeypatch):
@@ -194,8 +199,9 @@ def test_slow_bridge_classifier_does_not_delay_a_ready_answer(monkeypatch):
     assert starts[0][0] < 0.6
 
 
-def test_callback_then_ok_is_queued_once_without_chat_generation_or_more_questions(monkeypatch):
+def test_callback_request_is_queued_once_without_chat_generation_or_more_questions(monkeypatch):
     queued, spoken, logged = [], [], []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
     monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
 
     monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "callback")
@@ -206,19 +212,41 @@ def test_callback_then_ok_is_queued_once_without_chat_generation_or_more_questio
         spoken.append(text)
         yield b"\xff" * 160
 
-    script = [(0.3, "Yeah. Someone call me later.", True, True),
-              (0.6, "OK.", True, True), (0.9, "Someone call me later.", True, True)]
-    starts, _ = run_call(monkeypatch, script, tts=tts, logged=logged, call_seconds=1.5, caller="+61412345678")
+    script = [(0.3, "Yeah. Someone call me later.", True, True)]
+    starts, _ = run_call(monkeypatch, script, tts=tts, logged=logged, call_seconds=1.2, caller="+61412345678")
     assert not starts
     assert len(queued) == 1
-    assert "You're welcome." in spoken
+    assert any("I've noted your callback request." in line for line in spoken)
     assert not any("?" in line for line in spoken[1:])
-    assert [turn["action"] for turn in logged[-1]["voice_turn_timings"]] == ["callback_requested", "callback_ack", "callback_ack"]
+    assert [turn["action"] for turn in logged[-1]["voice_turn_timings"]] == ["callback_requested"]
     assert all(turn["handoff_source"].startswith("semantic") for turn in logged[-1]["voice_turn_timings"])
+
+
+def test_nova_speech_final_does_not_route_an_incomplete_prefix(monkeypatch):
+    queued, logged = [], []
+    monkeypatch.setenv("CUSTOM_COMPLETE_TURN_MS", "100")
+    monkeypatch.setattr(custom, "complete_nova_turn",
+                        lambda text: "Yes. So what is Home DFO serving" in text)
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent",
+                        lambda text, *args: "callback" if text.strip() == "Yes. So what" else "")
+    monkeypatch.setattr(custom.call_forwarding, "create_callback_outreach",
+                        lambda *args, **kwargs: queued.append(args) or "Human team")
+
+    script = [(0.2, "Yes. So what", True, True),
+              (0.65, "is Home DFO serving, actually?", True, True)]
+    _, finished = run_call(monkeypatch, script, logged=logged, call_seconds=1.7, model_seconds=0.05,
+                           answer_text="We supply bathroom and kitchen products.")
+
+    assert finished == ["Yes. So what is Home DFO serving, actually?"]
+    assert not queued
+    assert logged[-1]["transfer_requested"] is False
 
 
 def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(monkeypatch):
     spoken = []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
     monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: True)
     monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
     monkeypatch.setattr(custom.call_forwarding, "transfer", lambda *args: True)
@@ -229,9 +257,9 @@ def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(mo
 
     offer = "Would you like me to connect you with the team for full product details?"
     script = [(0.2, "Can you help with this product?", True, True),
-              (0.9, "Yeah. Yeah. Please.", True, True)]
+              (1.5, "Yeah. Yeah. Please.", True, True)]
     starts, _ = run_call(monkeypatch, script, tts=tts, model_seconds=0.05,
-                         answer_text=offer, call_seconds=1.8)
+                         answer_text=offer, call_seconds=2.4)
     assert len(starts) == 1
     assert custom.call_forwarding.CONNECTING_LINE in spoken
     assert not any("back later" in line or "phone number" in line or "email" in line for line in spoken)

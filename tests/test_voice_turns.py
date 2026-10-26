@@ -13,6 +13,26 @@ def test_explicit_pause_is_not_a_new_product_request():
         assert not pause_request(text)
 
 
+def test_nova_turn_completion_only_fast_closes_confidently_complete_meaning(monkeypatch):
+    from turn_meaning import CONTACT, TURN_COMPLETION
+
+    monkeypatch.setattr(CONTACT, "best", lambda text: "other")
+    monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: [
+        ("unfinished", 0.90), ("complete", 0.70)])
+    assert voice_turns.complete_nova_turn("Yes. So what") is False
+
+    monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: [
+        ("unfinished", 0.90), ("complete", 0.88)])
+    assert voice_turns.complete_nova_turn("Could you tell me") is None
+
+    monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: [
+        ("complete", 0.82), ("unfinished", 0.61)])
+    assert voice_turns.complete_nova_turn("What do you sell?") is True
+
+    monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: None)
+    assert voice_turns.complete_nova_turn("A question") is None
+
+
 def test_would_love_to_preserves_the_product_context_for_an_accepted_offer(monkeypatch):
     monkeypatch.setattr(voice_turns, "detail_asked", lambda text: "")
     messages = [{"role": "user", "content": "A round matte black basin."},
