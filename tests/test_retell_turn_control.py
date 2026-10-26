@@ -210,3 +210,26 @@ def test_yes_to_live_offer_does_not_ask_now_or_later_again(app, monkeypatch):
         response = socket.receive_json()
         assert response["content"] == retell.call_forwarding.CONNECTING_LINE
         assert response["content_complete"] is True
+
+
+def test_slow_retell_routing_gets_only_one_bridge_for_the_whole_turn(app, monkeypatch):
+    import time
+    monkeypatch.setattr(retell, "bridges_enabled", lambda: True)
+    monkeypatch.setattr(retell, "status_after_seconds", lambda: 0.01)
+    monkeypatch.setattr(retell, "wait_bridge_phrase", lambda *args: "Just putting that together for you.")
+    def slow_routing(*args):
+        time.sleep(0.08)
+        return ""
+    monkeypatch.setattr(retell.call_forwarding, "contextual_handoff_intent", slow_routing)
+    async def answer(*args, **kwargs):
+        await asyncio.sleep(0.08)
+        yield "Here is the answer."
+    monkeypatch.setattr(retell, "_stream_reply", answer)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/routing-wait") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "What services do you provide?"}]})
+        assert socket.receive_json()["content"].strip() == "Just putting that together for you."
+        assert socket.receive_json()["content"] == "Here is the answer."
+        assert socket.receive_json()["content_complete"] is True

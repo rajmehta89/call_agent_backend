@@ -121,3 +121,36 @@ def test_slow_bridge_model_falls_back_and_caller_interruption_cancels_both():
         assert source_cancelled.is_set() and bridge_cancelled.is_set()
 
     asyncio.run(run())
+
+
+def test_llama_selects_only_an_approved_wait_message(monkeypatch):
+    from types import SimpleNamespace
+    from voice_wait import wait_message
+    import voice_turns
+    seen = {}
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    def create(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 1}'))])
+    client = SimpleNamespace(with_options=lambda **kwargs: client,
+                             chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = asyncio.run(wait_message(SimpleNamespace(openai_client=client),
+        "One moment, please.", "What services do you provide?"))
+    assert result in voice_turns.STATUS_PHRASES
+    assert seen["model"] == "meta-llama/llama-3.1-8b-instruct"
+
+
+def test_invalid_or_slow_llama_never_blocks_the_fallback(monkeypatch):
+    import time
+    from types import SimpleNamespace
+    from voice_wait import wait_message
+    import voice_turns
+    monkeypatch.setenv("VOICE_FAST_MODEL", "llama")
+    monkeypatch.setattr(voice_turns, "bridge_model_seconds", lambda: 0.01)
+    def create(**kwargs):
+        time.sleep(0.04)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 999}'))])
+    client = SimpleNamespace(with_options=lambda **kwargs: client,
+                             chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    assert asyncio.run(wait_message(SimpleNamespace(openai_client=client),
+        "One moment, please.", "What services do you provide?")) == "One moment, please."

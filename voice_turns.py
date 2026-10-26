@@ -741,7 +741,7 @@ def careful_voice_model(default: str = "") -> str:
 
 # ---- acknowledgements: something said while the answer is being prepared -------------------------------------
 #
-# Context-aware, rule-based (no extra model call): the caller's words decide the kind of acknowledgement, the last few
+# Semantic intent and conversation state decide eligibility; the fast model may select a wait line. The last few
 # are never repeated, and simple questions, answers to the agent, short replies and sensitive issues get none at all.
 # Only LOOKUP_BRIDGES say "let me check", and only when a live store lookup really runs; all are said only if the
 # answer is not ready yet.
@@ -883,7 +883,7 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     # fragments never get a generic status just because a provider is slow.
     point = main_sentence(caller_text)
     from turn_meaning import CALLER_TURN, WAIT_QUESTION
-    if len(point.split()) >= 6 and CALLER_TURN.best(point) == "question" and WAIT_QUESTION.best(point) == "complete":
+    if WAIT_QUESTION.best(kind_of_turn_text(caller_text)) == "complete":
         return status_phrase(recent)
     return ""
 
@@ -993,3 +993,17 @@ def caller_country_line(caller_id: str) -> str:
             f"A phone number they give is checked for every country by the system, which tells you what it found.{local} "
             "Never ask the caller for a 'country code'; if the system says the country is unclear, just ask naturally which "
             "country the number is in.")
+
+
+def complete_nova_turn(caller_text: str) -> bool:
+    """A confident complete meaning may close a stalled Nova turn after real silence.
+
+    Contact dictation keeps the longer watchdog so a pause cannot cut a number
+    or email in half. No keyword or phrase rules decide completion.
+    """
+    from turn_meaning import TURN_COMPLETION, CONTACT
+    if CONTACT.best(caller_text) in {"phone", "email"}:
+        return False
+    ranked = TURN_COMPLETION.rank(kind_of_turn_text(caller_text))
+    return bool(ranked and ranked[0][0] == "complete" and ranked[0][1] >= TURN_COMPLETION.min_score
+                and ranked[0][1] - ranked[1][1] >= 0.04)

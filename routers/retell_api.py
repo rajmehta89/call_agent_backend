@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
-from voice_wait import with_wait_bridge
+from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
@@ -1210,20 +1210,51 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             return
 
         streamed = False
-        if caller_text:
+        bridge_prelude = ""
+        recent = [phrase for item in transcript if item.get("role") == "assistant"
+                  for phrase in ALL_BRIDGES if str(item.get("content", "")).startswith(phrase)][-3:]
+
+        async def prepare_notice():
+            if not caller_text or not bridges_enabled():
+                return ""
+            candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
+                " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
+            return await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent)
+
+        bridge_ready = asyncio.create_task(prepare_notice())
+        asyncio.current_task().add_done_callback(lambda _: bridge_ready.cancel())
+
+        async def routing_notice():
+            line = await asyncio.shield(bridge_ready)
+            # A live lookup has not started until routing completes.
+            return "I'm working through the details now." if line in LOOKUP_BRIDGES else line
+
+        async def resolve():
             direct = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, caller_text, last_agent_text(transcript), callback_requested)
             timing["handoff_source"] = "semantic_context" if direct is not None else "semantic"
             if direct in {"live", "callback", "callback_ack", "declined", "unclear"}:
-                transfer_intent, ending = direct, False
+                result = direct, False
             else:
                 semantic_started = perf_counter()
                 await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
                 timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
-                _trace(f"retell_semantic_prepared call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - semantic_started) * 1000:.0f}")
-                transfer_intent, ending = await asyncio.gather(
+                result = await asyncio.gather(
                     asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if direct is None else asyncio.sleep(0, result=direct),
                     asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)),
                 )
+            yield tuple(result)
+
+        if caller_text:
+            async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "",
+                    status_after_seconds() if bridges_enabled() else 0, turn_started)) as routed:
+                async for item in routed:
+                    if isinstance(item, tuple):
+                        transfer_intent, ending = item
+                    else:
+                        bridge_prelude = item
+                        timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
+                        await send_event({"response_type": "response", "response_id": response_id,
+                                          "content": item, "content_complete": False})
         else:
             transfer_intent, ending = "", False
         _trace(f"retell_turn_intent call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - turn_started) * 1000:.0f}")
@@ -1280,21 +1311,14 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             reminder = event.get("interaction_type") == "reminder_required"
             source = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=reminder,
                                    started_at=turn_started, timings=timing, inline_bridge=False)
-            recent = [phrase for item in transcript if item.get("role") == "assistant"
-                      for phrase in ALL_BRIDGES if str(item.get("content", "")).startswith(phrase)][-3:]
-
             async def make_bridge():
-                candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
-                    " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
-                if candidate in LOOKUP_BRIDGES:
-                    return await _lookup_bridge(services, caller_text, last_agent_text(transcript), candidate, call_id, response_id, delay_seconds=0)
-                return candidate
+                return await asyncio.shield(bridge_ready)
 
             fallback = ""  # make_bridge supplies a phrase only after this turn has qualified.
             def record_bridge(line):
                 timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
             stream = with_wait_bridge(source, make_bridge, fallback,
-                                      status_after_seconds() if bridges_enabled() and not reminder else 0, turn_started,
+                                      status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, turn_started,
                                       on_bridge=record_bridge)
             async with contextlib.aclosing(stream):
                 async for chunk in stream:
@@ -1319,6 +1343,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
             return
 
+        outgoing = "" if streamed else reply
+        reply = (bridge_prelude + reply).strip()
         agent_messages.append({"content": reply, "timestamp": utc_iso()})
         save_progress(event.get("transcript"), reply)
         transfer_service.append_message(call_id, "assistant", reply)
@@ -1328,7 +1354,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             {
                 "response_type": "response",
                 "response_id": response_id,
-                "content": "" if streamed else reply,
+                "content": outgoing,
                 "content_complete": True,
             }
         )

@@ -425,3 +425,33 @@ def test_when_elevenlabs_cuts_off_the_call_carries_on_with_the_deepgram_voice(mo
     starts, finished = run_call(monkeypatch, script, tts=elevenlabs_out_of_credits)
     assert finished == ["What do you sell?"]
     assert spoken[-1] == "Here is the answer."  # the reply was spoken in full with the other voice
+
+
+def test_slow_semantic_routing_gets_one_bridge_before_the_answer(monkeypatch):
+    spoken, logged = [], []
+    monkeypatch.setenv("VOICE_STATUS_AFTER_MS", "40")
+    monkeypatch.setenv("VOICE_BRIDGE_DELAY_MS", "40")
+    def slow_routing(*args):
+        time.sleep(0.15)
+        return ""
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", slow_routing)
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+    run_call(monkeypatch, [(0.2, "What services do you provide?", True, True)],
+             tts=tts, logged=logged, bridges=True, model_seconds=0.1, call_seconds=1.3,
+             bridge_selector=lambda *args: "Just putting that together for you.")
+    assert spoken.count("Just putting that together for you.") == 1
+    assert spoken.index("Just putting that together for you.") < spoken.index("Here is the answer.")
+    assert logged[-1]["voice_turn_timings"][0]["bridge_first_audio_ms"] < logged[-1]["voice_turn_timings"][0]["first_audio_ms"]
+
+
+def test_complete_nova_question_ends_before_the_long_watchdog(monkeypatch):
+    logged = []
+    monkeypatch.setenv("CUSTOM_COMPLETE_TURN_MS", "350")
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "2500")
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
+    starts, finished = run_call(monkeypatch, [(0.2, "What services do you provide?", False, False)],
+                                model_seconds=0.05, logged=logged, call_seconds=1.2)
+    assert finished == ["What services do you provide?"]
+    assert logged[-1]["voice_turn_timings"][0]["turn_end_trigger"] == "nova_semantic_complete"

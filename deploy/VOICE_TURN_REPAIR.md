@@ -185,3 +185,34 @@ this release; health and regression checks alone do not establish timing parity.
 
 Validation: all 409 backend tests passed locally, including semantic handoff,
 callback state, voice turn timing, and live-store answer regressions.
+
+## Release 12: bridge slow routing and close clear Nova turns sooner
+
+The 14:19 UTC custom call on 26 October had four long speech-end-to-audio
+intervals: 4.531, 4.139, 3.507 and 5.297 seconds. Turn detection accounted for
+2.350, 4.050, 2.760 and 5.200 seconds; after the turn closed, the first audio
+followed in 2.181, 0.089, 0.747 and 0.097 seconds. This shows that most of the
+delay happened before the answer path began, so an answer-only bridge could
+arrive too late or not at all.
+
+Both custom Twilio and Retell now start one eligible bridge while semantic
+handoff routing and answer generation run. The fast model can choose among
+approved, fact-free holding lines; a slow or unavailable model falls back to
+the approved line. A ready answer still wins, and a routing-time bridge suppresses
+the second bridge. A catalogue-lookup phrase is changed to a general status line
+until the lookup actually starts.
+
+Custom Nova calls also use the semantic turn-completion model after a short quiet
+period. It can end a clearly complete turn before the longer provider watchdog;
+email and phone dictation retain the longer wait so pauses do not cut off contact
+details. This does not reduce the provider's own end-of-turn delay when Nova is
+still listening.
+
+The local browser-call application error was Twilio error 11200: the local ngrok
+tunnel had stopped, so Twilio could not fetch its voice webhook. Restarting the
+local development services restored the tunnel and local browser app URL. The
+production phone routing was not changed by this repair.
+
+Production health must show `2026-10-26-voice-turn-repair-12` after deployment.
+A new live call is needed to measure the effect on actual turn detection and
+caller-perceived timing; the recorded call above predates these changes.

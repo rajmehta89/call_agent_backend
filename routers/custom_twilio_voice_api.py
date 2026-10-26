@@ -31,8 +31,8 @@ from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_wait import with_wait_bridge
-from voice_turns import wait_bridge_phrase
+from voice_wait import with_wait_bridge, wait_message
+from voice_turns import wait_bridge_phrase, complete_nova_turn
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
@@ -810,6 +810,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     forced_fallback_text = ""
     early_handoff_checked = ""
     early_handoff_task: Optional[asyncio.Task[Any]] = None
+    completion_task: Optional[asyncio.Task[Any]] = None
+    completion_text = ""
     speculation_task: Optional[asyncio.Task[Any]] = None
     flux_turn_started = 0.0     # when the current Flux turn began (for logging turns that stay open long)
     flux_turn_logged = False
@@ -917,8 +919,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if "turn_detection_ms" in timing:
             timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + first_audio_ms
         voice_turn_timings.append(timing)
-        memory.add(text, line)
-        responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
+        spoken_line = " ".join(part for part in ((turn_timing or {}).get("bridge_text", ""), line) if part)
+        memory.add(text, spoken_line)
+        responses.append({"content": spoken_line, "timestamp": spoke_at, "language": preferred_language})
         save_progress()
         if active and not transfer_pending:
             schedule_silence_reminder()
@@ -950,11 +953,46 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         """Resolve semantic handoff intent and conversation state, otherwise answer as usual."""
         nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested
         agent_text = last_agent_text(memory.history())
-        intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
-        turn_timing = {**(turn_timing or {}), "handoff_source": "semantic_context" if intent is not None else "semantic"}
-        if intent is None:
-            await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
-            intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
+        turn_timing = dict(turn_timing or {})
+        bridge_ready = prepared["bridge_ready"] if prepared else asyncio.create_task(prepare_bridge(text, memory.history()))
+
+        async def resolve():
+            intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
+            turn_timing["handoff_source"] = "semantic_context" if intent is not None else "semantic"
+            if intent is None:
+                await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
+                intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
+            yield intent
+
+        async def routing_notice():
+            line = await asyncio.shield(bridge_ready)
+            return STATUS_PHRASES[0] if line in LOOKUP_BRIDGES else line
+
+        bridge_pending = False
+        def record_notice(line):
+            nonlocal bridge_pending
+            bridge_pending = True
+            turn_timing.update(bridge_text=line, bridge_ms=round((perf_counter() - heard_at) * 1000))
+
+        deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
+        try:
+            async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "", deadline, heard_at, record_notice)) as routed:
+                async for item in routed:
+                    if bridge_pending:
+                        bridge_pending = False
+                        recent_bridges.append(item.strip())
+                        delay = await speak(item.strip())
+                        turn_timing["bridge_first_audio_ms"] = turn_timing["bridge_ms"] + round(delay * 1000)
+                    else:
+                        intent = item
+        except BaseException:
+            bridge_ready.cancel()
+            drop_reply(prepared)
+            raise
+        if not intent:
+            prepared = prepared or start_reply(text, bridge_ready)
+        else:
+            bridge_ready.cancel()
         if intent in {"callback_ack", "declined"}:
             earlier_handoff_text = ""
             drop_reply(prepared)
@@ -1089,22 +1127,23 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.debug("call warm-up failed: %s", error)
 
-    def start_reply(text: str) -> Dict[str, Any]:
-        """Start preparing the reply to `text` (knowledge search + model), without speaking anything yet."""
-        history = memory.history()
-        def choose_bridge():
-            if bridges_enabled() and choose_voice_model(text, last_agent_text(history)) is None:
-                chooser = wait_bridge_phrase if status_after_seconds() > 0 else bridge_phrase
-                return chooser(text, recent_bridges[-3:], " ".join(earlier_caller_texts(history, text)[-8:]))
+    async def prepare_bridge(text, history):
+        nonlocal services
+        if not bridges_enabled():
             return ""
+        await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history))
+        candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent_bridges[-3:],
+                                           " ".join(earlier_caller_texts(history, text)[-8:]))
+        if not candidate:
+            return ""
+        if services is None:
+            services = await asyncio.to_thread(_voice_services)
+        return await wait_message(services, candidate, text, last_agent_text(history), recent_bridges[-3:])
 
-        async def prepare_bridge():
-            if not bridges_enabled():
-                return ""
-            await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history))
-            return await asyncio.to_thread(choose_bridge)
-
-        bridge_ready = asyncio.create_task(prepare_bridge())
+    def start_reply(text: str, bridge_ready=None) -> Dict[str, Any]:
+        """Prepare the real answer independently of semantic bridge selection and Llama."""
+        history = memory.history()
+        bridge_ready = bridge_ready if bridge_ready is not None else asyncio.create_task(prepare_bridge(text, history))
 
         async def stream():
             # Bridge eligibility and the real answer run independently. A slow classifier must never hold up
@@ -1156,8 +1195,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         # The model and the knowledge search start now (or already started), before anything is spoken.
         prepared = prepared or start_reply(text)
         sentences, first = prepared["sentences"], prepared["first"]
-        spoken: List[str] = []
-        spoke_at = ""
+        prefix = (turn_timing or {}).get("bridge_text", "")
+        spoken: List[str] = [prefix] if prefix else []
+        spoke_at = utc_iso() if prefix else ""
         try:
             if await asyncio.to_thread(sounds_unfinished, text):
                 # Probably a pause mid-sentence ("what are the popular ..."): give the caller a moment to finish. The
@@ -1165,9 +1205,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 waited = max(0.0, unfinished_wait_seconds() - (perf_counter() - prepared["started"]))
                 if waited:
                     await asyncio.sleep(waited)
-            filler_spoken = False
+            filler_spoken = bool(prefix)
             bridge_pending = False
-            bridge_timing: Dict[str, Any] = {}
+            bridge_timing: Dict[str, Any] = {key: value for key, value in (turn_timing or {}).items() if key.startswith("bridge_")}
 
             async def first_sentence():
                 try:
@@ -1184,7 +1224,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 bridge_timing["bridge_ms"] = round((perf_counter() - heard_at) * 1000)
 
             deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
-            stream = with_wait_bridge(first_sentence(), make_bridge, "", deadline, heard_at, record_bridge)
+            stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge)
             try:
                 sentence = ""
                 async with contextlib.aclosing(stream):
@@ -1278,11 +1318,29 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         dropped. Nothing is spoken until the turn has really ended. With Nova-3 it also ends a turn Deepgram never
         ends (it sometimes drops short words)."""
         nonlocal forced_turn, forced_at, forced_fallback_text, early_handoff_checked, early_handoff_task
+        nonlocal completion_task, completion_text
         wait = _speculate_after_seconds()
         stuck_after = _turn_timeout_seconds()
         while active:
             await asyncio.sleep(0.05)
             quiet_for = perf_counter() - heard_changed_at
+            if not flux and heard_text and not bot_busy():
+                try:
+                    complete_after = max(0.3, float(os.getenv("CUSTOM_COMPLETE_TURN_MS", "900")) / 1000)
+                except ValueError:
+                    complete_after = 0.9
+                if completion_task is not None and completion_task.done():
+                    try:
+                        complete = completion_task.result()
+                    except Exception:
+                        complete = False
+                    completion_task = None
+                    if complete and completion_text == heard_text and quiet_for >= complete_after:
+                        await finish_utterance("nova_semantic_complete")
+                        continue
+                if completion_task is None and quiet_for >= complete_after and completion_text != heard_text:
+                    completion_text = heard_text
+                    completion_task = asyncio.create_task(asyncio.to_thread(complete_nova_turn, heard_text))
             if early_handoff_task is not None and early_handoff_task.done():
                 try:
                     handoff = early_handoff_task.result()
@@ -1373,7 +1431,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def finish_utterance_locked(trigger: str = "local") -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
-        nonlocal turn_word_end
+        nonlocal turn_word_end, completion_text, completion_task
+        completion_text = ""
+        if completion_task is not None:
+            completion_task.cancel()
+            completion_task = None
         semantic_prefetch.discard_pending()
         bind_call(call_sid)
         turn_ended_at = perf_counter()
@@ -1615,7 +1677,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if transcript_task:
                     transcript_task.cancel()
                     await asyncio.gather(transcript_task, return_exceptions=True)
-                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, deepgram_ready)
+                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task, deepgram_ready)
                                  if task is not None]
                 for task in closing_tasks:
                     task.cancel()
