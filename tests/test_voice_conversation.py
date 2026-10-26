@@ -113,3 +113,12 @@ def test_no_store_lookup_for_clarify_yes_or_bye(monkeypatch):
     assert retell_api._no_lookup_turn("Sorry?")
     assert retell_api._no_lookup_turn("Yes, please.")
     assert not retell_api._no_lookup_turn("How much is the black basin?")
+
+
+def test_company_introduction_does_not_wait_for_the_live_catalogue(monkeypatch):
+    import voice_keyterms
+    from turn_meaning import CALLER_TURN
+    monkeypatch.setattr(voice_keyterms, "business_name", lambda: "Home DFO")
+    monkeypatch.setattr(CALLER_TURN, "best", lambda text: "question")
+    assert retell_api._no_lookup_turn("Yeah, so, uh, what is Home DFO is for")
+    assert not retell_api._no_lookup_turn("What is the basin for?")

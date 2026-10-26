@@ -130,6 +130,23 @@ def test_reply_starts_before_the_turn_ends_and_is_used(monkeypatch):
     assert finished == ["what do you sell"]
 
 
+def test_one_word_sorry_cancels_the_pending_answer_without_a_new_product_lookup(monkeypatch):
+    outgoing = []
+    original = custom.WebSocket.send_text
+
+    async def record(socket, text):
+        outgoing.append(json.loads(text))
+        await original(socket, text)
+
+    monkeypatch.setattr(custom.WebSocket, "send_text", record)
+    script = [(1.0, "What do you sell?", True, True),
+              (1.2, "Sorry", False, False), (1.3, "Sorry.", True, True)]
+    starts, finished = run_call(monkeypatch, script)
+    assert starts and all("sorry" not in text.lower() for _, text in starts)
+    assert not finished
+    assert any(event.get("event") == "clear" for event in outgoing)
+
+
 def test_early_reply_is_dropped_when_the_caller_goes_on(monkeypatch):
     script = [(0.5, "do you sell", False, False),     # pause: an early reply starts
               (1.0, "do you sell basins", False, False),  # caller goes on: dropped

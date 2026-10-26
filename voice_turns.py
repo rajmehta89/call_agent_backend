@@ -43,8 +43,27 @@ _ASKED_FOR_DETAILS = re.compile(r"\b(?:name|number|phone|mobile|email|e-mail|spe
 
 
 def is_acknowledgement(caller_text: str) -> bool:
+    if re.fullmatch(r"(?:[\s,.!?]*(?:yes|yeah|yep|sure|okay|ok)[\s,.!?]*)?"
+                    r"(?:i(?: would|'d) love to|that would be (?:great|good)|please do)[\s,.!?]*", caller_text.lower()):
+        return True
     words = re.findall(r"[a-z']+", caller_text.lower())
     return bool(words) and len(words) <= 8 and all(word in _ACK_WORDS for word in words)
+
+
+def pause_request(caller_text: str) -> bool:
+    """An explicit interruption alone, never an apology followed by a question."""
+    words = re.findall(r"[a-z']+", caller_text.lower())
+    allowed = {"sorry", "stop", "wait", "hold", "on", "hang", "please", "a", "second", "one", "moment",
+               "yeah", "yes", "no", "uh", "um", "just", "excuse", "me", "i'm"}
+    return bool(words) and len(words) <= 12 and set(words) <= allowed and (
+        any(word in {"sorry", "stop", "wait"} for word in words)
+        or "hold on" in caller_text.lower() or "hang on" in caller_text.lower()
+        or "excuse me" in caller_text.lower()
+    )
+
+
+def pause_reply(caller_text: str) -> str:
+    return "Would you like me to repeat that?" if caller_text.strip().endswith("?") else "Of course. Go ahead."
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
@@ -776,9 +795,9 @@ def status_after_seconds() -> float:
     """VOICE_STATUS_AFTER_MS: a short status update ("I'm working through the details now.") if the answer still has
     not started this long after the caller finished (0 = never)."""
     try:
-        return max(0.0, float(os.getenv("VOICE_STATUS_AFTER_MS", "2500"))) / 1000
+        return max(0.0, float(os.getenv("VOICE_STATUS_AFTER_MS", "1200"))) / 1000
     except ValueError:
-        return 2.5
+        return 1.2
 
 
 def bridges_enabled() -> bool:

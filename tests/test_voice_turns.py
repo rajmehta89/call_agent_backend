@@ -3,6 +3,22 @@ from voice_turns import NumberSpeaker, caller_number_digits, choose_voice_model,
 
 
 import pytest
+from voice_turns import pause_request, search_text
+
+
+def test_explicit_pause_is_not_a_new_product_request():
+    for text in ["Sorry", "Yeah, sorry, sorry.", "Wait, please.", "Hold on a second.", "Stop."]:
+        assert pause_request(text)
+    for text in ["Sorry, what sizes do you have?", "I want a stop valve.", "The delivery wait is too long."]:
+        assert not pause_request(text)
+
+
+def test_would_love_to_preserves_the_product_context_for_an_accepted_offer(monkeypatch):
+    monkeypatch.setattr(voice_turns, "detail_asked", lambda text: "")
+    messages = [{"role": "user", "content": "A round matte black basin."},
+                {"role": "assistant", "content": "Would you like advice on basin sizes or styles?"}]
+    query = search_text("Yeah, I would love to.", messages)
+    assert "matte black basin" in query and "sizes or styles" in query
 
 
 @pytest.fixture(autouse=True)

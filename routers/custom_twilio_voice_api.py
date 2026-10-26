@@ -29,6 +29,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
+from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES
 from conversation_memory import ConversationMemory, voice_history_token_budget
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -66,7 +67,8 @@ def _to_ws_url(http_url: str) -> str:
 
 def _deepgram_url(language: str = "en") -> str:
     code = normalize_language(language)
-    auto_language = os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
+    auto_language = (os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
+                     and code != "ur")  # Urdu is supported by the dedicated Nova model, not Nova-3 multi.
     model = os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
     # Words callers say that speech recognition could get wrong (business, brand and product names), taken from the
     # knowledge automatically (voice_keyterms.py) plus any extras in .env. Nova-3 listens for them ("keyterm").
@@ -77,7 +79,6 @@ def _deepgram_url(language: str = "en") -> str:
         "&interim_results=true&smart_format=true&punctuate=true"
         f"&endpointing={os.getenv('CUSTOM_ENDPOINTING_MS', '500')}"
         f"&utterance_end_ms={os.getenv('CUSTOM_UTTERANCE_END_MS', '1000')}&vad_events=true"
-        + ("&language_hint=en&language_hint=ar&language_hint=ur" if auto_language else "")
         + "".join(f"&keyterm={quote(term)}" for term in keyterms[:50])
     )
 
@@ -106,7 +107,7 @@ def _flux_url(language: str = "en") -> str:
     model = os.getenv(f"CUSTOM_FLUX_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_FLUX_MODEL", "flux-general-en").strip() or "flux-general-en"
     return (
         "wss://api.deepgram.com/v2/listen?"
-        f"model={model}&language={quote({'en': 'en-US', 'ar': 'ar', 'ur': 'ur'}.get(code, 'en-US'))}&encoding=mulaw&sample_rate=8000"
+        f"model={model}&encoding=mulaw&sample_rate=8000"
         f"&eot_threshold={eot}&eager_eot_threshold={eager}&eot_timeout_ms={timeout_ms}"
         + "".join(f"&keyterm={quote(term)}" for term in current_keyterms()[:50])
     )
@@ -719,7 +720,7 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     base = _public_base(request)
     if not base.startswith(("https://", "http://")):
         raise HTTPException(status_code=503, detail="TWILIO_PUBLIC_BASE_URL is not configured")
-    stream_url = f"{_to_ws_url(base)}/api/custom-voice/media?preferred_language={quote(call_language)}"
+    stream_url = f"{_to_ws_url(base)}/api/custom-voice/media"
     browser_phone = _browser_caller_phone(form.get("caller_phone"))
     caller = html.escape(browser_phone or str(form.get("From") or "unknown"), quote=True)
     call_sid = html.escape(str(form.get("CallSid") or ""), quote=True)
@@ -780,6 +781,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     # Question currently being answered, until its reply starts playing.
     unanswered_text = ""
     active = True
+    stream_failure = ""
     pending_saves: set[asyncio.Task[Any]] = set()
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
     prefetched_at = 0.0
@@ -816,19 +818,21 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     def bot_busy() -> bool:
         return bool(pending_mark) or bool(reply_task and not reply_task.done())
 
-    async def interrupt() -> None:
+    async def interrupt(force: bool = False) -> None:
         """Caller started talking: stop thinking/speaking and flush audio Twilio has buffered."""
-        nonlocal reply_task, pending_mark
+        nonlocal reply_task, pending_mark, unanswered_text
         if transfer_pending:
             return
-        if unanswered_text:
+        if unanswered_text and not force:
             # Still thinking about a question nobody has heard an answer to: the caller is continuing
             # that sentence, not interrupting. finish_utterance() merges the two parts.
             return
+        if force:
+            unanswered_text = ""
         if reply_task and not reply_task.done():
             reply_task.cancel()
         reply_task = None
-        if pending_mark and stream_sid:
+        if stream_sid:
             pending_mark = ""
             await send_twilio({"event": "clear", "streamSid": stream_sid})
 
@@ -842,6 +846,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             await asyncio.to_thread(_hang_up, call_sid)
         except Exception as error:
             logger.warning("custom voice: could not end call %s: %s", call_sid, error)
+
+    async def pause_for_caller(text: str) -> None:
+        line = pause_reply(text)
+        await speak(line)
+        memory.add(text, line)
+        responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
+        save_progress()
 
     async def forward_to_team(text: str, heard_at: float) -> None:
         """The caller asked for a person and call forwarding is on: say so, let it play, then ring the team
@@ -1074,11 +1085,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     await speak(bridge, cache_key=_audio_cache_key(bridge, engine, preferred_language))  # the answer is being prepared meanwhile
                 filler_after = 0.0
             status_wait = status_after_seconds() - (perf_counter() - heard_at)
-            if bridges_enabled() and status_wait > 0 and not first.done():
+            if bridges_enabled() and not filler_spoken and not first.done():
                 # A long wait: one real status update, said only if the answer still has not started.
-                done, _ = await asyncio.wait({first}, timeout=status_wait)
-                status = "" if done else status_phrase(recent_bridges[-3:])
-                if status and _audio_cache_key(status, engine, preferred_language) in _cached_audio:
+                done, _ = await asyncio.wait({first}, timeout=max(0.0, status_wait))
+                status = "" if done else (status_phrase(recent_bridges[-3:]) or "One moment, please.")
+                if status:
                     recent_bridges.append(status)
                     filler_spoken = True
                     spoken.append(status)
@@ -1256,6 +1267,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
             save_progress()
             return
+        if pause_request(text):
+            drop_reply(prepared)
+            if reply_task and not reply_task.done():
+                reply_task.cancel()
+            unanswered_text = ""
+            transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
+            reply_task = asyncio.create_task(pause_for_caller(text))
+            reply_task.add_done_callback(log_reply_failure)
+            return
         if not unanswered_text and not (reply_task and not reply_task.done()) and call_is_over(text, last_agent_text(memory.history())):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             drop_reply(prepared)
@@ -1304,8 +1324,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if kind == "TurnInfo":  # Deepgram Flux
                     words = str(payload.get("transcript") or "").split()
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
-                    if bot_busy() and len(words) >= 2 and payload.get("event") in {"Update", "StartOfTurn"}:
-                        await interrupt()
+                    if bot_busy() and (len(words) >= 2 or pause_request(" ".join(words))) and payload.get("event") in {"Update", "StartOfTurn"}:
+                        await interrupt(force=pause_request(" ".join(words)))
                     on_flux_turn(payload)
                     continue
                 if kind in {"Error", "Warning"}:
@@ -1331,8 +1351,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         finish_utterance()
                     continue
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
-                if bot_busy() and len(text.split()) >= 2:
-                    await interrupt()
+                if bot_busy() and (len(text.split()) >= 2 or pause_request(text)):
+                    await interrupt(force=pause_request(text))
                 # Start the knowledge search on what the caller has said so far (see brain_service.query_embedding).
                 nonlocal prefetched_at
                 if payload.get("is_final") or perf_counter() - prefetched_at > 0.4:
@@ -1373,12 +1393,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         asyncio.create_task(speculate())  # ends with the call (when `active` turns false)
 
     try:
-        deepgram_ready = asyncio.create_task(open_deepgram())
+        deepgram_ready = None
         try:
                 while True:
                     message = json.loads(await websocket.receive_text())
                     event = message.get("event")
-                    if deepgram_ready.done() and deepgram_ready.exception():
+                    if deepgram_ready is not None and deepgram_ready.done() and deepgram_ready.exception():
                         raise deepgram_ready.exception()
                     if event == "start":
                         start = message.get("start") or {}
@@ -1394,6 +1414,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
                             await websocket.close(code=1008)
                             return
+                        # Use the authenticated Start parameters before opening STT.
+                        # Flux's English model cannot transcribe Arabic or Urdu.
+                        flux = _use_flux() and not auto_language and preferred_language == "en"
+                        deepgram_ready = asyncio.create_task(open_deepgram())
                         greeting = await asyncio.to_thread(_greeting_text, preferred_language)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)
                         responses.append({"content": greeting, "timestamp": utc_iso(), "language": preferred_language})
@@ -1404,7 +1428,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         reply_task.add_done_callback(log_reply_failure)
                         # Record the bridge phrases and fillers in this call's voice while the greeting plays, so
                         # they can be said instantly.
-                        phrases = (*(ALL_BRIDGES if bridges_enabled() else ()), *(_FILLERS if _filler_after_seconds() else ()))
+                        phrases = (*(tuple(dict.fromkeys((*STATUS_PHRASES, *LOOKUP_BRIDGES, *ALL_BRIDGES))) if bridges_enabled() else ()),
+                                   *(_FILLERS if _filler_after_seconds() else ()))
                         if phrases:
                             asyncio.create_task(_warm_audio_cache(phrases, engine, preferred_language))
                     elif event == "media":
@@ -1424,7 +1449,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 drop_reply(early_reply)  # a reply started early for a turn that never ended
                 if reply_task and not reply_task.done():
                     reply_task.cancel()
-                deepgram_ready.cancel()
+                if deepgram_ready is not None:
+                    deepgram_ready.cancel()
                 if transcript_task:
                     transcript_task.cancel()
                     await asyncio.gather(transcript_task, return_exceptions=True)
@@ -1433,6 +1459,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         active = False
     except Exception as error:
+        stream_failure = f"{type(error).__name__}: {error}"
         logger.error("custom Twilio voice websocket error: %s", error)
     finally:
         await semantic_prefetch.close()
@@ -1447,12 +1474,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if transcript or responses:
             log_call(caller, None, {
                 "direction": "inbound",
-                "status": "completed",
+                "status": "failed" if stream_failure else "completed",
                 "duration": int(round(perf_counter() - call_started)),
                 "provider": "custom_twilio",
                 "provider_call_id": call_sid or stream_sid,
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
+                "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                                      **({"stream_error": stream_failure} if stream_failure else {})},
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],
                 "messages": live_transcript.ordered_from_lists(transcript, responses),

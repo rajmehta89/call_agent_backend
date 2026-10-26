@@ -8,6 +8,7 @@ from the configured OpenRouter model (gpt-oss-20b by default).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import json
 import logging
@@ -22,6 +23,8 @@ from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
+from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement
+from voice_wait import with_wait_bridge
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
@@ -385,6 +388,12 @@ def _no_lookup_turn(caller_text: str) -> bool:
     call so far). Judged by meaning; a store lookup otherwise costs up to a second or two on these turns."""
     from turn_meaning import CALLER_TURN
     from voice_turns import kind_of_turn_text
+    if pause_request(caller_text) or is_acknowledgement(caller_text):
+        return True
+    generic = kind_of_turn_text(caller_text).lower().strip(" .?!—")
+    generic = re.sub(r"^(?:(?:yeah|yes|okay|ok|so|uh|um|well)[\s,.]+)+", "", generic)
+    if re.fullmatch(r"(?:what (?:is|does)|tell me about) your company(?: is)?(?: for| do| about)?", generic):
+        return True  # a business introduction needs the knowledge, not a live catalogue/order request
     try:
         return CALLER_TURN.best(kind_of_turn_text(caller_text)) in {"clarify", "acknowledge", "closing"}
     except Exception:
@@ -805,6 +814,7 @@ async def _stream_reply(
     reminder: bool = False,
     started_at: Optional[float] = None,
     timings: Optional[Dict[str, Any]] = None,
+    inline_bridge: bool = True,
 ):
     """Yield model deltas while recording the latency of each voice turn."""
     request_started = started_at if started_at is not None else perf_counter()
@@ -847,12 +857,12 @@ async def _stream_reply(
         turn_model = None  # a wrong number or email needs the careful model
     bridge = ""
     prompt_task = None
-    if not reminder and bridges_enabled() and turn_model is None:
+    if inline_bridge and not reminder and bridges_enabled() and turn_model is None:
         # A short acknowledgement while the model works; non-question lookups
         # can still prepare their prompt while this phrase is selected.
         said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
         recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
-        bridge = bridge_phrase(caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
+        bridge = await asyncio.to_thread(bridge_phrase, caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
         if bridge:
             # Reuse a question prompt already prepared alongside the checks.
             if prepared_prompt is None:
@@ -893,6 +903,8 @@ async def _stream_reply(
         # Retell asks for a nudge after the caller has been silent; without this the model may repeat its last answer.
         messages.append({"role": "system", "content": "The caller has gone quiet. Check in with one short, friendly sentence, "
                          "for example asking if they are still there or if there is anything else you can help with. Do not repeat your previous answer."})
+    if not inline_bridge and bridges_enabled():
+        messages.append({"role": "system", "content": "The call system handles any short wait acknowledgement. Start directly with the actual answer; do not add or repeat a wait/checking phrase."})
     _trace(
         f"retell_llm_started call={call_id} response_id={response_id} "
         f"model={turn_model or services.config.OPENROUTER_MODEL} retrieval_ms={retrieval_ms:.0f}"
@@ -952,7 +964,8 @@ async def _stream_reply(
                 pass
 
 
-async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, fallback: str, call_id: str, response_id: int) -> str:
+async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, fallback: str, call_id: str, response_id: int,
+                         delay_seconds: Optional[float] = None) -> str:
     """What to say while the store lookup runs, phrased for this question by the small fast model ("Let me check the
     Lydia mixer for you."): no facts, no reasoning, just the line. Never said before bridge_delay_seconds (if the caller
     carries on, Retell cancels this reply first); slower than bridge_model_seconds or unsafe, the fixed phrase."""
@@ -972,8 +985,9 @@ async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str
         except Exception as error:
             logger.info("voice: lookup bridge from %s skipped (%s)", model, type(error).__name__)
     waited = perf_counter() - started
-    if waited < bridge_delay_seconds():
-        await asyncio.sleep(bridge_delay_seconds() - waited)
+    delay = bridge_delay_seconds() if delay_seconds is None else delay_seconds
+    if waited < delay:
+        await asyncio.sleep(delay - waited)
     _trace(f"retell_lookup_bridge call={call_id} response_id={response_id} source={'model' if line else 'fixed'} "
            f"ms={waited * 1000:.0f} said={(line or fallback)!r}")
     return line or fallback
@@ -1179,6 +1193,14 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             ]
             transfer_service.append_message(call_id, "user", caller_text)
 
+        if caller_text and pause_request(caller_text):
+            reply = pause_reply(caller_text)
+            await send_event({"response_type": "response", "response_id": response_id,
+                              "content": reply, "content_complete": True})
+            agent_messages.append({"content": reply, "timestamp": now})
+            save_progress(event.get("transcript"), reply)
+            return
+
         streamed = False
         if caller_text:
             semantic_started = perf_counter()
@@ -1231,22 +1253,42 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             reply = f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
         else:
             answer_parts: List[str] = []
-            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required", started_at=turn_started, timings=timing):
-                if response_id != latest_response_id:
-                    _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
-                    return
-                answer_parts.append(chunk)
-                if not streamed:
-                    timing["first_text_ms"] = round((perf_counter() - turn_started) * 1000)
-                streamed = True
-                await send_event(
-                    {
-                        "response_type": "response",
-                        "response_id": response_id,
-                        "content": chunk,
-                        "content_complete": False,
-                    }
-                )
+            reminder = event.get("interaction_type") == "reminder_required"
+            source = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=reminder,
+                                   started_at=turn_started, timings=timing, inline_bridge=False)
+            recent = [phrase for item in transcript if item.get("role") == "assistant"
+                      for phrase in ALL_BRIDGES if str(item.get("content", "")).startswith(phrase)][-3:]
+
+            async def make_bridge():
+                candidate = await asyncio.to_thread(bridge_phrase, caller_text, recent,
+                    " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
+                if candidate in LOOKUP_BRIDGES:
+                    return await _lookup_bridge(services, caller_text, last_agent_text(transcript), candidate, call_id, response_id, delay_seconds=0)
+                return candidate
+
+            fallback = status_phrase(recent) or "One moment, please."
+            def record_bridge(line):
+                timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
+            stream = with_wait_bridge(source, make_bridge, fallback,
+                                      status_after_seconds() if bridges_enabled() and not reminder else 0, turn_started,
+                                      on_bridge=record_bridge)
+            async with contextlib.aclosing(stream):
+                async for chunk in stream:
+                    if response_id != latest_response_id:
+                        _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
+                        return
+                    answer_parts.append(chunk)
+                    if not streamed:
+                        timing["first_text_ms"] = round((perf_counter() - turn_started) * 1000)
+                    streamed = True
+                    await send_event(
+                        {
+                            "response_type": "response",
+                            "response_id": response_id,
+                            "content": chunk,
+                            "content_complete": False,
+                        }
+                    )
             reply = "".join(answer_parts).strip() or "I’m sorry, I didn’t catch that. Could you please repeat it?"
 
         if response_id != latest_response_id:
@@ -1302,6 +1344,11 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 caller_number = str(call.get("from_number") or "unknown")
                 transfer_service.register_call(call_id, caller_number, direction=call.get("direction") or "inbound")
                 _trace(f"retell_call_details call={call_id} direction={call.get('direction') or 'inbound'} caller_known={caller_number != 'unknown'}")
+                try:
+                    sensitivity = min(1.0, max(0.0, float(os.getenv("RETELL_INTERRUPTION_SENSITIVITY", "0.85"))))
+                except ValueError:
+                    sensitivity = 0.85
+                await send_event({"response_type": "update_agent", "agent_config": {"interruption_sensitivity": sensitivity}})
                 # While the greeting plays: open the model connection and pre-build the prompt (cold first turns
                 # could otherwise take seconds).
                 asyncio.create_task(asyncio.to_thread(warm_model_connection, services))
@@ -1310,6 +1357,10 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 continue
 
             if interaction_type == "update_only":
+                if event.get("turntaking") == "user_turn" and not handoff_pending:
+                    latest_response_id = -1
+                    for older in list(response_tasks):
+                        older.cancel()
                 # The caller is still talking: start the knowledge-search embedding for what they have said so
                 # far, so it is usually ready (cached) when Retell asks for the reply.
                 spoken = _last_user_message(_transcript_as_messages(transcript))
