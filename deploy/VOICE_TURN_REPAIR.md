@@ -62,6 +62,25 @@ interruption sensitivity and final end-to-end timing after deployment.
 
 Production health must show `2026-10-26-voice-turn-repair-4`.
 
+## Follow-up from the 11:58 IST production call
+
+The latest call showed the acknowledgement bridge playing at about 1.2 seconds
+after Retell requested each response, including the simple company overview and
+contact follow-up. The spoken answer then began about 1.4-2.6 seconds after
+those acknowledgements. The caller-to-acknowledgement interval was longer because
+Retell had not yet declared the caller's turn complete; the bridge timer begins
+only after `response_required` arrives.
+
+The Retell connection now sets maximum responsiveness and asks for one follow-up
+after seven seconds of caller silence following agent speech. Custom Flux's
+silence backstop is 1.8 seconds by default (configurable with
+`CUSTOM_FLUX_EOT_TIMEOUT_MS`; increase it for callers who pause longer between
+clauses). The short bridge already covers delayed simple answers and contact
+details; it improves perceived wait time but does not make the full model answer
+finish sooner.
+
+Production health must show `2026-10-26-voice-turn-repair-5` after deployment.
+
 Primary references:
 
 - https://developers.deepgram.com/docs/nova-3-language-prompting

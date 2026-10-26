@@ -102,7 +102,9 @@ def _flux_url(language: str = "en") -> str:
     signal to start preparing the reply), and an EndOfTurn anyway after CUSTOM_FLUX_EOT_TIMEOUT_MS of silence."""
     eot = _env_number("CUSTOM_FLUX_EOT_THRESHOLD", 0.7, 0.5, 1.0)
     eager = min(eot, _env_number("CUSTOM_FLUX_EAGER_THRESHOLD", 0.4, 0.3, 0.9))  # Flux rejects eager > eot
-    timeout_ms = int(_env_number("CUSTOM_FLUX_EOT_TIMEOUT_MS", 3000, 500, 60000))
+    # End the turn promptly after a real pause while retaining room for callers who
+    # pause briefly between clauses. Override for callers who need longer pauses.
+    timeout_ms = int(_env_number("CUSTOM_FLUX_EOT_TIMEOUT_MS", 1800, 500, 60000))
     code = normalize_language(language)
     model = os.getenv(f"CUSTOM_FLUX_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_FLUX_MODEL", "flux-general-en").strip() or "flux-general-en"
     return (

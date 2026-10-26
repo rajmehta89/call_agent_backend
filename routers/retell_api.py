@@ -1348,7 +1348,24 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     sensitivity = min(1.0, max(0.0, float(os.getenv("RETELL_INTERRUPTION_SENSITIVITY", "0.85"))))
                 except ValueError:
                     sensitivity = 0.85
-                await send_event({"response_type": "update_agent", "agent_config": {"interruption_sensitivity": sensitivity}})
+                try:
+                    responsiveness = min(1.0, max(0.0, float(os.getenv("RETELL_RESPONSIVENESS", "1.0"))))
+                except ValueError:
+                    responsiveness = 1.0
+                try:
+                    reminder_trigger_ms = max(1000, int(os.getenv("RETELL_REMINDER_TRIGGER_MS", "7000")))
+                except ValueError:
+                    reminder_trigger_ms = 7000
+                try:
+                    reminder_max_count = max(0, int(os.getenv("RETELL_REMINDER_MAX_COUNT", "1")))
+                except ValueError:
+                    reminder_max_count = 1
+                await send_event({"response_type": "update_agent", "agent_config": {
+                    "interruption_sensitivity": sensitivity,
+                    "responsiveness": responsiveness,
+                    "reminder_trigger_ms": reminder_trigger_ms,
+                    "reminder_max_count": reminder_max_count,
+                }})
                 # While the greeting plays: open the model connection and pre-build the prompt (cold first turns
                 # could otherwise take seconds).
                 asyncio.create_task(asyncio.to_thread(warm_model_connection, services))

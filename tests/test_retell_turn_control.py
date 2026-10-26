@@ -87,10 +87,15 @@ def test_only_an_explicit_user_turn_cancels_an_old_response(app, monkeypatch, tu
             assert socket.receive_json()["content"] == "First answer."
 
 
-def test_call_uses_higher_interruption_sensitivity_without_replacing_the_agent(app, monkeypatch):
+def test_call_uses_responsive_turn_detection_and_one_silence_reminder(app, monkeypatch):
     monkeypatch.delenv("RETELL_INTERRUPTION_SENSITIVITY", raising=False)
     with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-settings") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "call_details", "call": {}})
-        assert socket.receive_json() == {"response_type": "update_agent", "agent_config": {"interruption_sensitivity": 0.85}}
+        assert socket.receive_json() == {"response_type": "update_agent", "agent_config": {
+            "interruption_sensitivity": 0.85,
+            "responsiveness": 1.0,
+            "reminder_trigger_ms": 7000,
+            "reminder_max_count": 1,
+        }}

@@ -25,6 +25,7 @@ def test_flux_selects_language_by_model_and_has_no_language_parameter(monkeypatc
     params = parse_qs(urlsplit(custom._flux_url()).query)
     assert params["model"] == ["flux-general-en"]
     assert "language" not in params
+    assert params["eot_timeout_ms"] == ["1800"]
 
 
 def test_twilio_stream_uses_custom_parameters_instead_of_a_query_string(monkeypatch):
