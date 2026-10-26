@@ -20,9 +20,11 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
                     line = fallback
                     if choice in done:
                         try:
-                            line = choice.result() or fallback
+                            # An empty result is deliberate: this turn does not
+                            # qualify for a bridge (for example, a short reply).
+                            line = choice.result()
                         except Exception:
-                            pass
+                            line = fallback
                     if line:
                         if on_bridge is not None:
                             on_bridge(line)

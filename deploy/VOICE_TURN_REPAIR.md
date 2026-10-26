@@ -82,7 +82,17 @@ finish sooner.
 The shared reminder timing is configurable with `VOICE_REMINDER_TRIGGER_MS`;
 the Retell reminder count is configurable with `VOICE_REMINDER_MAX_COUNT`.
 
-Production health must show `2026-10-26-voice-turn-repair-6` after deployment.
+## Follow-up from the latest custom calls
+
+The latest custom calls exposed generic status phrases on short or simple turns,
+including an incomplete "So" and a short "No". The custom path used a generic
+status even when the turn classifier had deliberately selected no bridge. The
+Retell path also used a generic fallback when the bridge classifier returned no
+phrase. Both now preserve that empty decision and answer directly; when a bridge
+is appropriate, the model is told to continue with the answer without adding a
+second holding phrase.
+
+Production health must show `2026-10-26-voice-turn-repair-7` after deployment.
 
 Primary references:
 

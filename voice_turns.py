@@ -946,7 +946,8 @@ def bridge_note(bridge: str) -> str:
     """Tells the model the reply has already begun with the bridge, so it continues instead of repeating it."""
     return (f"You (the agent) have already said \"{bridge}\" out loud as a short acknowledgement; it is not something the "
             "caller said. Continue straight on with the actual answer: do not repeat or rephrase it, and do not claim to "
-            "have checked or looked anything up.")
+            "have checked or looked anything up. Do not add another holding phrase such as 'I'm here', 'one moment', or "
+            "'let me see'; go directly to the answer.")
 
 
 FAST_TURN_NOTE = (

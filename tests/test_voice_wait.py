@@ -40,6 +40,27 @@ def test_slow_answer_gets_one_bridge_then_keeps_streaming():
     asyncio.run(run())
 
 
+def test_ineligible_turn_does_not_get_a_generic_bridge():
+    async def run():
+        release = asyncio.Event()
+
+        async def source():
+            await release.wait()
+            yield "Direct answer."
+
+        async def no_bridge():
+            return ""
+
+        stream = with_wait_bridge(source(), no_bridge, "One moment.", 0.001, perf_counter())
+        async def release_answer():
+            await asyncio.sleep(0.03)
+            release.set()
+        asyncio.create_task(release_answer())
+        assert [part async for part in stream] == ["Direct answer."]
+
+    asyncio.run(run())
+
+
 def test_answer_wins_while_bridge_model_is_still_working():
     async def run():
         bridge_cancelled = asyncio.Event()

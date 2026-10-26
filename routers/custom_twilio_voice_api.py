@@ -1120,7 +1120,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     await speak(bridge, cache_key=_audio_cache_key(bridge, engine, preferred_language))  # the answer is being prepared meanwhile
                 filler_after = 0.0
             status_wait = status_after_seconds() - (perf_counter() - heard_at)
-            if bridges_enabled() and not filler_spoken and not first.done():
+            if bridges_enabled() and bridge and not filler_spoken and not first.done():
                 # A long wait: one real status update, said only if the answer still has not started.
                 done, _ = await asyncio.wait({first}, timeout=max(0.0, status_wait))
                 status = "" if done else (status_phrase(recent_bridges[-3:]) or "One moment, please.")
