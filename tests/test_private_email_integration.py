@@ -40,6 +40,7 @@ class PrivateEmailIntegrationTests(unittest.TestCase):
             "recipient_email": "owner@example.com", "subject": "Hello", "body": "Message", "company_context": "",
         }
         fake_mongo = MagicMock()
+        fake_mongo.db.email_suppressions.find_one.return_value = None
         fake_mongo.email_outbox.find_one_and_update.return_value = draft
         with patch.dict(os.environ, {"PRIVATE_EMAIL_ADDRESS": "raj@buildwithraj.com", "PRIVATE_EMAIL_PASSWORD": "test-secret"}), \
              patch.object(email_campaign, "mongo_client", fake_mongo), \

@@ -32,6 +32,7 @@ def db(monkeypatch):
                            inbox_threads=FakeCollection(), notifications=FakeCollection())
     monkeypatch.setattr(call_forwarding, "mongo_client", fake)
     monkeypatch.setenv("TWILIO_PUBLIC_BASE_URL", "https://example.test")
+    monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+18178092336")
     monkeypatch.setenv("VOICE_DEFAULT_REGION", "AU")
     monkeypatch.setattr(call_forwarding, "_timeline", lambda *a, **k: None)
     call_forwarding._ON_CACHE["at"] = -1e9
@@ -78,7 +79,8 @@ def test_rings_every_active_agent_and_connects_on_answer(db):
     assert 'record="record-from-answer-dual"' in twiml
     assert 'recordingStatusCallback="https://example.test/api/call-forwarding/recording-result"' in twiml
     assert 'timeout="25"' in twiml and 'action="https://example.test/api/call-forwarding/dial-result"' in twiml
-    assert 'callerId="+61400000000"' in twiml  # the agent sees who is calling
+    assert 'callerId="+18178092336"' in twiml
+    assert 'callerId="+61400000000"' not in twiml
 
 
 def test_language_match_rings_the_best_team_members(db):
@@ -203,6 +205,7 @@ def test_later_ai_save_keeps_the_forwarding_outcome(monkeypatch):
     """The AI's end-of-call save (custom stream closing, Retell's reports) must not reset a forwarded call."""
     from routers import calls_api
     assert "status" in calls_api.FORWARDING_FIELDS and calls_api.FORWARDING_MODE == call_forwarding.MODE
+    assert "human_callback_requested" in calls_api.FORWARDING_FIELDS
 
 
 def test_parent_status_keeps_unanswered_human_transfer_in_callback_queue(db, monkeypatch):

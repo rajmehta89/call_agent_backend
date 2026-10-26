@@ -1,11 +1,15 @@
 """Campaign controls, queue processing, approval behavior, and rate limiting."""
 
 import os
+import smtplib
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
+from uuid import uuid4
 
 from bson import ObjectId
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from email_policy import approval_window_open, get_email_policy, send_window_open
 from mongo_client import mongo_client
@@ -153,12 +157,20 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     from gmail_service import gmail_service
     from private_email_service import private_email_service
 
-    is_dubai = draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach"
-    sender = private_email_service if is_dubai else gmail_service
-    if not is_dubai and not brain_service.tools().get("send_gmail_email", False):
+    recipient = str(draft.get("recipient_email") or "").strip().lower()
+    domain = recipient.rsplit("@", 1)[-1]
+    suppression = mongo_client.db.email_suppressions.find_one({"$or": [{"email": recipient}, {"domain": domain}]})
+    if suppression:
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "excluded", "exclusion_reason": suppression.get("reason", "suppressed"), "updated_at": datetime.utcnow()}})
+        return {"status": "excluded", "reason": "Recipient is suppressed"}
+    use_private_email = (draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach"
+                         or draft.get("sender_provider") == "namecheap_private_email"
+                         or (not draft.get("sender_provider") and get_email_campaign().get("sender_provider") == "namecheap_private_email"))
+    sender = private_email_service if use_private_email else gmail_service
+    if not use_private_email and not brain_service.tools().get("send_gmail_email", False):
         return {"status": "error", "reason": "The Gmail tool is disabled"}
     if not sender.configured:
-        return {"status": "error", "reason": "Private Email is not configured" if is_dubai else "Gmail is not configured"}
+        return {"status": "error", "reason": "Private Email is not configured" if use_private_email else "Gmail is not configured"}
     safe_copy = normalize_draft_copy(draft)
     if safe_copy["body"] != draft.get("body") or safe_copy["company_context"] != draft.get("company_context"):
         mongo_client.email_outbox.update_one(
@@ -185,18 +197,60 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
         now = datetime.utcnow()
         mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": now, "updated_at": now, "delivery": result}})
         return {"status": "sent", "id": str(draft["_id"])}
+    except smtplib.SMTPResponseException as exc:
+        if "too many messages from sender in last" in str(exc).lower():
+            retry_after = datetime.utcnow() + timedelta(hours=1)
+            mongo_client.email_outbox.update_one(
+                {"_id": draft["_id"]},
+                {"$set": {"status": "approved", "last_delivery_error": str(exc),
+                          "delivery_retry_after": retry_after, "updated_at": datetime.utcnow()}},
+            )
+            mongo_client.db.email_provider_backoff.update_one(
+                {"_id": "namecheap_private_email" if use_private_email else "gmail"},
+                {"$set": {"retry_after": retry_after, "reason": "Provider hourly sender limit",
+                          "updated_at": datetime.utcnow()}}, upsert=True,
+            )
+            return {"status": "provider_rate_limited", "retry_after": retry_after.isoformat() + "Z"}
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": str(exc), "updated_at": datetime.utcnow()}})
+        return {"status": "error", "reason": "Private Email delivery failed" if use_private_email else "Gmail delivery failed"}
     except Exception as exc:
         mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": str(exc), "updated_at": datetime.utcnow()}})
-        return {"status": "error", "reason": "Private Email delivery failed" if is_dubai else "Gmail delivery failed"}
+        return {"status": "error", "reason": "Private Email delivery failed" if use_private_email else "Gmail delivery failed"}
 
 
 def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100) -> Dict[str, Any]:
     if not mongo_client.is_connected():
         return {"processed": 0, "sent": 0, "status": "database_unavailable"}
+    # Manual approvals and the background worker share a lease so they cannot
+    # both observe the last free hourly slot and send different messages.
+    owner = uuid4().hex
+    now = datetime.utcnow()
+    locks = mongo_client.db.campaign_delivery_locks
+    try:
+        lease = locks.find_one_and_update(
+            {"_id": "email_outbox", "$or": [{"expires_at": {"$lte": now}}, {"expires_at": {"$exists": False}}]},
+            {"$set": {"owner": owner, "expires_at": now + timedelta(minutes=3)}},
+            upsert=True, return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return {"processed": 0, "sent": 0, "status": "delivery_in_progress"}
+    if not lease:
+        return {"processed": 0, "sent": 0, "status": "delivery_in_progress"}
+    try:
+        return _process_email_outbox_locked(draft_ids, limit, owner)
+    finally:
+        locks.delete_one({"_id": "email_outbox", "owner": owner})
+
+
+def _process_email_outbox_locked(draft_ids: Optional[List[str]], limit: int, owner: str) -> Dict[str, Any]:
     campaign = get_email_campaign()
     policy = get_email_policy()
     if campaign["status"] != "running" or not send_window_open(policy):
         return {"processed": 0, "sent": 0, "status": "waiting", "campaign_status": campaign["status"]}
+    provider = str(campaign.get("sender_provider") or "gmail")
+    backoff = mongo_client.db.email_provider_backoff.find_one({"_id": provider})
+    if isinstance(backoff, dict) and isinstance(backoff.get("retry_after"), datetime) and backoff["retry_after"] > datetime.utcnow():
+        return {"processed": 0, "sent": 0, "status": "provider_rate_limited", "retry_after": backoff["retry_after"].isoformat() + "Z"}
     if _daily_count(policy) >= int(campaign["daily_limit"]):
         return {"processed": 0, "sent": 0, "status": "daily_limit_reached", "daily_limit": campaign["daily_limit"]}
     # A process/network failure can leave a draft claimed as "sending". Requeue
@@ -215,6 +269,12 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
     sent = 0
     skipped_for_approval = 0
     for draft in drafts:
+        renewed = mongo_client.db.campaign_delivery_locks.update_one(
+            {"_id": "email_outbox", "owner": owner, "expires_at": {"$gt": datetime.utcnow()}},
+            {"$set": {"expires_at": datetime.utcnow() + timedelta(minutes=3)}},
+        )
+        if not renewed.matched_count:
+            break
         current_campaign = get_email_campaign()
         if current_campaign["status"] != "running" or not send_window_open(policy):
             break
@@ -229,6 +289,8 @@ def process_email_outbox(draft_ids: Optional[List[str]] = None, limit: int = 100
             skipped_for_approval += 1
             continue
         result = _send_draft(draft)
+        if result.get("status") == "provider_rate_limited":
+            return {"processed": len(drafts), "sent": sent, "status": "provider_rate_limited", "retry_after": result["retry_after"]}
         if result.get("status") == "sent":
             sent += 1
     return {"processed": len(drafts), "sent": sent, "skipped_for_approval": skipped_for_approval, "status": "processed"}
@@ -245,6 +307,16 @@ def _discovery_queries(configured_query: str) -> List[str]:
         if query and query.lower() not in {item.lower() for item in queries}:
             queries.append(query)
     return queries
+
+
+def _discovery_locations(configured_location: str) -> List[str]:
+    """Semicolons separate markets; commas remain part of a city address."""
+    locations = []
+    for value in str(configured_location or "United States").split(";"):
+        value = value.strip()
+        if value and value.casefold() not in {item.casefold() for item in locations}:
+            locations.append(value)
+    return locations or ["United States"]
 
 
 def refill_campaign_candidates() -> Dict[str, Any]:
@@ -280,6 +352,13 @@ def refill_campaign_candidates() -> Dict[str, Any]:
         scrape = campaign_definition.get("scrape") or {}
         configured_query = str(scrape.get("query") or configured_query)
         location = str(scrape.get("location") or location)
+    locations = _discovery_locations(location)
+    def last_discovered(value):
+        last = mongo_client.discovery_runs.find_one({"location": value}, sort=[("created_at", -1)])
+        return last.get("created_at", datetime.min) if last else datetime.min
+    # Rotate to the least recently researched market instead of asking Places
+    # to interpret the whole country list as a single geographic location.
+    location = min(locations, key=last_discovered)
     recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
     query = next(
         (

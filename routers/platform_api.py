@@ -1019,7 +1019,9 @@ def decide_email_drafts_bulk(payload: ValuePayload, user: Dict[str, Any] = Depen
 
     # Dubai drafts use the verified Private Email mailbox. Verify it once before
     # changing any status so a failed login cannot leave a half-approved batch.
-    if any(draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach" for draft in drafts):
+    if (get_email_campaign().get("sender_provider") == "namecheap_private_email"
+            or any(draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach"
+                   or draft.get("sender_provider") == "namecheap_private_email" for draft in drafts)):
         if not private_email_service.configured:
             raise HTTPException(status_code=409, detail="Connect raj@buildwithraj.com to the backend before approving these emails")
         try:
@@ -1068,7 +1070,9 @@ def decide_email_draft(draft_id: str, payload: ValuePayload, user: Dict[str, Any
         return {"success": True, "data": {"status": "excluded", "id": draft_id}}
     if decision != "approve":
         raise HTTPException(status_code=400, detail="Decision must be approve or exclude")
-    if draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach":
+    if (draft.get("campaign_name") == "Dubai voice WhatsApp CRM outreach"
+            or draft.get("sender_provider") == "namecheap_private_email"
+            or get_email_campaign().get("sender_provider") == "namecheap_private_email"):
         if not private_email_service.configured:
             raise HTTPException(status_code=409, detail="Connect raj@buildwithraj.com to the backend before approving this email")
         try:

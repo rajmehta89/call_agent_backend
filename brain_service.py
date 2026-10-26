@@ -116,7 +116,11 @@ def _local_embedder() -> Any:
             try:
                 from fastembed import TextEmbedding
                 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "fastembed")
-                _LOCAL_EMBEDDER = TextEmbedding(os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"), cache_dir=cache_dir)
+                try:
+                    threads = max(1, int(os.getenv("LOCAL_EMBEDDING_THREADS", "1" if os.getenv("RENDER_EXTERNAL_URL") else "2")))
+                except ValueError:
+                    threads = 1
+                _LOCAL_EMBEDDER = TextEmbedding(os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"), cache_dir=cache_dir, threads=threads)
                 logger.info("local embedding model ready: %s", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"))
             except Exception as exc:
                 _LOCAL_EMBEDDER_FAILED = True
@@ -130,7 +134,11 @@ def local_embeddings(texts: List[str], query: bool = False) -> List[List[float]]
     if model is None or not texts:
         return []
     try:
-        vectors = model.query_embed(texts) if query else model.passage_embed(texts)
+        try:
+            batch_size = max(1, min(64, int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "8"))))
+        except ValueError:
+            batch_size = 8
+        vectors = model.query_embed(texts, batch_size=batch_size) if query else model.passage_embed(texts, batch_size=batch_size)
         return [[float(value) for value in vector] for vector in vectors]
     except Exception as exc:
         logger.warning(f"local embedding failed: {type(exc).__name__}: {exc}")

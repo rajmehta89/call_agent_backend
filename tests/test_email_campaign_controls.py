@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import email_campaign
 
@@ -39,6 +39,7 @@ class FakeCursor(list):
 class FakeMongo:
     def __init__(self, docs=None):
         self.email_outbox = FakeCollection(docs)
+        self.db = Mock()
 
     def is_connected(self):
         return True

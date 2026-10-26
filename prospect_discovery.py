@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,7 +20,7 @@ from mongo_client import mongo_client
 
 PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "domain.com", "sentry.io", "wixpress.com", "wordpress.com"}
+IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "yourcompany.com", "domain.com", "sentry.io", "wixpress.com", "wordpress.com"}
 ASSET_EMAIL_EXTENSIONS = {"webp", "png", "jpg", "jpeg", "gif", "svg", "ico", "css", "js", "woff", "woff2"}
 
 
@@ -90,11 +90,17 @@ def search_locations(query: str, limit: int = 8) -> List[Dict[str, str]]:
 
 
 def _website_email(website: str) -> str:
+    return _website_contact(website)[0]
+
+
+def _website_contact(website: str) -> tuple[str, str]:
+    """Return a business-domain email and the public page that published it."""
     if not website:
-        return ""
+        return "", ""
     parsed = urlparse(website if website.startswith("http") else f"https://{website}")
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return ""
+        return "", ""
+    host = (parsed.hostname or "").lower().removeprefix("www.")
     urls = [parsed.geturl()]
     for suffix in ("/contact", "/contact-us", "/about"):
         urls.append(urljoin(parsed.geturl().rstrip("/") + "/", suffix.lstrip("/")))
@@ -103,18 +109,28 @@ def _website_email(website: str) -> str:
             response = requests.get(url, timeout=(3, 5), headers={"User-Agent": "BuildWithRaj-ProspectResearch/1.0"})
             if response.status_code >= 400:
                 continue
+            final_host = (urlparse(response.url).hostname or "").lower().removeprefix("www.")
+            if final_host != host:
+                continue
             soup = BeautifulSoup(response.text[:2_000_000], "html.parser")
-            candidates = set(EMAIL_PATTERN.findall(response.text))
-            candidates.update(link.get("href", "").replace("mailto:", "") for link in soup.select('a[href^="mailto:"]'))
-            for candidate in sorted(candidates):
+            for tag in soup(["script", "style", "noscript", "svg"]):
+                tag.decompose()
+            candidates = {unquote(link.get("href", "")[7:].split("?", 1)[0]) for link in soup.select('a[href^="mailto:"]')}
+            candidates.update(EMAIL_PATTERN.findall(soup.get_text(" ", strip=True)))
+            def priority(candidate):
+                return (candidate.split("@", 1)[0] not in {"info", "hello", "contact", "enquiries", "sales", "office", "admin"}, candidate)
+            for candidate in sorted(candidates, key=priority):
                 email = candidate.strip(" <>.,;:\"'()[]").lower()
-                host = email.rsplit("@", 1)[-1]
-                ignored_host = host in IGNORED_EMAIL_HOSTS or any(host.endswith(f".{ignored}") for ignored in IGNORED_EMAIL_HOSTS)
-                if _valid_contact_email(email) and not ignored_host and not email.startswith(("noreply@", "no-reply@", "donotreply@")):
-                    return email
+                domain = email.rsplit("@", 1)[-1]
+                ignored_host = domain in IGNORED_EMAIL_HOSTS or any(domain.endswith(f".{ignored}") for ignored in IGNORED_EMAIL_HOSTS)
+                local = email.split("@", 1)[0]
+                if (EMAIL_PATTERN.fullmatch(email) and _valid_contact_email(email)
+                        and (domain == host or domain.endswith("." + host)) and not ignored_host
+                        and not local.startswith(("noreply", "no-reply", "donotreply", "privacy", "careers", "jobs", "press", "recruit", "abuse", "dpo"))):
+                    return email, response.url
         except requests.RequestException:
             continue
-    return ""
+    return "", ""
 
 
 def _place_name(place: Dict[str, Any]) -> str:
@@ -263,8 +279,10 @@ def discover_prospects(query: str, location: str = "United States", max_results:
         places = response.json().get("places", [])
         websites = [str(place.get("websiteUri") or "").strip() for place in places]
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(websites)))) as executor:
-            emails = list(executor.map(_website_email, websites))
-        for place, email in zip(places, emails):
+            contacts = list(executor.map(_website_contact, websites))
+        for place, (email, email_source_url) in zip(places, contacts):
+            if place.get("businessStatus") == "CLOSED_PERMANENTLY":
+                continue
             company_name = _place_name(place)
             website = _clean_website(str(place.get("websiteUri") or "").strip())
             dedupe_key = str(place.get("id") or website or company_name.lower())
@@ -273,6 +291,8 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             "dedupe_key": dedupe_key,
             "company_name": company_name,
             "email": email,
+            "email_source_url": email_source_url,
+            "email_checked_at": now,
             "website": website,
             "address": place.get("formattedAddress", ""),
             "phone": place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber", ""),
@@ -310,7 +330,7 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             if draft_id:
                 drafts += 1
             results.append({"company_name": company_name, "email": email, "website": website, "status": prospect["status"], "draft_id": draft_id})
-            if not create_drafts or drafts >= target_drafts:
+            if create_drafts and drafts >= target_drafts:
                 break
         if not create_drafts or drafts >= target_drafts:
             break

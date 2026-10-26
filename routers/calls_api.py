@@ -18,7 +18,7 @@ from call_status import schedule_auto_status
 FORWARDING_MODE = "ring_all_answer"  # call_forwarding.py marks forwarded calls with this transfer_mode
 FORWARDING_MODES = {FORWARDING_MODE, "ring_all_press_1"}  # preserve results from calls made before the change
 FORWARDING_FIELDS = ("status", "transfer_requested", "transfer_status", "transfer_destination", "transfer_error", "transfer_succeeded",
-                     "accepted_by", "handled_by", "recording_url", "recording_sid")
+                     "accepted_by", "handled_by", "recording_url", "recording_sid", "human_callback_requested")
 from live_transcript import ordered_from_lists
 import re
 

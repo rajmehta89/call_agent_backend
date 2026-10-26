@@ -444,10 +444,11 @@ def _base_url() -> str:
 
 
 def _caller_id(caller: str) -> str:
-    """Shown to the agent: the customer's own number when there is one (browser test calls have none: the business
-    number is shown instead)."""
-    if str(caller or "").startswith("+"):
-        return caller
+    """Use the configured business identity for the new outbound team leg.
+
+    A browser caller's CRM contact number is not their Twilio source identity.
+    Reusing it as caller ID caused error 13247 even for a verified contact.
+    """
     return (os.getenv("TWILIO_PHONE_NUMBER") or os.getenv("TWILIO_CALLER_ID") or "").strip()
 
 

@@ -118,10 +118,10 @@ def research(prospect, key):
 
 def copy_for(prospect):
     company = prospect["company_name"]
-    industry = str(prospect.get("industry") or "").lower()
+    industry = str(prospect.get("industry") or "").lower().replace("_", " ")
     if any(word in industry for word in ("property", "real estate")):
         idea = "collect buyer and tenant enquiries, route them to the right agent, and log follow-up in your CRM"
-    elif any(word in industry for word in ("clinic", "health", "dental")):
+    elif any(word in industry for word in ("clinic", "health", "dental", "dentist")):
         idea = "answer approved administrative questions, collect appointment requests, and hand clinical questions to staff"
     elif any(word in industry for word in ("maintenance", "cleaning", "construction")):
         idea = "capture service requests, route urgent work to staff, and update your CRM or job system"
@@ -132,7 +132,8 @@ def copy_for(prospect):
     else:
         idea = "capture incoming enquiries, route requests to the right person, and keep CRM follow-up organised"
     subject = f"A voice + WhatsApp enquiry idea for {company}"[:180]
-    body = (f"Hi {company} team,\n\nI'm Raj Mehta. I build AI voice and WhatsApp workflows for businesses. "
+    greeting = company if company.lower().endswith("team") else f"{company} team"
+    body = (f"Hi {greeting},\n\nI'm Raj Mehta. I build AI voice and WhatsApp workflows for businesses. "
             f"One possible workflow for {company} could {idea}.\n\nWould a short example be useful?\n\n"
             "Best,\nRaj Mehta\nAI Automation Developer\nhttps://buildwithraj.com/\n\n"
             'If this is not relevant, reply "no thanks" and I won\'t follow up.')

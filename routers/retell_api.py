@@ -761,8 +761,10 @@ async def _stream_reply(
     call_id: str,
     response_id: int,
     reminder: bool = False,
+    started_at: Optional[float] = None,
 ):
     """Yield model deltas while recording the latency of each voice turn."""
+    request_started = started_at if started_at is not None else perf_counter()
     caller_text = _last_user_message(transcript)
     if not caller_text:
         yield "Could you please tell me how I can help?"
@@ -772,13 +774,20 @@ async def _stream_reply(
         # sentence and this reply is cancelled before a word of it is spoken (no half-started answer).
         await asyncio.sleep(unfinished_wait_seconds())
 
-    request_started = perf_counter()
     if _log_content_enabled():
         _trace(f"retell_llm_request call={call_id} response_id={response_id} caller={caller_text!r}")
 
     prompt_started = perf_counter()
-    turn_model = None if reminder else choose_voice_model(caller_text, last_agent_text(transcript))
-    details_note, details_problem = ("", False) if reminder else contact_check(caller_text, last_agent_text(transcript), earlier_caller_texts(transcript, caller_text), caller_region(caller_number))
+    if reminder:
+        turn_model, (details_note, details_problem) = None, ("", False)
+    else:
+        # Semantic decisions can use network embeddings in production. Keep
+        # them off the receive loop and overlap independent work.
+        turn_model, (details_note, details_problem) = await asyncio.gather(
+            asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript)),
+            asyncio.to_thread(contact_check, caller_text, last_agent_text(transcript),
+                              earlier_caller_texts(transcript, caller_text), caller_region(caller_number)),
+        )
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
     bridge = ""
@@ -797,7 +806,7 @@ async def _stream_reply(
             else:
                 await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
             yield bridge + " "
-    places = "" if reminder else place_note(caller_text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(transcript))
+    places = "" if reminder else await asyncio.to_thread(place_note, caller_text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(transcript))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
     if prompt_task is not None:
@@ -969,15 +978,17 @@ async def retell_webhook(request: Request) -> Response:
 FORWARD_AFTER_SECONDS = 5.0
 
 
-async def _hand_to_team(call_id: str, call_sid: str, caller: str, requested_text: str = "", preferred_language: str = "") -> None:
+async def _hand_to_team(call_id: str, call_sid: str, caller: str, requested_text: str = "", preferred_language: str = "") -> bool:
     await asyncio.sleep(FORWARD_AFTER_SECONDS)
     language = preferred_language or await asyncio.to_thread(language_for_phone, caller)
     if not await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, call_id, requested_text, language):
         _trace(f"retell_forwarding_failed call={call_id}", error=True)
         transfer_service.request_transfer(call_id, "Caller asked for a person; the transfer could not start", "retell_callback", 0.95,
                                           phone_number=caller)
+        return False
     else:
         _trace(f"retell_forwarded call={call_id} twilio={call_sid}")
+        return True
 
 
 @router.websocket("/llm-websocket/{call_id}")
@@ -1004,6 +1015,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     started_clock = perf_counter()
     caller_number = "unknown"
     callback_requested = False
+    handoff_pending = False
     user_messages: List[Dict[str, str]] = []
     agent_messages: List[Dict[str, str]] = []
     live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
@@ -1049,6 +1061,15 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     response_tasks: set[asyncio.Task[None]] = set()
     latest_response_id = -1
 
+    async def handoff_to_team(call_sid: str, caller: str, requested_text: str) -> None:
+        nonlocal handoff_pending
+        try:
+            if not await _hand_to_team(call_id, call_sid, caller, requested_text):
+                handoff_pending = False
+        except Exception:
+            handoff_pending = False
+            _trace(f"retell_forwarding_task_failed call={call_id}", error=True)
+
     async def send_event(payload: Dict[str, Any]) -> None:
         async with send_lock:
             await websocket.send_json(payload)
@@ -1073,7 +1094,12 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         task.add_done_callback(live_saves.discard)
 
     async def handle_response(event: Dict[str, Any], response_id: int) -> None:
-        nonlocal callback_requested, user_messages
+        nonlocal callback_requested, user_messages, handoff_pending
+        turn_started = perf_counter()
+        if handoff_pending:
+            await send_event({"response_type": "response", "response_id": response_id,
+                              "content": "", "content_complete": True})
+            return
         transcript = _transcript_as_messages(event.get("transcript"))
         caller_text = _last_user_message(transcript)
         now = utc_iso()
@@ -1088,8 +1114,9 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         streamed = False
         transfer_intent = await asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if caller_text else ""
+        _trace(f"retell_turn_intent call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - turn_started) * 1000:.0f}")
         specific_agent = await asyncio.to_thread(call_forwarding.requested_agent, caller_text) if caller_text and transfer_intent in {"callback", "unclear"} else None
-        if event.get("interaction_type") == "response_required" and caller_text and call_is_over(caller_text, last_agent_text(transcript)):
+        if event.get("interaction_type") == "response_required" and caller_text and await asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             _trace(f"retell_call_over call={call_id} response_id={response_id} caller={caller_text!r}")
             await send_event({"response_type": "response", "response_id": response_id, "content": "",
@@ -1101,7 +1128,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             # Call forwarding is on and the caller asked for a person: say so, then ring the team once it has been said.
             reply = call_forwarding.CONNECTING_LINE
             twilio_call = call_forwarding.twilio_call_for_retell(call_id) or {}
-            asyncio.create_task(_hand_to_team(call_id, twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number, caller_text))
+            handoff_pending = True
+            asyncio.create_task(handoff_to_team(twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number, caller_text))
         elif event.get("interaction_type") == "response_required" and caller_text and (
             transfer_intent == "live" or specific_agent
         ):
@@ -1126,7 +1154,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             reply = f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
         else:
             answer_parts: List[str] = []
-            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required"):
+            async for chunk in _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=event.get("interaction_type") == "reminder_required", started_at=turn_started):
                 if response_id != latest_response_id:
                     _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
                     return
