@@ -208,6 +208,16 @@ def requested_agent(caller_text: str, settings: Optional[Dict[str, Any]] = None)
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def explicit_callback_request(caller_text: str) -> bool:
+    """Fast, high-confidence callback phrases that should work with forwarding disabled too."""
+    text = re.sub(r"[^a-z0-9]+", " ", str(caller_text or "").lower()).strip()
+    return bool(re.search(
+        r"\b(?:call|ring|phone|contact|get back to)\b.{0,48}\b(?:back|later|tomorrow|today|me|us)\b|"
+        r"\b(?:callback|call back|ring back)\b",
+        text,
+    ))
+
+
 def assign_lead_to_requested_agent(
     caller: str,
     requested_text: str,
@@ -593,6 +603,7 @@ def create_callback_outreach(
     destination: str = "",
     message: str = "",
     notify_only: bool = False,
+    contact_email: str = "",
 ) -> str:
     """Create the in-app outreach notification for a named request or the general human team."""
     settings = get_settings()
@@ -606,7 +617,8 @@ def create_callback_outreach(
         customer=caller or "caller",
         recipient=recipient,
         call_session_id=session_id or None,
-        message=message or f"A caller asked to speak with {recipient}. Please follow up.",
+        message=(message or f"A caller asked to speak with {recipient}. Please follow up.")
+                + (f" Caller email: {contact_email}." if contact_email else ""),
     )
     if not notify_only:
         logger.info("call forwarding: outreach created for %s (%s)", recipient, session_id)

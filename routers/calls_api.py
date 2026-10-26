@@ -59,6 +59,7 @@ EXTRA_CALL_FIELDS = (
     "in_voicemail",
     "human_callback_requested",
     "contact_phone",
+    "contact_email",
     "analysis_status",
     "transcript_with_tool_calls",
     "provider_started_at",

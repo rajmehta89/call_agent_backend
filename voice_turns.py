@@ -662,6 +662,59 @@ def contact_check(caller_text: str, agent_text: str = "", earlier: List[str] = (
     return "Check of the caller's details (done by the system; trust it over your own reading): " + " ".join(notes), problem
 
 
+def contact_email_followup_note(messages: List[Dict[str, str]], current_text: str = "") -> str:
+    """Carry a captured email forward and stop repeating a failed email request.
+
+    `messages` may include the current caller turn. We inspect only earlier turns so
+    contact_check can handle a newly spoken address and ask for one confirmation.
+    """
+    items = [dict(item) for item in messages]
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if item.get("role") == "user" and str(item.get("content") or "").strip() == current_text.strip():
+            items.pop(index)
+            break
+
+    previous_emails = []
+    for item in items:
+        if item.get("role") != "user":
+            continue
+        address = spoken_email(str(item.get("content") or ""))
+        if address and _EMAIL.fullmatch(address):
+            previous_emails.append(address)
+    if previous_emails:
+        return (f"The caller already provided the email address {previous_emails[-1]}. Keep it for this request and do not ask "
+                "them to provide or spell it again. If they correct it, use the corrected address.")
+
+    current_has_email_attempt = bool(_EMAIL_CONTEXT.search(current_text or ""))
+    if current_has_email_attempt:
+        return ""
+    asked_to_repeat = any(
+        item.get("role") == "assistant"
+        and _EMAIL_CONTEXT.search(str(item.get("content") or ""))
+        and re.search(r"\b(?:again|repeat|spell|slowly)\b", str(item.get("content") or ""), re.I)
+        for item in items
+    )
+    prior_email_attempt = any(
+        item.get("role") == "user" and _EMAIL_CONTEXT.search(str(item.get("content") or ""))
+        for item in items
+    )
+    if asked_to_repeat and prior_email_attempt:
+        return ("The caller already tried to give an email and you asked once for them to repeat it, but no complete address "
+                "was understood. Do not ask for the email again. Continue the callback request using the caller's phone number.")
+    return ""
+
+
+def contact_email_from_messages(messages: List[Dict[str, str]]) -> str:
+    """Return the latest syntactically complete email the caller said in this conversation."""
+    for item in reversed(messages):
+        if item.get("role") == "user":
+            address = spoken_email(str(item.get("content") or ""))
+            if address and _EMAIL.fullmatch(address):
+                return address
+    return ""
+
+
 def last_agent_text(messages: List[Dict[str, str]]) -> str:
     """What the agent said last (to know whether it had just asked for a number or an email)."""
     for item in reversed(messages):

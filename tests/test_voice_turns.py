@@ -134,6 +134,30 @@ def test_email_checks():
     assert problem and "NOT a complete email" in note
 
 
+def test_email_from_earlier_turn_is_retained_without_asking_again():
+    from voice_turns import contact_email_followup_note, contact_email_from_messages
+    messages = [
+        {"role": "user", "content": "My email is raj at gmail dot com."},
+        {"role": "assistant", "content": "Your email is raj at gmail dot com. Is that right?"},
+        {"role": "user", "content": "Yes, that is right."},
+    ]
+    assert contact_email_from_messages(messages) == "raj@gmail.com"
+    note = contact_email_followup_note(messages + [{"role": "user", "content": "Someone call me later."}], "Someone call me later.")
+    assert "already provided" in note and "do not ask" in note
+
+
+def test_failed_email_retry_is_not_repeated_on_later_callback_turn():
+    from voice_turns import contact_email_followup_note
+    messages = [
+        {"role": "assistant", "content": "Could you please give me your email address?"},
+        {"role": "user", "content": "My email is राज at gmail dot com."},
+        {"role": "assistant", "content": "Please say your email address again slowly."},
+        {"role": "user", "content": "Someone call me later."},
+    ]
+    note = contact_email_followup_note(messages, "Someone call me later.")
+    assert "Do not ask for the email again" in note
+
+
 from voice_turns import place_note, unknown_places
 
 KNOWLEDGE = "Store address: 1537 Sydney Road, Campbellfield, Vic 3061. Delivery to most of Australia. Installers nationwide."

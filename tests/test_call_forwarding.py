@@ -289,6 +289,16 @@ def test_later_callback_keeps_its_intent_when_scores_are_distinct(monkeypatch):
     assert call_forwarding.handoff_intent("Can someone call me back tomorrow?") == "callback"
 
 
+@pytest.mark.parametrize("text", [
+    "Someone call me later.",
+    "Could you ring me tomorrow?",
+    "Please have the team get back to us this afternoon.",
+    "Can you call me back?",
+])
+def test_explicit_callback_request_is_detected_without_forwarding(text):
+    assert call_forwarding.explicit_callback_request(text)
+
+
 def test_close_tie_can_still_be_a_later_callback(monkeypatch):
     from turn_meaning import HANDOFF_ACTION
 

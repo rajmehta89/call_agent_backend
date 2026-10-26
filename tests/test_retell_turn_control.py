@@ -99,3 +99,22 @@ def test_call_uses_responsive_turn_detection_and_one_silence_reminder(app, monke
             "reminder_trigger_ms": 7000,
             "reminder_max_count": 1,
         }}
+
+
+def test_explicit_later_callback_is_queued_without_more_contact_questions(app, monkeypatch):
+    queued = {}
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda *args: "callback")
+    monkeypatch.setattr(retell.call_forwarding, "requested_agent", lambda *args: None)
+    monkeypatch.setattr(retell.call_forwarding, "create_callback_outreach",
+                        lambda *args, **kwargs: queued.update(args=args, kwargs=kwargs) or "Human team")
+    monkeypatch.setattr(retell.transfer_service, "request_transfer", lambda *args, **kwargs: queued.update(transfer=True))
+    monkeypatch.setattr(retell.transfer_service, "update_transfer", lambda *args, **kwargs: None)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "Someone call me later."}]})
+        response = socket.receive_json()
+        assert response["content_complete"] is True
+        assert "marked your request" in response["content"]
+        assert queued.get("transfer") is True

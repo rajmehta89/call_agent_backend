@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
-from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement
+from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import with_wait_bridge
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
@@ -887,6 +887,9 @@ async def _stream_reply(
     messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
         messages.append({"role": "system", "content": details_note})
+    email_note = contact_email_followup_note(transcript, caller_text)
+    if email_note:
+        messages.append({"role": "system", "content": email_note})
     if places:
         messages.append({"role": "system", "content": places})
     offered = "" if reminder else yes_to_offer_note(caller_text, last_agent_text(transcript))
@@ -1230,7 +1233,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             handoff_pending = True
             asyncio.create_task(handoff_to_team(twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number, caller_text))
         elif event.get("interaction_type") == "response_required" and caller_text and (
-            transfer_intent == "live" or specific_agent
+            transfer_intent in {"live", "callback"} or specific_agent
         ):
             callback_requested = True
             transfer_service.request_transfer(
@@ -1247,6 +1250,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 call_id,
                 specific_agent.get("name") if specific_agent else "",
                 f"The caller asked to speak with a specific team member, but a live transfer was not available. Please follow up.",
+                contact_email=contact_email_from_messages(transcript),
             )
             transfer_service.update_transfer(call_id, "requested", destination)
             _trace(f"retell_human_callback_requested call={call_id} response_id={response_id}")

@@ -29,7 +29,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
-from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES
+from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -491,6 +491,9 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     messages = [{"role": "system", "content": system}, *conversation] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
         messages.append({"role": "system", "content": details_note})
+    email_note = contact_email_followup_note([*history, {"role": "user", "content": text}], text)
+    if email_note:
+        messages.append({"role": "system", "content": email_note})
     if verified_phone:
         messages.append({"role": "system", "content": f"The caller has already provided a valid contact number: {verified_phone}. Keep it for this call. Do not call it incomplete or ask for it again."})
     if places:
@@ -785,6 +788,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     unanswered_text = ""
     active = True
     stream_failure = ""
+    callback_requested = False
     pending_saves: set[asyncio.Task[Any]] = set()
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
     prefetched_at = 0.0
@@ -918,14 +922,33 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     async def answer_or_forward(text: str, heard_at: float, prepared: Optional[Dict[str, Any]]) -> None:
         """Forwarding is on: hand the call to the team if the caller asked for a person (a meaning check, off the
         event loop), otherwise answer as usual."""
-        nonlocal transfer_pending, earlier_handoff_text, unanswered_text
+        nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested
         await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(memory.history()))
         intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
-        if intent == "live":
+        if intent == "live" and call_forwarding.forwarding_on():
             earlier_handoff_text = ""
             transfer_pending = True
             drop_reply(prepared)
             await forward_to_team(text, heard_at)
+        elif intent == "callback" and not await asyncio.to_thread(call_forwarding.requested_agent, text):
+            earlier_handoff_text = ""
+            callback_requested = True
+            drop_reply(prepared)
+            email = contact_email_from_messages(memory.history())
+            await asyncio.to_thread(
+                call_forwarding.create_callback_outreach,
+                caller,
+                text,
+                call_sid,
+                "Human team",
+                "The caller requested a callback. Please follow up using the caller's phone number.",
+                contact_email=email,
+            )
+            line = "I've noted your callback request. The team will call you on this number."
+            await speak(line)
+            memory.add(text, line)
+            responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
+            save_progress()
         elif intent in {"callback", "unclear"} and await asyncio.to_thread(call_forwarding.requested_agent, text):
             # A named request should never disappear into a generic callback queue, even when a live transfer
             # is unavailable or the caller did not clearly say "now". Create the outreach for that person.
@@ -938,6 +961,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 call_sid,
                 "",
                 "The caller asked to speak with a specific team member. Please follow up with this caller.",
+                contact_email=contact_email_from_messages(memory.history()),
             )
             line = f"I have noted your request for {destination}. They or the team will contact you using this number."
             spoke_at = utc_iso()
@@ -1341,7 +1365,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
         save_progress()
-        if call_sid and call_forwarding.forwarding_on():  # a cached flag: no waiting here
+        callback_candidate = call_forwarding.explicit_callback_request(text)
+        if call_sid and (call_forwarding.forwarding_on() or callback_candidate):  # cached switch/regex: no waiting here
             reply_task = asyncio.create_task(answer_or_forward(text, perf_counter(), prepared))
             reply_task.add_done_callback(log_reply_failure)
             return
@@ -1517,7 +1542,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if transcript or responses:
             log_call(caller, None, {
                 "direction": "inbound",
-                "status": "failed" if stream_failure else "completed",
+                "status": "transfer_requested" if callback_requested else "failed" if stream_failure else "completed",
                 "duration": int(round(perf_counter() - call_started)),
                 "provider": "custom_twilio",
                 "provider_call_id": call_sid or stream_sid,
@@ -1530,6 +1555,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "messages": live_transcript.ordered_from_lists(transcript, responses),
                 "voice_turn_timings": voice_turn_timings[-200:],
                 "contact_phone": contact_phone,
+                "contact_email": contact_email_from_messages(memory.history()),
+                "transfer_requested": callback_requested,
+                "transfer_status": "requested" if callback_requested else None,
+                "transfer_destination": "Callback queue" if callback_requested else None,
+                "human_callback_requested": callback_requested,
                 "summary": memory.summary or f"Custom Twilio voice call with {len(transcript)} caller turns and {len(responses)} AI responses.",
                 "preferred_language": preferred_language,
                 "languages_used": sorted(languages_used),

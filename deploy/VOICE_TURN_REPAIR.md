@@ -92,7 +92,21 @@ phrase. Both now preserve that empty decision and answer directly; when a bridge
 is appropriate, the model is told to continue with the answer without adding a
 second holding phrase.
 
-Production health must show `2026-10-26-voice-turn-repair-7` after deployment.
+## Callback and email follow-up
+
+The 12:35 IST custom call showed the email recognizer receiving a non-Latin
+transliteration for the local part. It correctly asked once for a clearer
+address, but later turns did not remember that retry and asked again. The call
+also classified the caller's final "call me later" as a callback request but
+continued ordinary model prompting instead of placing it in the callback queue.
+
+Earlier complete email addresses now remain in call context and are attached to
+the callback notification and call record. If an address was not understood and
+the agent already asked once for a repeat, the next turn proceeds with the
+caller's phone number instead of asking for the email again. Explicit callback
+intent now creates the human follow-up notification on both voice paths.
+
+Production health must show `2026-10-26-voice-turn-repair-8` after deployment.
 
 Primary references:
 
