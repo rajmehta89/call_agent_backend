@@ -1061,7 +1061,17 @@ class BrainService:
         if shopify_service.catalog_nouns(user_input):
             return user_input
         named_before = shopify_service.catalog_nouns(conversation_text)
-        return f"{' '.join(named_before[-3:])} {user_input}" if named_before else user_input
+        if named_before:
+            return f"{' '.join(named_before[-3:])} {user_input}"
+        # The catalogue vocabulary is built in the background, so it may still be empty on an early turn.
+        # A later price/detail question should still carry the caller's recent product phrase into the search.
+        earlier = conversation_text[:-len(user_input)].strip() if user_input and conversation_text.endswith(user_input) else conversation_text
+        if earlier:
+            from store_intent import product_reference
+            if product_reference(earlier):
+                recent = " ".join(earlier.split()[-18:])
+                return f"{recent} {user_input}".strip()
+        return user_input
 
     def _caller_orders_context(self, customer_phone: Optional[str], tools: Dict[str, bool]) -> tuple[str, Optional[str]]:
         """Whatever they ask, the AI knows this caller's own orders (found by caller ID when the call started, so no

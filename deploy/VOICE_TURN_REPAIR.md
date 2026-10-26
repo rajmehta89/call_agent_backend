@@ -115,3 +115,18 @@ Primary references:
 - https://docs.retellai.com/api-references/llm-websocket
 - https://www.twilio.com/docs/api/errors/31921
 - https://www.twilio.com/docs/voice/twiml/stream
+
+## Product-detail follow-ups
+
+The 12:55 IST custom call asked about round basins and their prices. Speech
+recognition first misheard the product name, then the meaning-only store
+classifier missed the clearer basin availability question. The later price
+question was recognized as product-related, but its query had lost the basin
+from the earlier turns, so the agent fell back to saying it lacked pricing.
+
+Product-category and shopping-interest cues now recover catalogue lookups when
+the meaning classifier misses, while the store's live product vocabulary is
+still loading. Follow-up price/detail searches retain the recent caller product
+phrase, including when speech recognition garbles the newest product word.
+
+Production health must show 2026-10-26-voice-turn-repair-9 after deployment.

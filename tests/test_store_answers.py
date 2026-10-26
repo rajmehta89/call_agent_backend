@@ -498,6 +498,36 @@ def test_what_the_caller_wants_is_understood_by_meaning(question, earlier, kinds
     assert got[:len(kinds)] == kinds if kinds else got == []
 
 
+@pytest.mark.parametrize("question, earlier", [
+    ("I'm interested in round Beijing. So if you guys have it, that would be fine.", ""),
+    ("So you don't have the round basin, actually?", ""),
+    ("What are your price ranges for all kinds of busy?", "I'm interested in round Beijing. So you don't have the round basin, actually?"),
+])
+def test_product_questions_survive_misheard_names_and_follow_up_turns(store, question, earlier):
+    import store_intent
+    assert store_intent.wanted(question, earlier)[:1] == ["product"]
+
+
+def test_misheard_product_follow_up_still_searches_recent_basin_and_prices(store, monkeypatch):
+    question = "What are your price ranges for all kinds of busy?"
+    earlier = "I'm interested in round Beijing. So you don't have the round basin, actually?"
+    text, tool = ask(question, earlier=earlier)
+    assert tool == "search_shopify_products"
+    assert "Above Counter Basin Round Matte Black" in text
+    assert "AUD" in text
+    import store_intent
+    assert store_intent.clearly_wanted(question, earlier) is True
+
+
+def test_round_product_interest_and_clarification_return_live_catalogue_facts(store):
+    first, first_tool = ask("I'm interested in round Beijing. So if you guys have it, that would be fine.")
+    clarification, clarification_tool = ask("So you don't have the round basin, actually?")
+    assert first_tool == clarification_tool == "search_shopify_products"
+    assert "Above Counter Basin Round Matte Black" in first
+    assert "Above Counter Basin Round Matte Black" in clarification
+    assert "AUD" in clarification
+
+
 def test_a_general_question_gets_an_overview_and_a_detail_question_gets_the_full_product(store, monkeypatch):
     monkeypatch.setattr(shop, "_wants_detail", lambda question: "warranty" in question)  # decided by meaning in the app
     overview, _ = ask("how much is the lydia wall mixer with diverter")
