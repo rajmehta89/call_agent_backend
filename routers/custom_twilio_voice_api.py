@@ -31,7 +31,7 @@ from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_wait import with_wait_bridge, wait_message
+from voice_wait import with_wait_bridge
 from voice_turns import wait_bridge_phrase, complete_nova_turn
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -445,14 +445,16 @@ def _next_chunk(pending: str, first: bool) -> Optional[re.Match]:
 
 
 async def _voice_sentences(services: AIServices, text: str, history: List[Dict[str, str]], caller: str, summary: str,
-                           bridge: str = "", verified_phone: str = "", language: str = "en") -> AsyncIterator[str]:
+                           bridge: str = "", verified_phone: str = "", language: str = "en",
+                           timings: Optional[Dict[str, Any]] = None) -> AsyncIterator[str]:
     """Stream the reply and yield it one finished sentence at a time, so speech can start before the model is done.
     Uses the same voice prompt, knowledge search and reply guard as the Retell agent (routers/retell_api.py).
     bridge: the phrase being spoken right now ("Sure, let me check."); the reply continues from it."""
     phone = caller if caller.startswith("+") else "unknown"
     started = perf_counter()
     agent_text = last_agent_text(history)
-    await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
+    earlier_text = " ".join(" ".join(earlier_caller_texts(history, text)[-8:]).split()[-25:])
+    await asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text)
 
     def check_places():
         return place_note(text, brain_service.knowledge_text(), agent_text)
@@ -463,7 +465,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         return None
 
     turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
-        asyncio.to_thread(choose_voice_model, text, agent_text),
+        asyncio.to_thread(choose_voice_model, text, agent_text, earlier_text),
         asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
         asyncio.to_thread(check_places),
         asyncio.to_thread(prepare_question),
@@ -472,7 +474,8 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         turn_model = None  # a wrong number or email needs the careful model
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    if prepared_prompt is not None and (turn_model is None or places):
+    if prepared_prompt is not None:
+        # The fast model handles non-product questions too, with the same relevant business facts as the main model.
         system = prepared_prompt
     else:
         def prepare_selected_prompt():
@@ -486,6 +489,9 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                    "the caller explicitly wants the team to call later. The call system announces and starts a live "
                    "transfer separately. In an ordinary AI reply, never claim a transfer is already happening.")
     prompt_ms = (perf_counter() - started) * 1000
+    requested_model = turn_model or services.config.OPENROUTER_MODEL
+    if timings is not None:
+        timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms))
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()
     conversation = [*history, {"role": "user", "content": text}]
@@ -527,7 +533,10 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
             if not first_token_ms:
                 first_token_ms = (perf_counter() - started) * 1000
                 logger.info("custom voice timing: model=%s prompt=%.0fms model_first_words=%.0fms (after prompt %.0fms)",
-                            turn_model or services.config.OPENROUTER_MODEL, prompt_ms, first_token_ms, first_token_ms - prompt_ms)
+                            requested_model, prompt_ms, first_token_ms, first_token_ms - prompt_ms)
+                if timings is not None:
+                    timings.update(first_model_text_ms=round(first_token_ms),
+                                   model_wait_ms=round(max(0.0, first_token_ms - prompt_ms)))
             pending += numbers.feed(guard.feed(chunk))
             while (match := _next_chunk(pending, first=not yielded)):
                 sentence, pending = pending[:match.end()].strip(), pending[match.end():]
@@ -959,7 +968,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested
         agent_text = last_agent_text(memory.history())
         turn_timing = dict(turn_timing or {})
-        bridge_ready = prepared["bridge_ready"] if prepared else asyncio.create_task(prepare_bridge(text, memory.history()))
+        bridge_diagnostics = prepared["bridge_diagnostics"] if prepared else {}
+        bridge_ready = prepared["bridge_ready"] if prepared else asyncio.create_task(
+            prepare_bridge(text, memory.history(), bridge_diagnostics))
 
         async def resolve():
             intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
@@ -994,8 +1005,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             bridge_ready.cancel()
             drop_reply(prepared)
             raise
+        turn_timing.update(bridge_diagnostics)
         if not intent:
-            prepared = prepared or start_reply(text, bridge_ready)
+            prepared = prepared or start_reply(text, bridge_ready, bridge_diagnostics)
         else:
             bridge_ready.cancel()
         if intent in {"callback_ack", "declined"}:
@@ -1132,33 +1144,45 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.debug("call warm-up failed: %s", error)
 
-    async def prepare_bridge(text, history):
-        nonlocal services
+    async def prepare_bridge(text, history, diagnostics=None):
+        diagnostics = diagnostics if diagnostics is not None else {}
+        started = perf_counter()
         if not bridges_enabled():
+            diagnostics.update(bridge_candidate=False, bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
-        await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history))
+        eligibility_started = perf_counter()
+        earlier_text = " ".join(" ".join(earlier_caller_texts(history, text)[-8:]).split()[-25:])
+        await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history), earlier_text)
         candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent_bridges[-3:],
                                            " ".join(earlier_caller_texts(history, text)[-8:]))
+        diagnostics.update(bridge_candidate=bool(candidate),
+                           bridge_eligibility_ms=round((perf_counter() - eligibility_started) * 1000))
         if not candidate:
+            diagnostics.update(bridge_selector="none", bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
-        if services is None:
-            services = await asyncio.to_thread(_voice_services)
-        return await wait_message(services, candidate, text, last_agent_text(history), recent_bridges[-3:])
+        # wait_bridge_phrase already selected an approved, semantically appropriate line. A second Llama call only
+        # chooses between approved phrases and can consume most of the time the bridge is meant to save.
+        diagnostics.update(bridge_selector="semantic_candidate", bridge_ready_ms=round((perf_counter() - started) * 1000))
+        return candidate
 
-    def start_reply(text: str, bridge_ready=None) -> Dict[str, Any]:
-        """Prepare the real answer independently of semantic bridge selection and Llama."""
+    def start_reply(text: str, bridge_ready=None, bridge_diagnostics=None) -> Dict[str, Any]:
+        """Prepare the real answer independently of semantic bridge selection."""
         history = memory.history()
-        bridge_ready = bridge_ready if bridge_ready is not None else asyncio.create_task(prepare_bridge(text, history))
+        diagnostics = bridge_diagnostics if bridge_diagnostics is not None else {}
+        bridge_ready = bridge_ready if bridge_ready is not None else asyncio.create_task(prepare_bridge(text, history, diagnostics))
+        reply_timings: Dict[str, Any] = {}
 
         async def stream():
             # Bridge eligibility and the real answer run independently. A slow classifier must never hold up
             # the knowledge/model request, and a missing audio-cache entry must never suppress an eligible bridge.
-            async with contextlib.aclosing(_voice_sentences(services, text, history, caller, memory.summary, "", contact_phone, preferred_language)) as source:
+            async with contextlib.aclosing(_voice_sentences(services, text, history, caller, memory.summary, "", contact_phone,
+                                                              preferred_language, timings=reply_timings)) as source:
                 async for sentence in source:
                     yield sentence
 
         sentences = stream().__aiter__()
-        return {"text": text, "bridge_ready": bridge_ready, "sentences": sentences,
+        return {"text": text, "bridge_ready": bridge_ready, "bridge_diagnostics": diagnostics,
+                "reply_timings": reply_timings, "sentences": sentences,
                 "first": asyncio.ensure_future(sentences.__anext__()), "started": perf_counter()}
 
     def drop_reply(prepared: Optional[Dict[str, Any]]) -> None:
@@ -1212,7 +1236,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     await asyncio.sleep(waited)
             filler_spoken = bool(prefix)
             bridge_pending = False
-            bridge_timing: Dict[str, Any] = {key: value for key, value in (turn_timing or {}).items() if key.startswith("bridge_")}
+            bridge_timing: Dict[str, Any] = dict(prepared.get("bridge_diagnostics") or {})
+            bridge_timing.update({key: value for key, value in (turn_timing or {}).items() if key.startswith("bridge_")})
 
             async def first_sentence():
                 try:
@@ -1263,6 +1288,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             timing = {"pipeline": "custom_twilio", "tts_engine": engine,
                                        **(turn_timing or {}),
                                        **bridge_timing,
+                                       **prepared.get("reply_timings", {}),
                                        "first_sentence_ms": round(brain_seconds * 1000),
                                        "tts_first_audio_ms": round(first_audio * 1000),
                                        "first_audio_ms": round((brain_seconds + first_audio) * 1000),
@@ -1303,7 +1329,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 nova_speech_final_text = ""
             heard_text, heard_changed_at = text, perf_counter()
             if not transfer_pending:
-                semantic_prefetch.schedule(text, last_agent_text(memory.history()))
+                semantic_history = memory.history()
+                semantic_prefetch.schedule(text, last_agent_text(semantic_history),
+                    " ".join(" ".join(earlier_caller_texts(semantic_history, text)[-8:]).split()[-25:]))
             if early_reply and not _same_words(early_reply["text"], text):
                 drop_reply(early_reply)
                 early_reply = None

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
-from voice_wait import with_wait_bridge, wait_message
+from voice_wait import with_wait_bridge
 from voice_turns import wait_bridge_phrase
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
@@ -761,8 +761,8 @@ class _SemanticPrefetch:
         self.updated_at = 0.0
         self.task = None
 
-    def schedule(self, caller_text: str, agent_text: str) -> None:
-        payload = (caller_text, agent_text)
+    def schedule(self, caller_text: str, agent_text: str, earlier: str = "") -> None:
+        payload = (caller_text, agent_text, earlier) if earlier else (caller_text, agent_text)
         if not caller_text or payload == self.last:
             return
         self.last = self.pending = payload
@@ -801,8 +801,7 @@ def voice_temperature() -> float:
 
 
 def _max_spoken_words(fast: bool = False) -> int:
-    """Longest reply in words (RETELL_MAX_SPOKEN_WORDS); turns on the fast model (VOICE_FAST_MAX_WORDS) are
-    acknowledgements and detail requests, which should be short."""
+    """Longest reply in words (RETELL_MAX_SPOKEN_WORDS); fast-model turns stay short and natural."""
     name, default = ("VOICE_FAST_MAX_WORDS", 25) if fast else ("RETELL_MAX_SPOKEN_WORDS", 60)
     try:
         return max(15, int(os.getenv(name, str(default))))
@@ -832,6 +831,7 @@ async def _stream_reply(
 
     prompt_started = perf_counter()
     prepared_prompt = None
+    earlier_text = " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:])
     if reminder:
         turn_model, (details_note, details_problem), places = None, ("", False), ""
     else:
@@ -846,7 +846,7 @@ async def _stream_reply(
             return None
 
         turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
-            asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript)),
+            asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript), earlier_text),
             asyncio.to_thread(contact_check, caller_text, last_agent_text(transcript),
                               earlier_caller_texts(transcript, caller_text), caller_region(caller_number)),
             asyncio.to_thread(check_places),
@@ -881,13 +881,15 @@ async def _stream_reply(
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
     if prompt_task is not None:
         system_prompt = await prompt_task  # built with the knowledge, as a bridged turn always uses the main model
-    elif prepared_prompt is not None and (turn_model is None or places):
+    elif prepared_prompt is not None:
+        # Non-product questions can use the fast model while keeping relevant business facts in context.
         system_prompt = prepared_prompt
     else:
         system_prompt = await asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, turn_model is None or bool(places))
     retrieval_ms = (perf_counter() - prompt_started) * 1000
     if timings is not None:
-        timings.update(preparation_ms=round(retrieval_ms), model=turn_model or services.config.OPENROUTER_MODEL)
+        timings.update(preparation_ms=round(retrieval_ms), model=turn_model or services.config.OPENROUTER_MODEL,
+                       requested_model=turn_model or services.config.OPENROUTER_MODEL)
     reminder_text = voice_turn_reminder()
     messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
@@ -1217,9 +1219,20 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         async def prepare_notice():
             if not caller_text or not bridges_enabled():
                 return ""
+            bridge_started = perf_counter()
+            earlier = " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:])
+            await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript), earlier)
             candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
                 " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
-            return await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent)
+            if candidate:
+                timing.update(bridge_candidate=True, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000),
+                              bridge_ready_ms=round((perf_counter() - bridge_started) * 1000),
+                              bridge_selector="semantic_candidate")
+            else:
+                timing.update(bridge_candidate=False, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000),
+                              bridge_ready_ms=round((perf_counter() - bridge_started) * 1000),
+                              bridge_selector="none")
+            return candidate
 
         bridge_ready = asyncio.create_task(prepare_notice())
         asyncio.current_task().add_done_callback(lambda _: bridge_ready.cancel())
@@ -1432,7 +1445,9 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 # far, so it is usually ready (cached) when Retell asks for the reply.
                 spoken = _last_user_message(_transcript_as_messages(transcript))
                 if not handoff_pending:
-                    semantic_prefetch.schedule(spoken, last_agent_text(_transcript_as_messages(transcript)))
+                    messages = _transcript_as_messages(transcript)
+                    semantic_prefetch.schedule(spoken, last_agent_text(messages),
+                        " ".join(" ".join(earlier_caller_texts(messages, spoken)[-8:]).split()[-25:]))
                 if spoken and spoken != prefetched_text and perf_counter() - prefetched_at > 0.3:
                     prefetched_text, prefetched_at = spoken, perf_counter()
                     brain_service.prefetch_query_embedding(spoken)

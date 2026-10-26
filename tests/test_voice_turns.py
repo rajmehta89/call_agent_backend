@@ -56,6 +56,13 @@ def test_questions_need_facts():
 
 
 def test_choose_voice_model(monkeypatch):
+    import store_intent
+    def store_kinds(text, earlier=""):
+        if ("basin" in text.lower() or "bathroom actually" in text.lower()
+                or ("small" in text.lower() and "size is the room" in earlier.lower())):
+            return ["product"]
+        return []
+    monkeypatch.setattr(store_intent, "wanted", store_kinds)
     monkeypatch.setenv("VOICE_FAST_MODEL", "")
     assert choose_voice_model("It's Raj.") is None
     fast = "meta-llama/llama-3.1-8b-instruct"
@@ -64,9 +71,34 @@ def test_choose_voice_model(monkeypatch):
     assert choose_voice_model("Okay. Cool. Bye.") == fast                                   # acknowledgement / goodbye
     assert choose_voice_model("No, that's all, thanks.") == fast
     assert choose_voice_model("What basins do you have?") is None
-    # From a real call: telling us about the project needs the knowledge, not the fast model.
+    # Product intent keeps the careful model; a business question can use the fast model with retrieved facts.
     assert choose_voice_model("Yeah, I'm doing up my bathroom actually.", "Are you after a particular type?") is None
     assert choose_voice_model("It's quite small.", "What size is the room?") is None
+    from turn_meaning import CALLER_TURN
+    monkeypatch.setattr(CALLER_TURN, "best", lambda text, earlier="": "question")
+    assert choose_voice_model("What does Home DFO provide?") == fast
+
+
+def test_product_follow_up_stays_on_main_model_using_prior_caller_context(monkeypatch):
+    import store_intent
+    seen = {}
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    def wanted(text, earlier=""):
+        seen.update(text=text, earlier=earlier)
+        return ["product"] if earlier else []
+    monkeypatch.setattr(store_intent, "wanted", wanted)
+    assert choose_voice_model("And the price?", earlier="I'm looking for a matte black basin.") is None
+    assert seen["earlier"] == "I'm looking for a matte black basin."
+
+
+def test_semantic_prefetch_covers_the_contextual_store_probe(monkeypatch):
+    import meaning
+    seen = []
+    monkeypatch.setattr(meaning, "vectors", lambda texts: seen.extend(texts))
+    voice_turns.prepare_turn_meaning("And what is the price?", "Would you like dimensions?",
+                                     "I'm interested in a round basin.")
+    assert "I'm interested in a round basin. And what is the price?" in seen
+    assert "I'm interested in a round basin. Would you like dimensions? And what is the price?" in seen
 
 
 def test_spoken_number():

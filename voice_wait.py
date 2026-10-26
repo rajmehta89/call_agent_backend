@@ -1,41 +1,7 @@
 """A single wait acknowledgement that never holds up a ready voice answer."""
 
 import asyncio
-import json
 from time import perf_counter
-
-
-async def wait_message(services, fallback, caller_text, agent_text="", recent=()):
-    """Let the fast model select a fact-free wait line; never wait indefinitely for it."""
-    if not fallback:
-        return ""
-    from voice_turns import fast_voice_model, bridge_model_seconds, STATUS_PHRASES
-    model = fast_voice_model()
-    client = getattr(services, "openai_client", None)
-    if not model or client is None:
-        return fallback
-    choices = list(dict.fromkeys(line for line in (fallback, *STATUS_PHRASES) if line not in recent))
-    if not choices:
-        return ""
-
-    def choose():
-        response = client.with_options(timeout=bridge_model_seconds(), max_retries=0).chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content":
-                       "Select the most natural holding message for this ongoing phone conversation. "
-                       "The actual answer is still being prepared. Do not answer or add any words. "
-                       "Return only JSON with an integer index into this approved list: " + json.dumps(choices)},
-                      {"role": "user", "content": f"Agent: {agent_text}\nCaller: {caller_text}"}],
-            max_tokens=12, temperature=0,
-        )
-        value = json.loads(response.choices[0].message.content or "{} ").get("index")
-        return choices[value] if type(value) is int and 0 <= value < len(choices) else fallback
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(choose), bridge_model_seconds())
-    except Exception:
-        return fallback
-
 
 async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None):
     """Race the first answer against the wait deadline and bridge generation."""

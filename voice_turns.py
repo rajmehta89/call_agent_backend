@@ -1,7 +1,7 @@
 """Per-turn helpers shared by the Retell and custom voice pipelines.
 
-- choose_voice_model: send turns that need no business facts (a name, a number, "yes", "okay") to a small fast
-  model (VOICE_FAST_MODEL), and every question to the main model, so product answers keep its accuracy.
+- choose_voice_model: use the small fast model (VOICE_FAST_MODEL) for non-product conversation and simple details;
+  product and order questions stay on the main model. Both receive relevant business knowledge when they need it.
 - NumberSpeaker: whatever the model writes, the caller's phone number is read back with exactly the digits the
   caller said, one digit at a time ("zero four one two, three four five, six seven eight").
 """
@@ -13,7 +13,7 @@ import re
 from typing import Dict, List, Optional
 
 def fast_voice_model() -> str:
-    """VOICE_FAST_MODEL: the small model for turns without a question (empty = always the main model)."""
+    """VOICE_FAST_MODEL: the small model for non-product turns and simple details (empty = always main model)."""
     return os.getenv("VOICE_FAST_MODEL", "").strip()
 
 
@@ -40,16 +40,36 @@ def pause_reply(caller_text: str) -> str:
     return "Would you like me to repeat that?" if caller_text.strip().endswith("?") else "Of course. Go ahead."
 
 
-def choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
-    """The fast model for this turn, or None for the main model, decided by what the caller MEANS (turn_meaning):
-    only a goodbye, a plain "okay" that answers no question of ours, or the detail we just asked for (name, number,
-    email, a time, an address) goes fast. Everything else, including anything about an order (looked up in the store),
-    gets the main model and the knowledge."""
+def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:
+    """Use the fast model for non-product conversation and the main model for product/order data.
+
+    Both decisions use semantic classifiers. If either classifier cannot decide, keep the main model. General
+    business questions still receive retrieved business knowledge; only live product and order turns need the
+    main model's extra care.
+    """
     fast = fast_voice_model()
     if not fast:
         return None
     is_simple = _simple_turn(caller_text, agent_text)
-    return fast if is_simple else None
+    if is_simple is True:
+        return fast
+    if is_simple is None:
+        return None
+
+    from turn_meaning import CALLER_TURN
+    kind = CALLER_TURN.best(kind_of_turn_text(caller_text))
+    if kind in {None, "", "acknowledge", "closing", "detail"}:
+        # Acknowledgements to our own question and unsolicited details need the conversation context.
+        return None
+    try:
+        import store_intent
+        store_context = " ".join(" ".join(part for part in (earlier, agent_text) if part).split()[-25:])
+        store_kinds = store_intent.wanted(caller_text, store_context)
+    except Exception:
+        return None
+    if store_kinds is None or {"product", "order"}.intersection(store_kinds):
+        return None
+    return fast
 
 
 DETAILS_WE_ASK_FOR = ("name", "phone", "email", "time", "address")
@@ -84,7 +104,7 @@ def kind_of_turn_text(caller_text: str) -> str:
     return text
 
 
-def prepare_turn_meaning(caller_text: str, agent_text: str = "") -> None:
+def prepare_turn_meaning(caller_text: str, agent_text: str = "", earlier: str = "") -> None:
     """Batch the shared semantic inputs before the individual turn checks.
 
     Network embeddings otherwise cost a separate round trip for the original,
@@ -93,7 +113,12 @@ def prepare_turn_meaning(caller_text: str, agent_text: str = "") -> None:
     """
     from meaning import vectors
     masked = _PLACE_AFTER.sub(lambda match: match.group(0).replace(match.group(1), "that town"), caller_text)
-    texts = [caller_text, kind_of_turn_text(caller_text), masked, agent_text, agent_question(agent_text)]
+    bridge_context = " ".join((earlier or "").split()[-25:])
+    bridge_probe = f"{bridge_context} {caller_text}".strip() if bridge_context and caller_text else ""
+    model_context = " ".join(" ".join(part for part in (earlier, agent_text) if part).split()[-25:])
+    model_probe = f"{model_context} {caller_text}".strip() if model_context and caller_text else ""
+    texts = [caller_text, kind_of_turn_text(caller_text), masked, agent_text, agent_question(agent_text),
+             bridge_probe, model_probe]
     try:
         vectors(list(dict.fromkeys(text for text in texts if text.strip())))
     except Exception:

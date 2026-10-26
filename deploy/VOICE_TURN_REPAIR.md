@@ -1,4 +1,4 @@
-# Repair custom-call setup, delayed bridges and caller interruptions
+# Voice turn, bridge and interruption repairs
 
 The latest inspected Retell call started on 26 October 2026 at 11:24:09 IST.
 Its four spoken-response delays were 4.630, 2.094, 4.056 and 5.958 seconds.
@@ -259,3 +259,34 @@ Nova missed their audio. Release 14 adds the counters needed to distinguish
 those cases on a later call.
 
 Production health must show `2026-10-26-voice-turn-repair-14` after deployment.
+
+## Release 16: route non-product questions to Llama and prewarm bridge eligibility
+
+The newest production custom Twilio call on 26 October started at 17:57 UTC and
+lasted 134 seconds. Its first-audible timing included one 5.374-second answer;
+the bridge for that turn began at 3.782 seconds, despite the configured 0.8-second
+wait threshold. The prior call record did not save the selected model or separate
+bridge eligibility time from phrase selection, so it could not show which stage
+used the time. The live health endpoint still reported release 13 while the
+repository was on release 14.
+
+Non-product conversation and business questions now use `VOICE_FAST_MODEL`,
+with the relevant business knowledge still included. The Render parity profile
+sets that model to Llama; the live environment value is not exposed by the
+public health endpoint. Product and order questions keep the main model and
+live store data. Follow-up turns pass recent caller context into the semantic
+store classifier, so product follow-ups remain on the accurate path.
+
+Both call paths now speak the semantically selected approved bridge directly.
+This removes the second Llama request that previously reselected a phrase after
+bridge eligibility was established. The bridge also uses a contextual store
+intent check, but the previous semantic prefetch did not warm its combined
+prior-turn plus current-turn text. That could require another embedding on the
+bridge eligibility path. The current prefetch now prepares this exact probe
+while the caller is speaking, in both custom Twilio and Retell. Call timing
+records include the requested model, preparation time, first model text, model
+wait, bridge eligibility time, bridge readiness and selector. A new production
+call can now show whether any remaining delay is turn detection, semantic
+eligibility, retrieval or model generation.
+
+Production health must show `2026-10-27-voice-bridge-prefetch-16` after deployment.

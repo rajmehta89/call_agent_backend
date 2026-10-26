@@ -107,6 +107,38 @@ def test_question_retrieval_overlaps_model_selection(monkeypatch):
     assert len(prompts) == 1
 
 
+def test_retell_fast_business_question_keeps_retrieved_facts(monkeypatch):
+    seen = {}
+    fast = "meta-llama/llama-3.1-8b-instruct"
+    monkeypatch.setattr(retell, "choose_voice_model", lambda *args: fast)
+    monkeypatch.setattr(retell, "needs_facts", lambda text: True)
+    monkeypatch.setattr(retell, "place_note", lambda *args: "")
+    monkeypatch.setattr(retell, "contact_check", lambda *args: ("", False))
+    monkeypatch.setattr(retell, "bridges_enabled", lambda: False)
+    monkeypatch.setattr(retell, "_system_prompt", lambda *args: seen.update(with_facts=args[4]) or "Relevant business facts")
+    monkeypatch.setattr(retell, "_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(retell.brain_service, "knowledge_text", lambda: "")
+
+    def complete(messages, *args, **kwargs):
+        seen.update(messages=messages, model=kwargs.get("model"))
+        return iter(["Home DFO supplies bathroom and kitchen products."])
+
+    services = SimpleNamespace(fallback_model="fallback", config=SimpleNamespace(OPENROUTER_MODEL="main"),
+                               stream_chat_completion=complete)
+    timings = {}
+
+    async def run():
+        return "".join([chunk async for chunk in retell._stream_reply(
+            services, [{"role": "user", "content": "What does Home DFO provide?"}],
+            "unknown", "test-call", 1, timings=timings)])
+
+    assert "bathroom and kitchen" in asyncio.run(run())
+    assert seen["model"] == fast
+    assert seen["with_facts"] is True
+    assert any("Relevant business facts" in message["content"] for message in seen["messages"])
+    assert timings["requested_model"] == fast
+
+
 def test_semantic_prefetch_coalesces_partial_words_and_reuses_unchanged_text(monkeypatch):
     calls = []
     monkeypatch.setattr(retell, "prepare_turn_meaning", lambda *args: calls.append(args))

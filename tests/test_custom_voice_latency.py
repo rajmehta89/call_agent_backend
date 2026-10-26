@@ -81,3 +81,35 @@ def test_custom_contact_validation_keeps_model_and_knowledge_selection(monkeypat
     assert seen["model"] == expected_model
     assert seen["with_facts"] == with_facts
     assert any("Check this number" in message["content"] for message in seen["messages"])
+
+
+def test_custom_fast_business_question_keeps_retrieved_facts_and_records_model(monkeypatch):
+    seen = {}
+    fast = "meta-llama/llama-3.1-8b-instruct"
+    monkeypatch.setattr(custom, "prepare_turn_meaning", lambda *args: None)
+    monkeypatch.setattr(custom, "choose_voice_model", lambda *args: fast)
+    monkeypatch.setattr(custom, "needs_facts", lambda text: True)
+    monkeypatch.setattr(custom, "contact_check", lambda *args: ("", False))
+    monkeypatch.setattr(custom, "place_note", lambda *args: "")
+    monkeypatch.setattr(custom, "_system_prompt", lambda *args: seen.update(with_facts=args[4]) or "Relevant business facts")
+    monkeypatch.setattr(custom.brain_service, "knowledge_text", lambda: "")
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
+
+    def complete(messages, *args, **kwargs):
+        seen.update(messages=messages, model=kwargs.get("model"))
+        yield "Home DFO supplies bathroom and kitchen products."
+
+    services = SimpleNamespace(fallback_model="fallback", config=SimpleNamespace(OPENROUTER_MODEL="main"),
+                               stream_chat_completion=complete)
+    timings = {}
+
+    async def run():
+        return "".join([sentence async for sentence in custom._voice_sentences(
+            services, "What does Home DFO provide?", [], "unknown", "", timings=timings)])
+
+    assert "bathroom and kitchen" in asyncio.run(run())
+    assert seen["model"] == fast
+    assert seen["with_facts"] is True
+    assert any("Relevant business facts" in message["content"] for message in seen["messages"])
+    assert timings["requested_model"] == fast
+    assert timings["preparation_ms"] >= 0 and timings["model_wait_ms"] >= 0

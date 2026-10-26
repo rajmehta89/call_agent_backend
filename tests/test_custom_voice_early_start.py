@@ -75,7 +75,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
              answer_text="Here is the answer.", caller="unknown"):
     starts, finished = [], []
 
-    async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en"):
+    async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en", **kwargs):
         starts.append((round(time.perf_counter() - t0, 2), text))
         try:
             await asyncio.sleep(model_seconds)
