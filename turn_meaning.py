@@ -181,6 +181,8 @@ HANDOFF_ACTION = Classifier("handoff action", {
     "other": [
         "What does your team do?", "How many agents work there?", "Can your installers come to my house?",
         "What are the opening hours?", "How much is this product?", "Can I call your store number?",
+        "What is this voice service for?", "What is this call assistant for?", "Can we check that?",
+        "Could you check that for me?",
         "I will talk to my partner first.", "What is the price of the black basin?",
         "Do you have someone who can install a shower?", "Thank you, goodbye.",
         "Are you an AI?", "Am I talking to a bot?", "Yeah.", "Okay.", "Yes.",

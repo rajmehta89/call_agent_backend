@@ -242,11 +242,22 @@ def test_asks_for_team_by_meaning(text, kind):
     ("Could someone from your office ring me when they are free?", "callback"),
     ("Can you put me in touch with someone?", "unclear"),
     ("Can I speak to someone about my missing order?", "unclear"),
+    ("Yeah. So what is only the voice for?", ""),
+    ("Can we check?", ""),
     ("I paid for my order and it has not turned up", ""),
     ("What does your staff do?", ""),
 ])
 def test_handoff_meaning_paraphrases_and_order_issue(text, expected):
     assert call_forwarding.handoff_intent(text) == expected
+
+
+def test_a_weak_live_score_does_not_trigger_an_unrequested_transfer(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda *args: [
+        ("live", 0.575), ("other", 0.553), ("callback", 0.550), ("unclear", 0.542),
+    ])
+    assert call_forwarding.handoff_intent("Yeah. So what is only the voice for?") == ""
 
 
 def test_semantic_classifier_uses_network_vectors_when_local_model_is_disabled(monkeypatch):

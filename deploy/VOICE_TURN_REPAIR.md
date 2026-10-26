@@ -216,3 +216,21 @@ production phone routing was not changed by this repair.
 Production health must show `2026-10-26-voice-turn-repair-12` after deployment.
 A new live call is needed to measure the effect on actual turn detection and
 caller-perceived timing; the recorded call above predates these changes.
+
+## Release 13: require clearer intent before a live transfer
+
+The 14:56 UTC custom call on 26 October lasted 20 seconds. The saved transcript
+shows the caller asking, “Yeah. So what is only the voice for?” The agent began a
+live transfer instead of answering. Semantic handoff scoring ranked `live` at
+0.575 and `other` at 0.553; the previous 0.02 margin accepted that weak lead.
+The turn was not a follow-up request.
+
+Live transfers now require a 0.04 semantic lead over `other`. The handoff
+examples also cover ordinary questions about checking something and what the
+voice service does. Explicit requests to speak to the team continue through the
+same semantic classifier. Regression coverage includes the saved transcript and
+“Can we check?”
+
+Production health must show `2026-10-26-voice-turn-repair-13` after deployment.
+A fresh call should confirm the agent answers ordinary questions without
+starting a transfer and still transfers on a clear request.

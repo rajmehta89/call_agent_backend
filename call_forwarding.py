@@ -385,7 +385,10 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
         if decided:
             return decided
         return "unclear"  # ask now-or-later instead of guessing after a provider error
-    if live >= HANDOFF_ACTION.min_score and live >= callback + 0.025 and live >= unclear - 0.02 and live >= other + 0.02:
+    # Live transfers are consequential. A barely-leading live score over `other`
+    # can turn ordinary questions into an unwanted transfer, so require a clear
+    # semantic margin over non-handoff intent while preserving explicit requests.
+    if live >= HANDOFF_ACTION.min_score and live >= callback + 0.025 and live >= unclear - 0.02 and live >= other + 0.04:
         result = "live"
     elif callback >= HANDOFF_ACTION.min_score and callback >= live + 0.02 and callback >= unclear + 0.02 and callback >= other + 0.02:
         result = "callback"
