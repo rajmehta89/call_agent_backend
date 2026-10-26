@@ -30,6 +30,9 @@ CALLER_TURN = Classifier("caller turn", {
     "search": ["I'm looking for a basin for a small bathroom.", "What would you recommend for a family bathroom?", "I need something for my kitchen.",
                "Which tap would suit a vessel basin?", "I want a modern freestanding bath.", "What options do you have for a powder room?",
                "Something that goes with matte black fittings.", "I'm after a new vanity."],
+    "compound": ["I need a vanity and a basin and also some tiles for the floor and the walls.",
+                 "Please explain the prices, compare the sizes and tell me about delivery.",
+                 "I have several questions about the finish, fitting and stock."],
     "problem": ["I'm not sure which one to choose.", "I'm having trouble with the installation.", "It's not working properly.",
                 "I can't work out how to fit it.", "I'm confused about the sizes.", "The website isn't letting me check out."],
     "sensitive": ["It arrived broken.", "The basin is cracked.", "It's leaking everywhere.", "I want a refund, this is ridiculous.",
@@ -166,12 +169,13 @@ HANDOFF_ACTION = Classifier("handoff action", {
         "Can you arrange a call from your team tomorrow?", "Can you transfer my call tomorrow?",
         "Can your team call me back later?", "I would rather have the team call me another time.",
         "Could your people phone me once they have a moment?",
+        "Please have the team get back to us this afternoon.",
     ],
     "unclear": [
         "Can you arrange a call from your team?", "I would like to speak with your team sometime.",
         "Can someone from the team talk to me?", "I need to discuss this with a person.",
         "Could I get in touch with someone?", "Can you arrange a call so we can discuss it?",
-        "I would like somebody from your team to help me.", "Yeah.", "Okay.", "Yes.",
+        "I would like somebody from your team to help me.",
         "I would like to talk with someone about a problem with my order.",
     ],
     "other": [
@@ -179,9 +183,80 @@ HANDOFF_ACTION = Classifier("handoff action", {
         "What are the opening hours?", "How much is this product?", "Can I call your store number?",
         "I will talk to my partner first.", "What is the price of the black basin?",
         "Do you have someone who can install a shower?", "Thank you, goodbye.",
-        "Are you an AI?", "Am I talking to a bot?",
+        "Are you an AI?", "Am I talking to a bot?", "Yeah.", "Okay.", "Yes.",
+        "Do not transfer me.", "I do not need anyone to call me.",
         "I paid for my order and it has not arrived. Where is it?",
         "My payment went through but I have not received the order. What happened?",
         "I need an update on my delivery.", "There is a problem with my purchase.",
+        "Can you help with this product?", "Can you guide me through the product details?",
+        "I want help choosing a bath.", "Can you tell me what you sell?",
+        "My number is eight eight six six six three one four nine one.",
+        "Eight eight six six six three one four nine one.", "Kitchen.",
     ],
 }, min_score=0.56, close_call=0.035)
+
+
+# These are meanings of whole utterances, not trigger words. Offers and replies
+# are classified separately so agreement inherits the action actually offered.
+HANDOFF_OFFER = Classifier("agent handoff offer", {
+    "live": ["Would you like me to connect you with the team for full product details?",
+             "Shall I put you through to a colleague?", "I can transfer you to someone now, if you like.",
+             "Would speaking with a person on this call help?"],
+    "callback": ["Would you like someone to call you back?", "Shall I arrange for the team to phone you later?",
+                 "I can ask a colleague to contact you after this call. Would that help?"],
+    "choice": ["Would you like me to connect you now or have someone call you back later?",
+               "Shall I put you through, or would you prefer a callback?"],
+    "other": ["Would you like the basin sizes and finishes?", "Anything else?",
+              "The team will call you on this number.", "Your callback request is already with the team.",
+              "What phone number should the team call?", "Would you like more information about delivery?"],
+}, min_score=0.58, close_call=0.025)
+
+HANDOFF_REPLY = Classifier("caller response to handoff offer", {
+    "accept": ["Yeah. Yeah. Please.", "Yes, please.", "Go ahead.", "That would be helpful.",
+               "I'd appreciate that.", "Sounds good to me.", "OK.", "Thanks.", "That works for me."],
+    "decline": ["No, thanks.", "Please don't do that.", "I would rather stay with you.",
+                "No need, I have what I need.", "Don't transfer me.", "I do not want a callback."],
+    "live": ["Now, please.", "Put me through while I am here.", "I'd prefer to stay on the line.",
+             "No, can you transfer me now?"],
+    "callback": ["Later, please.", "Tomorrow would suit me better.", "Someone call me later.",
+                 "Have them get back to me when they can."],
+    "other": ["What is the price of the basin?", "My number is 0412345678.", "I need the dimensions.",
+              "Can you tell me about delivery?", "I have a question about my order.",
+              "Can you help with this product?", "Please explain the options.", "Kitchen."],
+}, min_score=0.7, close_call=0.04)
+
+
+PAUSE_TURN = Classifier("caller pause", {
+    "pause": ["Sorry. Sorry.", "Wait a second.", "Please stop.", "Hold on a moment.",
+              "Hang on please.", "Excuse me.", "Let me finish.", "Sorry.", "Wait, please.", "Stop."],
+    "other": ["Sorry, can you explain the delivery options?", "I didn't catch that, could you repeat it?",
+              "Can you stop the delivery?", "I am waiting for my order.", "Yes, please.",
+              "What is the price?", "Someone call me later.", "Please transfer me."],
+}, min_score=0.75, close_call=0.04)
+
+AGENT_FAREWELL = Classifier("agent farewell", {
+    "farewell": ["Thank you for calling. Goodbye.", "Have a great day, Raj. Goodbye.",
+                 "Take care and enjoy your evening.", "Bye now."],
+    "other": ["Is there anything else I can help with?", "Thanks. Would you like more information?",
+              "The team will call you on this number.", "Here are the prices.", "Hello, how can I help?"],
+}, min_score=0.6)
+
+WAIT_QUESTION = Classifier("complete question for delayed reply", {
+    "complete": ["What is your Home DFO business for?", "Can you tell me what your company does?",
+                 "What are the product prices and delivery options?", "Could you explain how this works?"],
+    "other": ["Could you please tell me about", "Can you check the", "I would like to ask you for",
+              "My email is john at gmail dot com.", "What email should the team use?",
+              "My order arrived broken and I want a refund.", "Yes, please."],
+}, min_score=0.6)
+
+
+TURN_COMPLETION = Classifier("caller sentence completion", {
+    "unfinished": ["Could you arrange a call to your", "Could you please tell me about",
+                   "I am looking for", "What are the popular", "I need to know whether",
+                   "I was wondering if", "Can you check the", "My email is", "Can you tell me about the."],
+    "complete": ["What is it for?", "Who is it by?", "What are your services like?",
+                 "I'm looking for a round basin.", "Kitchen.", "Someone call me later.",
+                 "Yes, please.", "My number is eight eight six six six three one four nine one.",
+                 "I want to know about your business.", "Can you help with this product?",
+                 "Do you sell kitchen sinks?"],
+}, min_score=0.62)

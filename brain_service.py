@@ -1012,8 +1012,8 @@ class BrainService:
             by_kind = [p for kind in kinds for p in policies if p.get("type") == kind]
             by_meaning = [policies[index] for index, _ in ranked]
             wanted = list({id(p): p for p in [*by_kind, *by_meaning]}.values())
-        else:  # the meaning model is unavailable: match words in the policy names
-            wanted = [p for p in policies if any(word in f"{p['type']} {p['title']}".lower() for word in re.findall(r"[a-z]+", user_input.lower()))] or policies
+        else:  # Pass available policies to the answer model when semantic selection is unavailable.
+            wanted = policies
         return "Store policies from Shopify (summarise the relevant part; do not read it all out):\n" + "\n".join(
             f"[{p['title']}] {p['text'][:700]}" for p in wanted[:2]
         ) if wanted else ""
@@ -1026,8 +1026,8 @@ class BrainService:
         conversation_text = conversation_text or user_input
         earlier = conversation_text[: -len(user_input)] if conversation_text.endswith(user_input) else conversation_text
         kinds = store_intent.wanted(user_input, " ".join(earlier.split()[-25:]))
-        if kinds is None:  # the meaning model is unavailable: match words instead
-            return self._keyword_store_context(user_input, customer_phone, conversation_text)
+        if kinds is None:  # Never substitute keyword rules for the semantic decision.
+            return "Live store lookup is unavailable. Do not invent product, order or policy details.", None
         tools = self.tools()
         try:
             # An order number, or an email given after one, is something to look up whatever the wording.
@@ -1085,47 +1085,6 @@ class BrainService:
                         "likely an item in their most recent order: name that item and confirm it with them (\"Is it the ... you ordered "
                         "on ...?\") rather than asking what they bought. Share status, items and tracking; never addresses or payment details:\n"
                         + "\n".join(shopify_service.describe_order(order) for order in orders[:5])), "caller_orders"
-        return "", None
-
-    def _keyword_store_context(self, user_input: str, customer_phone: Optional[str] = None, conversation_text: str = "") -> tuple[str, Optional[str]]:
-        """Fallback when the local meaning model cannot load: the same choice made from words."""
-        lowered = user_input.lower()
-        tools = self.tools()
-        conversation_text = conversation_text or user_input
-        try:
-            if tools.get("get_order") and (self.ORDER_NUMBER.search(user_input) or any(term in lowered for term in self.ORDER_TERMS)
-                                           or (self.EMAIL.search(user_input) and self.ORDER_NUMBER.search(conversation_text))):
-                return self._order_context(conversation_text, customer_phone), "get_order"
-            # What the caller is shopping for, from this turn or, for a follow-up ("the smaller one", "what's the
-            # pricing?"), from what they said earlier in the call. Speech recognition can mishear the product
-            # ("business" for "basins"), so the earlier turns also keep the search on track.
-            named_now = shopify_service.catalog_nouns(user_input)
-            named_before = shopify_service.catalog_nouns(conversation_text)
-            follow_up = bool(named_before) and not named_now and any(term in lowered for term in (*self.PRODUCT_TERMS, *self.FOLLOW_UP_TERMS))
-            names_product = tools.get("search_shopify_products") and (bool(named_now) or follow_up or any(term in lowered for term in self.PRODUCT_TERMS))
-            # A warranty or guarantee on a named product is in that product's own specifications, not the store policies.
-            about_the_product = names_product and any(term in lowered for term in self.PRODUCT_POLICY_TERMS)
-            if tools.get("get_store_policy") and not about_the_product and any(term in lowered for term in self.POLICY_TERMS):
-                context = self._policy_context(user_input)
-                if context:
-                    return context, "get_store_policy"
-            # A product question in any words: the usual buying words, or naming something this store sells.
-            if names_product:
-                query = user_input if named_now or not named_before else f"{' '.join(named_before[-3:])} {user_input}"
-                return shopify_service.product_context(query, include_stock=bool(tools.get("check_inventory"))), "search_shopify_products"
-            # Whatever they ask, the AI knows this caller's own orders (found by caller ID when the call started, so no
-            # wait), and can tell from their meaning when they are talking about something they bought.
-            if customer_phone and tools.get("get_customer_orders") and tools.get("get_order"):
-                orders = shopify_service.cached_orders_for_phone(customer_phone)
-                if orders:
-                    return ("This caller's own recent orders, recognised by caller ID (verified). Use them only when the caller is talking "
-                            "about something they bought, a delivery, a return or a problem with a purchase; do not bring them up yourself. "
-                            "When they talk about something they bought without naming it (\"the thing I got\", \"it's leaking\"), it is most "
-                            "likely an item in their most recent order: name that item and confirm it with them (\"Is it the ... you ordered "
-                            "on ...?\") rather than asking what they bought. Share status, items and tracking; never addresses or payment details:\n"
-                            + "\n".join(shopify_service.describe_order(order) for order in orders[:5])), "caller_orders"
-        except Exception as exc:
-            return f"The live store lookup failed just now ({exc}). Say you could not check the store and offer a follow-up.", "shopify_error"
         return "", None
 
     def system_context(self, channel: str, customer_phone: Optional[str], live_context: str = "", retrieved_knowledge: Optional[List[Dict[str, Any]]] = None, conversation_summary: str = "", language: Optional[str] = None) -> str:

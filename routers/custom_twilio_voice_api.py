@@ -778,6 +778,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     transcript: List[Dict[str, str]] = []
     responses: List[Dict[str, str]] = []
     send_lock = asyncio.Lock()
+    finish_lock = asyncio.Lock()
     utterance: List[str] = []
     reply_task: Optional[asyncio.Task[Any]] = None
     silence_reminder_task: Optional[asyncio.Task[Any]] = None
@@ -902,18 +903,34 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
         save_progress()
 
-    async def forward_to_team(text: str, heard_at: float) -> None:
-        """The caller asked for a person and call forwarding is on: say so, let it play, then ring the team
-        (call_forwarding.py). If the transfer cannot start, the caller is told and the AI carries on."""
-        nonlocal unanswered_text, transfer_pending
-        bind_call(call_sid)
+    async def control_reply(text: str, line: str, heard_at: float, turn_timing: Optional[Dict[str, Any]], action: str) -> None:
+        """Speak a routing/control result directly, without another model request."""
+        nonlocal unanswered_text
         unanswered_text = ""
-        line = call_forwarding.CONNECTING_LINE
         spoke_at = utc_iso()
-        await speak(line)
+        routing_ms = round((perf_counter() - heard_at) * 1000)
+        first_audio = await speak(line)
+        first_audio_ms = routing_ms + round(first_audio * 1000)
+        timing = {"pipeline": "custom_twilio", "tts_engine": engine, **(turn_timing or {}),
+                  "action": action, "routing_ms": routing_ms, "tts_first_audio_ms": round(first_audio * 1000),
+                  "first_audio_ms": first_audio_ms, "first_audible_ms": first_audio_ms}
+        if "turn_detection_ms" in timing:
+            timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + first_audio_ms
+        voice_turn_timings.append(timing)
         memory.add(text, line)
         responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
         save_progress()
+        if active and not transfer_pending:
+            schedule_silence_reminder()
+
+    async def forward_to_team(text: str, heard_at: float, turn_timing: Optional[Dict[str, Any]] = None) -> None:
+        """The caller asked for a person and call forwarding is on: say so, let it play, then ring the team
+        (call_forwarding.py). If the transfer cannot start, the caller is told and the AI carries on."""
+        nonlocal unanswered_text, transfer_pending, callback_requested
+        bind_call(call_sid)
+        unanswered_text = ""
+        line = call_forwarding.CONNECTING_LINE
+        await control_reply(text, line, heard_at, turn_timing, "live_transfer")
         for _ in range(80):  # the line has finished playing (its mark came back); at most ~8 s
             if not pending_mark:
                 break
@@ -922,6 +939,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice: call=%s handed to the team %.2fs after the caller asked", call_sid, perf_counter() - heard_at)
             return
         transfer_pending = False
+        callback_requested = True
         fallback = "Sorry, I couldn't put you through just now. I've noted that you'd like to talk to someone, and our team will call you back."
         await speak(fallback)
         memory.add(text, fallback)
@@ -929,35 +947,49 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         save_progress()
 
     async def answer_or_forward(text: str, heard_at: float, prepared: Optional[Dict[str, Any]], turn_timing: Optional[Dict[str, Any]] = None) -> None:
-        """Forwarding is on: hand the call to the team if the caller asked for a person (a meaning check, off the
-        event loop), otherwise answer as usual."""
+        """Resolve semantic handoff intent and conversation state, otherwise answer as usual."""
         nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested
-        await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(memory.history()))
-        intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
-        if intent == "live" and call_forwarding.forwarding_on():
+        agent_text = last_agent_text(memory.history())
+        intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
+        turn_timing = {**(turn_timing or {}), "handoff_source": "semantic_context" if intent is not None else "semantic"}
+        if intent is None:
+            await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
+            intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
+        if intent in {"callback_ack", "declined"}:
             earlier_handoff_text = ""
+            drop_reply(prepared)
+            line = "You're welcome." if intent == "callback_ack" else "Of course."
+            await control_reply(text, line, heard_at, turn_timing, intent)
+        elif intent == "live" and call_forwarding.forwarding_on():
+            earlier_handoff_text = ""
+            callback_requested = False
             transfer_pending = True
             drop_reply(prepared)
-            await forward_to_team(text, heard_at)
-        elif intent == "callback" and not await asyncio.to_thread(call_forwarding.requested_agent, text):
+            await forward_to_team(text, heard_at, turn_timing)
+        elif intent in {"live", "callback"}:
             earlier_handoff_text = ""
-            callback_requested = True
             drop_reply(prepared)
+            if callback_requested:
+                await control_reply(text, "Your callback request is already with the team.", heard_at, turn_timing, "callback_ack")
+                return
             email = contact_email_from_messages(memory.history())
+            callback_number = contact_phone or caller
             await asyncio.to_thread(
                 call_forwarding.create_callback_outreach,
-                caller,
+                callback_number,
                 text,
                 call_sid,
-                "Human team",
+                "",
                 "The caller requested a callback. Please follow up using the caller's phone number.",
                 contact_email=email,
             )
-            line = "I've noted your callback request. The team will call you on this number."
-            await speak(line)
-            memory.add(text, line)
-            responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
-            save_progress()
+            callback_requested = True
+            known_phone = bool(re.fullmatch(r"\+?[0-9 ()-]{8,}", callback_number))
+            line = ("I've noted your callback request. The team will call you on this number." if known_phone
+                    else "I've passed on your callback request. What phone number should the team use?")
+            if intent == "live":
+                line = "A live transfer isn't available right now. " + line
+            await control_reply(text, line, heard_at, turn_timing, "callback_requested")
         elif intent in {"callback", "unclear"} and await asyncio.to_thread(call_forwarding.requested_agent, text):
             # A named request should never disappear into a generic callback queue, even when a live transfer
             # is unavailable or the caller did not clearly say "now". Create the outreach for that person.
@@ -972,23 +1004,16 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "The caller asked to speak with a specific team member. Please follow up with this caller.",
                 contact_email=contact_email_from_messages(memory.history()),
             )
+            callback_requested = True
             line = f"I have noted your request for {destination}. They or the team will contact you using this number."
-            spoke_at = utc_iso()
-            await speak(line)
-            memory.add(text, line)
-            responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
-            save_progress()
+            await control_reply(text, line, heard_at, turn_timing, "callback_requested")
         elif intent == "unclear":
             if len(text.split()) > 2:
                 earlier_handoff_text = text
             unanswered_text = ""
             drop_reply(prepared)
             line = "Would you like me to connect you with the team now, or have someone call you back later?"
-            spoke_at = utc_iso()
-            await speak(line)
-            memory.add(text, line)
-            responses.append({"content": line, "timestamp": spoke_at, "language": preferred_language})
-            save_progress()
+            await control_reply(text, line, heard_at, turn_timing, "handoff_clarification")
         else:
             earlier_handoff_text = ""
             await answer(text, heard_at, prepared, turn_timing)
@@ -1134,7 +1159,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         spoken: List[str] = []
         spoke_at = ""
         try:
-            if sounds_unfinished(text):
+            if await asyncio.to_thread(sounds_unfinished, text):
                 # Probably a pause mid-sentence ("what are the popular ..."): give the caller a moment to finish. The
                 # model is already working meanwhile; if they go on, finish_utterance cancels this and answers it all.
                 waited = max(0.0, unfinished_wait_seconds() - (perf_counter() - prepared["started"]))
@@ -1269,7 +1294,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     # A clear live request should not wait for Flux's often-missing EndOfTurn.
                     forced_fallback_text = heard_text
                     logger.info("custom voice: ending live handoff turn early: %s", heard_text[:120])
-                    finish_utterance("flux_live_handoff")
+                    await finish_utterance("flux_live_handoff")
                     continue
             if (flux and early_handoff_task is None and call_forwarding.forwarding_on() and heard_text
                     and quiet_for >= 0.6 and not bot_busy() and early_handoff_checked != heard_text):
@@ -1281,7 +1306,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 # Some Flux sessions acknowledge neither the request nor the turn. Do not leave the caller waiting.
                 forced_fallback_text = heard_text
                 logger.warning("custom voice: Flux did not end the requested turn; answering partial text: %s", heard_text[:120])
-                finish_utterance("flux_force_timeout")
+                await finish_utterance("flux_force_timeout")
                 continue
             if flux and heard_text and stuck_after and quiet_for >= stuck_after and not bot_busy() and forced_turn != heard_text:
                 # Flux keeps a turn open while someone reads out digits ("eight eight six ... six six three") and once
@@ -1294,7 +1319,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     await deepgram.send(json.dumps({"type": "ForceEndTurn"}))
                 except Exception as error:
                     logger.warning("custom voice: could not end the Flux turn (%s); answering what was heard", error)
-                    finish_utterance("flux_force_error")
+                    await finish_utterance("flux_force_error")
                 continue
             # With Nova-3 the same safeguard ends the turn here directly. The ¼-second early start applies to both (on a
             # real call Flux's EagerEndOfTurn mostly came together with EndOfTurn, giving no head start on its own).
@@ -1302,12 +1327,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 # The caller's words have not changed for a while and Deepgram never said the turn ended: end it
                 # ourselves rather than leave the caller waiting in silence.
                 logger.info("custom voice: no end of turn from Deepgram after %.1fs; answering: %s", quiet_for, heard_text[:120])
-                finish_utterance("nova_timeout")
+                await finish_utterance("nova_timeout")
                 continue
             if wait and quiet_for >= wait:
                 start_early()
 
-    def on_flux_turn(payload: Dict[str, Any]) -> None:
+    async def on_flux_turn(payload: Dict[str, Any]) -> None:
         """Deepgram Flux turn events. The transcript is the whole turn so far."""
         nonlocal early_reply
         nonlocal flux_turn_started, flux_turn_logged, forced_fallback_text, heard_changed_at
@@ -1340,9 +1365,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if payload.get("trigger") == "timeout":
                 logger.info("custom voice: Flux ended the turn after silence: %s", text[:120])
             utterance[:] = [text] if text else []
-            finish_utterance(f"flux_{payload.get('trigger') or 'model'}")
+            await finish_utterance(f"flux_{payload.get('trigger') or 'model'}")
 
-    def finish_utterance(trigger: str = "local") -> None:
+    async def finish_utterance(trigger: str = "local") -> None:
+        async with finish_lock:
+            await finish_utterance_locked(trigger)
+
+    async def finish_utterance_locked(trigger: str = "local") -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
         nonlocal turn_word_end
         semantic_prefetch.discard_pending()
@@ -1377,7 +1406,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
             save_progress()
             return
-        if pause_request(text):
+        if await asyncio.to_thread(pause_request, text):
             drop_reply(prepared)
             if reply_task and not reply_task.done():
                 reply_task.cancel()
@@ -1386,7 +1415,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             reply_task = asyncio.create_task(pause_for_caller(text))
             reply_task.add_done_callback(log_reply_failure)
             return
-        if not unanswered_text and not (reply_task and not reply_task.done()) and call_is_over(text, last_agent_text(memory.history())):
+        if not unanswered_text and not (reply_task and not reply_task.done()) and await asyncio.to_thread(call_is_over, text, last_agent_text(memory.history())):
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             drop_reply(prepared)
             transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
@@ -1412,8 +1441,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
         save_progress()
-        callback_candidate = call_forwarding.explicit_callback_request(text)
-        if call_sid and (call_forwarding.forwarding_on() or callback_candidate):  # cached switch/regex: no waiting here
+        # All calls use the same semantic routing, even with live forwarding off.
+        # Classification stays in the reply task, never in the STT event loop.
+        if call_sid:
             reply_task = asyncio.create_task(answer_or_forward(text, turn_ended_at, prepared, turn_timing))
             reply_task.add_done_callback(log_reply_failure)
             return
@@ -1447,9 +1477,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     record_words(payload.get("words"))
                     words = str(payload.get("transcript") or "").split()
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
-                    if bot_busy() and (len(words) >= 2 or pause_request(" ".join(words))) and payload.get("event") in {"Update", "StartOfTurn"}:
-                        await interrupt(force=pause_request(" ".join(words)))
-                    on_flux_turn(payload)
+                    if bot_busy() and payload.get("event") in {"Update", "StartOfTurn"}:
+                        pause = await asyncio.to_thread(pause_request, " ".join(words))
+                        if len(words) >= 2 or pause:
+                            await interrupt(force=pause)
+                    await on_flux_turn(payload)
                     continue
                 if kind in {"Error", "Warning"}:
                     logger.warning("custom voice: Deepgram %s %s: %s", kind.lower(), payload.get("code"), payload.get("description"))
@@ -1457,7 +1489,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if kind == "UtteranceEnd":
                     if float(payload.get("last_word_end") or 0) + 0.001 < latest_word_end:
                         continue  # A delayed gap signal from an older finalized segment; the caller has continued.
-                    finish_utterance("nova_utterance_end")
+                    await finish_utterance("nova_utterance_end")
                     continue
                 if kind != "Results":
                     continue
@@ -1474,11 +1506,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     # Deepgram can end a turn with an empty final transcript for a short word it showed in the partial
                     # one ("kitchen"): still end the turn, answering what it showed, instead of waiting forever.
                     if payload.get("is_final") and payload.get("speech_final") and heard_text and not bot_busy():
-                        finish_utterance("nova_empty_final")
+                        await finish_utterance("nova_empty_final")
                     continue
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
-                if bot_busy() and (len(text.split()) >= 2 or pause_request(text)):
-                    await interrupt(force=pause_request(text))
+                if bot_busy():
+                    pause = await asyncio.to_thread(pause_request, text)
+                    if len(text.split()) >= 2 or pause:
+                        await interrupt(force=pause)
                 # Start the knowledge search on what the caller has said so far (see brain_service.query_embedding).
                 nonlocal prefetched_at
                 if payload.get("is_final") or perf_counter() - prefetched_at > 0.4:
@@ -1490,7 +1524,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     utterance.append(text)
                     heard_changed(" ".join(utterance))
                     if payload.get("speech_final"):
-                        finish_utterance("nova_speech_final")
+                        await finish_utterance("nova_speech_final")
                 else:
                     heard_changed(" ".join([*utterance, text]))
             except Exception as error:

@@ -5,10 +5,23 @@ import asyncio
 import json
 import time
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from routers import custom_twilio_voice_api as custom
+
+
+@pytest.fixture(scope="module", autouse=True)
+def warm_semantic_decisions():
+    # Production warms these matrices before taking calls. Timing tests exercise
+    # the same steady-state path, excluding one-time model/classifier loading.
+    import turn_meaning
+    from meaning import Classifier
+    for classifier in vars(turn_meaning).values():
+        if isinstance(classifier, Classifier):
+            classifier.rank("hello")
 
 
 class FakeDeepgram:
@@ -58,14 +71,15 @@ class FakeDeepgram:
 
 
 def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0,
-             bridges=False, model_seconds=0.6, bridge_selector=None, logged=None):
+             bridges=False, model_seconds=0.6, bridge_selector=None, logged=None,
+             answer_text="Here is the answer.", caller="unknown"):
     starts, finished = [], []
 
     async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en"):
         starts.append((round(time.perf_counter() - t0, 2), text))
         try:
             await asyncio.sleep(model_seconds)
-            yield "Here is the answer."
+            yield answer_text
             finished.append(text)
         except asyncio.CancelledError:
             raise
@@ -116,7 +130,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     app.include_router(custom.router)
     t0 = time.perf_counter()
     with TestClient(app) as client, client.websocket_connect("/api/custom-voice/media") as ws:
-        ws.send_text(json.dumps({"event": "start", "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {}}}))
+        ws.send_text(json.dumps({"event": "start", "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {"caller": caller}}}))
         while True:  # like Twilio: report the greeting's playback marker once it has played
             message = json.loads(ws.receive_text())
             if message.get("event") == "mark":
@@ -178,6 +192,49 @@ def test_slow_bridge_classifier_does_not_delay_a_ready_answer(monkeypatch):
     assert "Here is the answer." in spoken
     assert "Let me check that for you." not in spoken
     assert starts[0][0] < 0.6
+
+
+def test_callback_then_ok_is_queued_once_without_chat_generation_or_more_questions(monkeypatch):
+    queued, spoken, logged = [], [], []
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
+
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "callback")
+    monkeypatch.setattr(custom.call_forwarding, "create_callback_outreach",
+                        lambda *args, **kwargs: queued.append(args) or "Human team")
+
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+
+    script = [(0.3, "Yeah. Someone call me later.", True, True),
+              (0.6, "OK.", True, True), (0.9, "Someone call me later.", True, True)]
+    starts, _ = run_call(monkeypatch, script, tts=tts, logged=logged, call_seconds=1.5, caller="+61412345678")
+    assert not starts
+    assert len(queued) == 1
+    assert "You're welcome." in spoken
+    assert not any("?" in line for line in spoken[1:])
+    assert [turn["action"] for turn in logged[-1]["voice_turn_timings"]] == ["callback_requested", "callback_ack", "callback_ack"]
+    assert all(turn["handoff_source"].startswith("semantic") for turn in logged[-1]["voice_turn_timings"])
+
+
+def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(monkeypatch):
+    spoken = []
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: True)
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
+    monkeypatch.setattr(custom.call_forwarding, "transfer", lambda *args: True)
+
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+
+    offer = "Would you like me to connect you with the team for full product details?"
+    script = [(0.2, "Can you help with this product?", True, True),
+              (0.9, "Yeah. Yeah. Please.", True, True)]
+    starts, _ = run_call(monkeypatch, script, tts=tts, model_seconds=0.05,
+                         answer_text=offer, call_seconds=1.8)
+    assert len(starts) == 1
+    assert custom.call_forwarding.CONNECTING_LINE in spoken
+    assert not any("back later" in line or "phone number" in line or "email" in line for line in spoken)
 
 
 def test_nova_fallback_preserves_the_newer_interim_after_a_final_prefix(monkeypatch):

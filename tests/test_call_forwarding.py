@@ -308,6 +308,27 @@ def test_close_tie_can_still_be_a_later_callback(monkeypatch):
     assert call_forwarding.handoff_intent("Can you arrange a call tomorrow so I can talk with him?") == "callback"
 
 
+@pytest.mark.parametrize("text, agent, queued, expected", [
+    ("Yeah. Yeah. Please.", "Would you like me to connect you with the team for full product details?", False, "live"),
+    ("OK.", "I've noted your callback request. The team will call you on this number.", True, "callback_ack"),
+    ("Yeah. Someone call me later.", "Would you like me to connect you now or have someone call you back later?", False, "callback"),
+    ("Now, please.", "Would you like me to connect you now or have someone call you back later?", False, "live"),
+    ("Yes, please.", "Would you like someone to call you back?", False, "callback"),
+    ("Yes, please.", "Would you like to connect now or have someone call you back later?", False, "unclear"),
+    ("No, thanks.", "Would you like me to connect you with the team?", False, "declined"),
+    ("Okay.", "Anything else?", False, ""),
+    ("Can you transfer me please?", "", False, "live"),
+    ("Can you transfer my call tomorrow?", "", False, "callback"),
+    ("Don't transfer me.", "", False, ""),
+    ("No. Can you transfer me now?", "", False, "live"),
+    ("What is the price of the basin?", "", False, None),
+    ("Yes.", "Would you like the basin sizes and finishes?", False, ""),
+])
+def test_handoff_replies_resolve_semantically_against_the_offer(text, agent, queued, expected):
+    decision = call_forwarding.contextual_handoff_intent(text, agent, queued)
+    assert (call_forwarding.handoff_intent(text) if decision is None and expected is not None else decision) == expected
+
+
 def test_explicit_request_to_take_current_call_is_live_transfer():
     assert call_forwarding.wants_person("Okay. No. I want someone to pick my call now.")
     assert call_forwarding.wants_person("No. Not more. Could you arrange a call to your")
@@ -335,3 +356,13 @@ def test_ambiguous_team_call_is_clarified_before_ringing():
     assert not call_forwarding.ambiguous_team_call("Can you arrange a call from your team now?")
     assert call_forwarding.wants_person("Could you link me with your team?")
     assert not call_forwarding.team_handoff_request("Can your team call me back later?")
+
+
+def test_non_handoff_wins_even_when_live_and_callback_scores_tie(monkeypatch):
+    from turn_meaning import HANDOFF_ACTION
+    monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda *args: [
+        ("other", 0.92), ("live", 0.65), ("callback", 0.64), ("unclear", 0.61)])
+    def unexpected(*args):
+        raise AssertionError("A non-handoff turn must not invoke timing adjudication")
+    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", unexpected)
+    assert call_forwarding.handoff_intent("Kitchen.") == ""

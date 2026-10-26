@@ -160,3 +160,28 @@ Production health must show 2026-10-26-voice-turn-repair-10 after deployment.
 Turn-boundary references:
 - https://developers.deepgram.com/docs/understand-endpointing-interim-results
 - https://developers.deepgram.com/docs/flux/configuration
+
+
+## Semantic transfer offers and callback state
+
+The 13:49 IST call accepted a live connection offer but was asked to choose now
+or later. After a later callback was queued, an acknowledgement reopened that
+same choice. Both voice paths now resolve replies against the offer's semantic
+meaning and retain completed callback state. Callback requests are queued once;
+acknowledgements do not create another handoff. Caller ID is reused when present,
+and live transfers do not require name, phone, or email collection.
+
+Handoff, product, model-choice and bridge intent decisions use semantic models
+and conversation state. Lexical intent shortcuts and the old keyword fallbacks
+have been removed from these paths. Semantic examples are warmed during startup.
+Contact parsing and catalogue entity search remain separate from intent routing.
+The fast model resolves ambiguous live/callback timing with a bounded request;
+it does not generate every non-product answer. Control confirmations are spoken
+directly and their routing/audio timings are recorded.
+
+Production health must show `2026-10-26-voice-turn-repair-11` after deployment.
+A fresh production call is needed to measure caller-perceived latency after
+this release; health and regression checks alone do not establish timing parity.
+
+Validation: all 409 backend tests passed locally, including semantic handoff,
+callback state, voice turn timing, and live-store answer regressions.

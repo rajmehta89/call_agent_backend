@@ -7,7 +7,6 @@ need editing when the products, prices or policies change.
 """
 
 import logging
-import re
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -21,6 +20,10 @@ EXAMPLES: Dict[str, List[str]] = {
         "I want to buy one.", "Do you sell those?", "Do you have anything cheaper?", "Tell me more about that product.",
         "What is it made of?", "I need the smaller one.", "Something to wash my hands in.", "Is it any good?",
         "What goes with it?", "Do you have it in a different colour?",
+        "I'm interested in a round basin.", "I'm interested in round Beijing.",
+        "So you don't have the round basin actually?", "Round basin.",
+        "I'm furnishing a new house and need a tub.", "I'd like to explore your range of products.",
+        "What about the prices for all kinds of those?", "What are the prices for all kinds of busy?",
     ],
     "order": [
         "Where is my order?", "Has my parcel shipped yet?", "Has it been posted yet?", "Has it been dispatched?",
@@ -38,11 +41,12 @@ EXAMPLES: Dict[str, List[str]] = {
     "none": [
         "Hello?", "Who am I speaking to?", "What time do you close?", "Where is your store?", "What's your phone number?",
         "Thanks, bye.", "Can someone call me back?", "My name is John.", "Yes.", "Okay.", "What does your company do?",
-        "Can I speak to a person?", "My email is john at gmail dot com.", "Are you a robot?", "Sorry, I didn't catch that.",
+        "Can I speak to a person?", "Can I talk to someone about a renovation?", "My email is john at gmail dot com.", "Are you a robot?", "Sorry, I didn't catch that.",
         # About the business itself (the knowledge base answers these, not the store's catalogue).
         "What services do you offer?", "Do you do installation?", "Can I become a trade partner?", "Are you open on weekends?",
         "Do you have a showroom I can visit?", "How long have you been in business?",
         # Off-topic chat any shop's caller might try: nothing in the store answers it.
+        "What is your company for?", "Yeah, so, uh, what is your company is for",
         "Who won the game last night?", "What's the weather like today?", "Tell me a joke.", "What's in the news?",
         "Who is the president?", "What's the score in the cricket?",
     ],
@@ -50,44 +54,13 @@ EXAMPLES: Dict[str, List[str]] = {
 from meaning import Classifier
 
 
-# Common shop categories cover catalogue cold start; a live store adds its own title/type vocabulary.
-_COMMON_PRODUCT_NOUNS = frozenset({
-    "basin", "sink", "mixer", "tap", "faucet", "shower", "bathtub", "bath", "toilet", "vanity", "tile",
-    "rangehood", "oven", "cooktop", "stove", "mirror", "cabinet", "tapware", "appliance", "fridge", "dishwasher",
-    "bench", "countertop", "furniture", "chair", "table", "sofa", "bed", "mattress", "lamp", "light", "curtain",
-    "door", "window", "paint", "flooring", "hardware", "accessory",
-})
-_PRODUCT_LOOKUP = re.compile(
-    r"\b(?:price|prices|pricing|cost|costs|stock|available|availability|size|sizes|dimension|dimensions|"
-    r"specification|specifications|details|options|range|recommend|cheaper|warranty|material)\b", re.I)
-_SHOPPING_INTEREST = re.compile(
-    r"\b(?:interested in|looking for|want to (?:buy|get|see)|need to buy|do you (?:have|sell|stock)|"
-    r"have you got|can i get)\b", re.I)
-_FOLLOW_UP = re.compile(
-    r"\b(?:that|those|these|it|they|one|ones|price|prices|pricing|cost|costs|cheaper|available|stock|size|details|options)\b", re.I)
-
-
 def product_reference(text: str) -> bool:
-    """Whether the caller named a likely product category, including during Shopify catalogue cold start."""
-    lowered = str(text or "").lower()
-    nouns = set(_COMMON_PRODUCT_NOUNS)
-    try:
-        from shopify_service import shopify_service
-        nouns.update(shopify_service.catalog_words())
-        nouns.update(shopify_service.product_kinds())
-    except Exception:
-        pass
-    return any(re.search(rf"\b{re.escape(noun)}s?\b", lowered) for noun in nouns if noun)
-
-
-def _lexical_product_request(text: str, earlier: str = "") -> bool:
-    current = str(text or "")
-    prior = str(earlier or "")
-    if product_reference(current):
-        return True
-    if _SHOPPING_INTEREST.search(current):
-        return True
-    return bool(product_reference(prior) and (_PRODUCT_LOOKUP.search(current) or _FOLLOW_UP.search(current)))
+    """Recognise a product discussion from its meaning, including ASR wording."""
+    ranked = rank(text)
+    if not ranked:
+        return False
+    scores = dict(ranked)
+    return scores["product"] >= STORE.min_score and scores["product"] >= scores["none"]
 
 # Two kinds this close in meaning (0.06) are both fetched, the model uses whichever fits; below 0.55 nothing matches.
 STORE = Classifier("store intent", EXAMPLES, min_score=0.55, close_call=0.06)
@@ -95,7 +68,7 @@ STORE = Classifier("store intent", EXAMPLES, min_score=0.55, close_call=0.06)
 
 def rank(text: str, earlier: str = "") -> Optional[List[Tuple[str, float]]]:
     """Each kind of request with how close the caller's words are to it, best first; None when the local model is
-    unavailable (the caller then falls back to word matching)."""
+    unavailable (the caller is never routed using keyword rules)."""
     return STORE.rank(text, earlier)
 
 
@@ -106,8 +79,6 @@ def clearly_wanted(text: str, earlier: str = "") -> bool:
     """True only when a store request is the best match and clearly ahead of "none". wanted() fetches on a close call
     as well (better too much data than too little); saying "let me check" needs this firmer answer, so an off-topic
     question ("who won the football?") is answered straight away."""
-    if _lexical_product_request(text, earlier):
-        return True
     ranked = rank(text, earlier)
     if not ranked:
         return False
@@ -123,9 +94,7 @@ def wanted(text: str, earlier: str = "") -> Optional[List[str]]:
     meaning model is unavailable."""
     kinds = STORE.close(text, earlier)
     if kinds is None:
-        return ["product"] if _lexical_product_request(text, earlier) else None
+        return None
     chosen = [kind for kind in kinds if kind != "none"]
-    if "product" not in chosen and "order" not in chosen and _lexical_product_request(text, earlier):
-        chosen.insert(0, "product")
     logger.debug("store intent %r -> %s", text[:60], chosen or "none")
     return chosen

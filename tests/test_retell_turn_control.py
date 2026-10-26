@@ -159,3 +159,54 @@ def test_slow_short_retell_reply_does_not_receive_generic_filler(app, monkeypatc
                           "transcript": [{"role": "user", "content": "No. So so."}]})
         assert socket.receive_json()["content"] == "Go ahead."
         assert socket.receive_json()["content_complete"] is True
+
+
+def test_callback_then_ok_does_not_reopen_handoff_or_invoke_model(app, monkeypatch):
+    queued = []
+    monkeypatch.setattr(retell.call_forwarding, "requested_agent", lambda *args: None)
+    monkeypatch.setattr(retell.call_forwarding, "create_callback_outreach",
+                        lambda *args, **kwargs: queued.append(args) or "Human team")
+    monkeypatch.setattr(retell.transfer_service, "request_transfer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(retell.transfer_service, "update_transfer", lambda *args, **kwargs: None)
+
+    async def no_model(*args, **kwargs):
+        raise AssertionError("The callback confirmation is handled directly")
+        yield
+
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda *args: "callback")
+    monkeypatch.setattr(retell, "_stream_reply", no_model)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback-state") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "call_details", "call": {"from_number": "+61412345678"}})
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "Someone call me later."}]})
+        queued_reply = socket.receive_json()["content"]
+        assert "phone number" not in queued_reply and "using this number" in queued_reply
+        socket.send_json({"interaction_type": "response_required", "response_id": 2,
+                          "transcript": [{"role": "assistant", "content": queued_reply},
+                                         {"role": "user", "content": "OK."}]})
+        assert socket.receive_json()["content"] == "You're welcome."
+        assert len(queued) == 1
+
+
+def test_yes_to_live_offer_does_not_ask_now_or_later_again(app, monkeypatch):
+    monkeypatch.setattr(retell.call_forwarding, "forwarding_on", lambda: True)
+    monkeypatch.setattr(retell.call_forwarding, "twilio_call_for_retell",
+                        lambda *args: {"call_sid": "CA_test", "caller": "+61412345678"})
+    monkeypatch.setattr(retell.call_forwarding, "transfer", lambda *args, **kwargs: True)
+
+    def no_classifier(*args):
+        raise AssertionError("Acceptance of a live transfer offer is already explicit")
+
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", no_classifier)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-offer-accepted") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "assistant", "content": "Would you like me to connect you with the team for full details?"},
+                                         {"role": "user", "content": "Yeah. Yeah. Please."}]})
+        response = socket.receive_json()
+        assert response["content"] == retell.call_forwarding.CONNECTING_LINE
+        assert response["content_complete"] is True

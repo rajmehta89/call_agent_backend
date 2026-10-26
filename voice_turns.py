@@ -12,14 +12,6 @@ import os
 import re
 from typing import Dict, List, Optional
 
-_QUESTION_START = re.compile(
-    r"^\s*(?:(?:and|so|but|okay|ok|um|uh|also|then|sorry|hey|hi|yeah|yes|well)[\s,.]+)*"
-    r"(?:what|what's|whats|how|why|when|where|which|who|whose|do|does|did|can|could|would|will|is|are|was|were|have|has|"
-    r"should|tell|explain|any|may|price|cost)\b",
-    re.I,
-)
-
-
 def fast_voice_model() -> str:
     """VOICE_FAST_MODEL: the small model for turns without a question (empty = always the main model)."""
     return os.getenv("VOICE_FAST_MODEL", "").strip()
@@ -27,39 +19,21 @@ def fast_voice_model() -> str:
 
 def needs_facts(caller_text: str) -> bool:
     """True when the caller asked something (a question needs the main model and the business knowledge)."""
-    text = caller_text.strip()
-    if not text or "?" in text:
-        return True
-    return any(_QUESTION_START.match(part) for part in re.split(r"(?<=[.!])\s+", text) if part.strip())
-
-
-# Words that make up a pure acknowledgement or goodbye ("Okay, cool, thanks", "No, that's all. Bye.").
-_ACK_WORDS = {"yes", "yeah", "yep", "yup", "no", "nope", "nah", "ok", "okay", "cool", "sure", "right", "alright", "fine", "good",
-              "great", "nice", "perfect", "awesome", "thanks", "thank", "you", "cheers", "bye", "goodbye", "see", "ya", "that's",
-              "thats", "it's", "its", "all", "nothing", "else", "correct", "sounds", "sorry", "hmm", "mm", "uh", "um", "oh",
-              "so", "and", "that", "is", "it", "for", "now", "much", "very", "got", "i", "hello", "hi", "there", "lovely"}
-# The agent just asked for one of the caller's details (name, number, email, a time): the reply is that detail.
-_ASKED_FOR_DETAILS = re.compile(r"\b(?:name|number|phone|mobile|email|e-mail|spell|digit|day|time|suburb|postcode|address|order)\b", re.I)
+    from turn_meaning import CALLER_TURN
+    return CALLER_TURN.best(caller_text) not in {"acknowledge", "closing", "detail"}
 
 
 def is_acknowledgement(caller_text: str) -> bool:
-    if re.fullmatch(r"(?:[\s,.!?]*(?:yes|yeah|yep|sure|okay|ok)[\s,.!?]*)?"
-                    r"(?:i(?: would|'d) love to|that would be (?:great|good)|please do)[\s,.!?]*", caller_text.lower()):
-        return True
-    words = re.findall(r"[a-z']+", caller_text.lower())
-    return bool(words) and len(words) <= 8 and all(word in _ACK_WORDS for word in words)
+    from turn_meaning import CALLER_TURN
+    return CALLER_TURN.best(caller_text) in {"acknowledge", "closing"}
 
 
 def pause_request(caller_text: str) -> bool:
-    """An explicit interruption alone, never an apology followed by a question."""
-    words = re.findall(r"[a-z']+", caller_text.lower())
-    allowed = {"sorry", "stop", "wait", "hold", "on", "hang", "please", "a", "second", "one", "moment",
-               "yeah", "yes", "no", "uh", "um", "just", "excuse", "me", "i'm"}
-    return bool(words) and len(words) <= 12 and set(words) <= allowed and (
-        any(word in {"sorry", "stop", "wait"} for word in words)
-        or "hold on" in caller_text.lower() or "hang on" in caller_text.lower()
-        or "excuse me" in caller_text.lower()
-    )
+    """Recognise a request to pause from the whole caller turn."""
+    from turn_meaning import PAUSE_TURN
+    ranked = PAUSE_TURN.rank(caller_text)
+    return bool(ranked and ranked[0][0] == "pause" and ranked[0][1] >= PAUSE_TURN.min_score
+                and ranked[0][1] - ranked[1][1] >= PAUSE_TURN.close_call)
 
 
 def pause_reply(caller_text: str) -> str:
@@ -75,8 +49,6 @@ def choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
     if not fast:
         return None
     is_simple = _simple_turn(caller_text, agent_text)
-    if is_simple is None:  # the meaning model is unavailable: decide from words
-        return _keyword_choose_voice_model(caller_text, agent_text)
     return fast if is_simple else None
 
 
@@ -149,34 +121,12 @@ def _simple_turn(caller_text: str, agent_text: str = "") -> Optional[bool]:
     return False
 
 
-def _keyword_choose_voice_model(caller_text: str, agent_text: str = "") -> Optional[str]:
-    """Fallback for choose_voice_model when the local meaning model cannot load."""
-    fast = fast_voice_model()
-    if not fast or needs_facts(caller_text) or _ORDER_TALK.search(f"{caller_text} {agent_text or ''}"):
-        return None  # an order number or email for an order is looked up in the store: main model, with the lookup
-    if _ASKED_FOR_DETAILS.search(agent_text or ""):
-        return fast  # the name, number or email the agent just asked for
-    if is_acknowledgement(caller_text):
-        # "Yeah." / "No." answering the agent's own question needs real understanding of what was asked (the small
-        # model replied "It sounds like you're looking for something,"): the main model. Goodbyes and thanks stay fast.
-        if (agent_text or "").strip().endswith("?") and not _CLOSING.search(caller_text):
-            return None
-        return fast
-    return None
-
-
-_FAREWELL = re.compile(r"\b(?:good)?bye\b|\bhave a (?:great|good|lovely|nice|wonderful) (?:day|one|evening|night|weekend|afternoon)\b|"
-                       r"\btake care\b", re.I)
-
-
-_AFFIRM = re.compile(r"^\W*(?:yes|yeah|yep|yup|sure|ok|okay|alright|please|go ahead|sounds good)\b", re.I)
-
-
 def yes_to_offer_note(caller_text: str, agent_text: str) -> str:
     """A note for this turn when the caller said yes to what we offered ("Would you like the sizes or the stock?"
     "Yeah."). From real calls: the model answered such a "Yeah" by repeating its previous answer almost word for word."""
     question = agent_question(agent_text)
-    if not question.endswith("?") or not is_acknowledgement(caller_text) or not _AFFIRM.match(caller_text):
+    from turn_meaning import HANDOFF_REPLY
+    if not question.endswith("?") or HANDOFF_REPLY.best(caller_text) != "accept":
         return ""
     if detail_asked(agent_text) not in ("", "order"):
         return ""  # "Can I take your name?" "Yes." is handled by the details rules
@@ -198,7 +148,8 @@ def search_text(caller_text: str, messages: List[Dict[str, str]]) -> str:
 def agent_said_goodbye(agent_text: str) -> bool:
     """Our own last reply was a farewell ("Have a great day, Raj. Goodbye."), not a question."""
     text = (agent_text or "").strip()
-    return bool(text) and "?" not in text and bool(_FAREWELL.search(text))
+    from turn_meaning import AGENT_FAREWELL
+    return bool(text) and AGENT_FAREWELL.best(text) == "farewell"
 
 
 def call_is_over(caller_text: str, agent_text: str) -> bool:
@@ -213,8 +164,6 @@ def call_is_over(caller_text: str, agent_text: str) -> bool:
     return CALLER_TURN.best(kind_of_turn_text(caller_text)) == "closing"
 
 
-_ORDER_TALK = re.compile(r"\border(?:s|ed)?\b", re.I)
-_CLOSING = re.compile(r"\b(?:bye|goodbye|thanks|thank|cheers|that's all|thats all|nothing else)\b", re.I)
 
 
 # ---- phone numbers -------------------------------------------------------------------------------------------
@@ -350,7 +299,6 @@ class NumberSpeaker:
 
 # ---- checking the caller's details -----------------------------------------------------------------------------
 
-_PHONE_CONTEXT = re.compile(r"\b(?:number|phone|mobile|cell|call me|reach me|contact|digits)\b", re.I)
 _EMAIL_CONTEXT = re.compile(r"@|\b(?:e-?mail|gmail|yahoo|hotmail|outlook|icloud|bigpond|dot com|dot au)\b", re.I)
 _EMAIL = re.compile(r"^[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}$")
 
@@ -565,8 +513,6 @@ def about_phone(caller_text: str, agent_text: str = "") -> bool:
     from turn_meaning import AGENT_ASKED, CONTACT
     said = CONTACT.best(caller_text)
     asked = AGENT_ASKED.best(agent_text) if (agent_text or "").strip() else ""
-    if said is None or asked is None:  # the meaning model is unavailable: decide from words
-        return bool(_PHONE_CONTEXT.search(caller_text) or _PHONE_CONTEXT.search(agent_text or ""))
     return said == "phone" or (asked == "phone" and said != "email")
 
 
@@ -820,18 +766,6 @@ LOOKUP_BRIDGES = ("Let me check that for you.", "One sec, I'll have a look.", "L
 ALL_BRIDGES = (*SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES,
                *STATUS_PHRASES, *LOOKUP_BRIDGES)
 
-_SEARCH = re.compile(r"\b(?:looking for|look for|need (?:a|an|some|something)|want (?:a|an|some|something)|recommend\w*|suggest\w*|"
-                     r"best|suit|which (?:one|ones|basin|tap|style)|what kind|what type|options? for|something for|ideas?)\b", re.I)
-_PROBLEM = re.compile(r"\b(?:problem|issue|trouble|not working|doesn't work|does not work|stopped working|struggling|stuck|"
-                      r"can't figure|confused|not sure (?:how|what|which))\b", re.I)
-# Upset, urgent or money/damage matters: no casual acknowledgement, the answer itself must handle it.
-_SENSITIVE = re.compile(r"\b(?:broken|damaged|faulty|leak\w*|flood\w*|refund|complain\w*|angry|upset|terrible|worst|urgent|"
-                        r"emergency|wrong (?:item|order|product)|never (?:arrived|came)|missing|scam|lawyer|unhappy|disappointed)\b", re.I)
-_CLARIFY = re.compile(r"\b(?:what do you mean|what does that mean|what you mean|meaning|sorry\?|pardon|say that again|say again|"
-                      r"repeat|didn't (?:get|catch|hear|understand)|don't understand|what was that|come again)\b", re.I)
-_REQUEST = re.compile(r"\b(?:call me|call back|callback|ring me|arrange|book|meeting|speak to|talk to|someone|quote|contact me)\b", re.I)
-# The caller answering the agent's question ("Yes, please go ahead", "No, that's fine"): reply directly.
-_ANSWER_START = re.compile(r"^\s*(?:yes|yeah|yep|yup|no|nope|nah|okay|ok|sure|alright|fine)\b", re.I)
 _bridge_turn = 0
 
 
@@ -880,24 +814,26 @@ def bridge_kind(caller_text: str, earlier: str = "") -> str:
     words = re.findall(r"[a-z']+", caller_text.lower())
     if len(words) < 4:
         return ""  # "Hello?", "Yes", "So what?": answer straight away
-    if pause_request(caller_text) or is_acknowledgement(caller_text) or _SENSITIVE.search(caller_text):
+    if pause_request(caller_text) or is_acknowledgement(caller_text):
         return ""
-    from turn_meaning import CALLER_TURN
+    from turn_meaning import CALLER_TURN, CONTACT
     turn_text = kind_of_turn_text(caller_text)
     kind = CALLER_TURN.best(turn_text)
-    if kind is None:  # the meaning model is unavailable: decide from words
-        return _keyword_bridge_kind(caller_text, earlier)
+    if kind is None:
+        return ""  # Do not invent an intent when the semantic model is unavailable.
     if kind == "request" and not _clear_lead(CALLER_TURN.rank(turn_text)):
         # "What's your phone number?" scored request, detail and question within 0.01: "Yeah, I can sort that out."
         # before a plain answer sounded wrong. Only a clear request ("Can someone call me back?") gets one.
         kind = "question"
     if kind in ("clarify", "request", "problem"):
         return kind
-    if kind not in ("acknowledge", "closing", "sensitive") and not _EMAIL_CONTEXT.search(caller_text) and store_lookup_runs(caller_text, earlier):
+    if kind not in ("acknowledge", "closing", "sensitive") and CONTACT.best(caller_text) != "email" and store_lookup_runs(caller_text, earlier):
         return "lookup"  # A shopping statement can be labelled "detail" even though it starts a catalogue lookup.
+    if kind == "compound":
+        return "detail"
     if kind in ("", "acknowledge", "closing", "detail", "sensitive"):
         return ""
-    if len(words) >= 22 or len(re.findall(r"\b(?:and|also|plus)\b", caller_text.lower())) >= 2:
+    if len(words) >= 22:
         return "detail"  # a long message with several things in it
     if kind == "search":
         return "search"
@@ -909,31 +845,6 @@ CLEAR_LEAD = 0.03  # how far the best kind of turn must lead the next one to be 
 
 def _clear_lead(ranked) -> bool:
     return bool(ranked) and (len(ranked) < 2 or ranked[0][1] - ranked[1][1] >= CLEAR_LEAD)
-
-
-def _keyword_bridge_kind(caller_text: str, earlier: str = "") -> str:
-    """Fallback for bridge_kind when the local meaning model cannot load."""
-    words = re.findall(r"[a-z']+", caller_text.lower())
-    if is_acknowledgement(caller_text) or len(words) < 4:
-        return ""  # "Hello?", "Yes", "So what?": answer straight away
-    if _SENSITIVE.search(caller_text):
-        return ""  # upset, urgent, damage or money: no casual filler
-    if _ANSWER_START.match(caller_text) and len(words) <= 14 and "?" not in caller_text:
-        return ""  # answering the agent's question: reply straight away
-    if _CLARIFY.search(caller_text):
-        return "clarify"
-    if _REQUEST.search(caller_text):
-        return "request"
-    if _PROBLEM.search(caller_text):
-        return "problem"
-    if len(words) >= 22 or len(re.findall(r"\b(?:and|also|plus)\b", caller_text.lower())) >= 2:
-        return "detail"
-    if _SEARCH.search(caller_text):
-        return "search"
-    if needs_facts(caller_text):
-        # A simple question the knowledge answers comes quickly enough; a live store lookup takes longer.
-        return "lookup" if store_lookup_runs(caller_text, earlier) else ""
-    return "statement"
 
 
 _KIND_PHRASES = {"search": SEARCH_BRIDGES, "problem": PROBLEM_BRIDGES, "detail": DETAIL_BRIDGES, "statement": STATEMENT_BRIDGES,
@@ -971,10 +882,8 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     # Full knowledge questions sometimes run slowly too. Short replies, contact details and unfinished
     # fragments never get a generic status just because a provider is slow.
     point = main_sentence(caller_text)
-    unfinished = not point.endswith("?") and re.search(
-        r"\b(?:about|the|a|an|and|or|to|for|with|your|my|because|if)[.!]?$", point, re.I)
-    if (len(point.split()) >= 6 and _QUESTION_START.match(point) and not _EMAIL_CONTEXT.search(point)
-            and not _SENSITIVE.search(point) and not unfinished):
+    from turn_meaning import CALLER_TURN, WAIT_QUESTION
+    if len(point.split()) >= 6 and CALLER_TURN.best(point) == "question" and WAIT_QUESTION.best(point) == "complete":
         return status_phrase(recent)
     return ""
 

@@ -97,11 +97,17 @@ class Classifier:
         """Every kind with its score (the closest example of that kind), best first. `earlier` (the turn before) is
         also tried, joined to this one, so a follow-up is read in its context. None when the model is unavailable."""
         text = (text or "").strip()
-        if not text or not self._ready():
+        if not text:
             return None
-        probes = [text] + ([f"{earlier.strip()} {text}"] if (earlier or "").strip() else [])
-        probe_vectors = vectors(probes)
-        if probe_vectors is None:
+        try:
+            if not self._ready():
+                return None
+            probes = [text] + ([f"{earlier.strip()} {text}"] if (earlier or "").strip() else [])
+            probe_vectors = vectors(probes)
+            if probe_vectors is None:
+                return None
+        except Exception as error:
+            logger.warning("%s semantic decision unavailable: %s", self.name, type(error).__name__)
             return None
         scores: Dict[str, float] = {}
         for weight, vector in zip((1.0, earlier_weight), probe_vectors):

@@ -376,9 +376,21 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
     except Exception:
         knowledge, business, channel, caller = [], "", {}, ""
     custom = agent_config.get_voice_prompt()
+    handoff_rules = (
+        "\n\n## Call-system handoff rules\n"
+        "Live transfers are handled by the call system. When the caller accepts your offer to connect them now, "
+        "the system connects them; do not ask a second now-versus-later question. Never require their name, phone "
+        "number or email before a live transfer. For callbacks, collect only a missing reachable phone number; "
+        "a name and email are optional and must not delay the request. After the system confirms a callback "
+        "request, do not offer the same transfer choice again when the caller says okay or thanks."
+    )
+    if phone and re.fullmatch(r"\+?[0-9 ()-]{8,}", phone):
+        handoff_rules += " A reachable caller-ID phone number is already available. Use it for the callback unless the caller asks for a different number; do not ask them to provide or reconfirm it."
+    else:
+        handoff_rules += " Caller ID is unavailable. Ask for a reachable number only if the caller requests a callback and has not already supplied one."
     if custom:
-        return _business_voice_prompt(custom, caller, phone, knowledge, summary)
-    return _voice_prompt(business, channel, caller, phone, knowledge, summary)
+        return _business_voice_prompt(custom, caller, phone, knowledge, summary) + handoff_rules
+    return _voice_prompt(business, channel, caller, phone, knowledge, summary) + handoff_rules
 
 
 STORE_LOOKUP_SECONDS = float(os.getenv("VOICE_STORE_LOOKUP_SECONDS", "2.5"))  # never hold a reply longer for Shopify
@@ -391,12 +403,13 @@ def _no_lookup_turn(caller_text: str) -> bool:
     from voice_turns import kind_of_turn_text
     if pause_request(caller_text) or is_acknowledgement(caller_text):
         return True
-    generic = kind_of_turn_text(caller_text).lower().strip(" .?!—")
-    generic = re.sub(r"^(?:(?:yeah|yes|okay|ok|so|uh|um|well)[\s,.]+)+", "", generic)
-    if re.fullmatch(r"(?:what (?:is|does)|tell me about) your company(?: is)?(?: for| do| about)?", generic):
-        return True  # a business introduction needs the knowledge, not a live catalogue/order request
     try:
-        return CALLER_TURN.best(kind_of_turn_text(caller_text)) in {"clarify", "acknowledge", "closing"}
+        generic = kind_of_turn_text(caller_text)
+        kind = CALLER_TURN.best(generic)
+        if kind in {"clarify", "acknowledge", "closing"}:
+            return True
+        import store_intent
+        return kind == "question" and store_intent.wanted(generic) == []
     except Exception:
         return False
 
@@ -720,21 +733,12 @@ class SpokenReplyGuard:
         return out
 
 
-_TRAILING_CONNECTORS = {"the", "a", "an", "and", "or", "but", "of", "for", "to", "with", "about", "in", "on", "at", "your", "my",
-                        "that", "which", "what", "is", "are", "do", "does", "can", "if", "so", "because", "like", "um", "uh"}
-
-
 def sounds_unfinished(text: str) -> bool:
-    """The caller paused mid-sentence: no closing punctuation, or the last word is one a sentence can't end on. A
-    question mark means the speech-to-text heard a finished question, even when it ends on such a word ("what is it
-    for?", "who is it by?"): answering those at once saves the wait."""
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if stripped.endswith("?"):
-        return False
-    words = re.findall(r"[a-z']+", stripped.lower())
-    return stripped[-1] not in ".!" or (bool(words) and words[-1] in _TRAILING_CONNECTORS)
+    """Whether the caller's meaning still needs a continuation."""
+    from turn_meaning import TURN_COMPLETION
+    ranked = TURN_COMPLETION.rank(text)
+    return bool(ranked and ranked[0][0] == "unfinished" and ranked[0][1] >= TURN_COMPLETION.min_score
+                and ranked[0][1] - ranked[1][1] >= 0.04)
 
 
 def unfinished_wait_seconds() -> float:
@@ -848,7 +852,7 @@ async def _stream_reply(
             asyncio.to_thread(check_places),
             asyncio.to_thread(prepare_question),
         )
-    if not reminder and sounds_unfinished(caller_text):
+    if not reminder and await asyncio.to_thread(sounds_unfinished, caller_text):
         # Preprocessing already gave the caller time to continue. Only wait for
         # the remainder, instead of adding another full pause after that work.
         remaining = unfinished_wait_seconds() - (perf_counter() - request_started)
@@ -1197,7 +1201,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             ]
             transfer_service.append_message(call_id, "user", caller_text)
 
-        if caller_text and pause_request(caller_text):
+        if caller_text and await asyncio.to_thread(pause_request, caller_text):
             reply = pause_reply(caller_text)
             await send_event({"response_type": "response", "response_id": response_id,
                               "content": reply, "content_complete": True})
@@ -1207,14 +1211,19 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         streamed = False
         if caller_text:
-            semantic_started = perf_counter()
-            await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
-            timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
-            _trace(f"retell_semantic_prepared call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - semantic_started) * 1000:.0f}")
-            transfer_intent, ending = await asyncio.gather(
-                asyncio.to_thread(call_forwarding.handoff_intent, caller_text),
-                asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)),
-            )
+            direct = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, caller_text, last_agent_text(transcript), callback_requested)
+            timing["handoff_source"] = "semantic_context" if direct is not None else "semantic"
+            if direct in {"live", "callback", "callback_ack", "declined", "unclear"}:
+                transfer_intent, ending = direct, False
+            else:
+                semantic_started = perf_counter()
+                await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
+                timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
+                _trace(f"retell_semantic_prepared call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - semantic_started) * 1000:.0f}")
+                transfer_intent, ending = await asyncio.gather(
+                    asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if direct is None else asyncio.sleep(0, result=direct),
+                    asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)),
+                )
         else:
             transfer_intent, ending = "", False
         _trace(f"retell_turn_intent call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - turn_started) * 1000:.0f}")
@@ -1227,12 +1236,20 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             return
         if event.get("interaction_type") == "reminder_required" and not caller_text:
             reply = "Is there anything else I can help you with?"
+        elif event.get("interaction_type") == "response_required" and transfer_intent in {"callback_ack", "declined"}:
+            reply = "You're welcome." if transfer_intent == "callback_ack" else "Of course."
+            timing["action"] = transfer_intent
         elif event.get("interaction_type") == "response_required" and caller_text and call_forwarding.forwarding_on()                 and call_forwarding.twilio_call_for_retell(call_id) and transfer_intent == "live":
             # Call forwarding is on and the caller asked for a person: say so, then ring the team once it has been said.
             reply = call_forwarding.CONNECTING_LINE
             twilio_call = call_forwarding.twilio_call_for_retell(call_id) or {}
             handoff_pending = True
+            callback_requested = False
             asyncio.create_task(handoff_to_team(twilio_call.get("call_sid", ""), twilio_call.get("caller") or caller_number, caller_text))
+        elif (event.get("interaction_type") == "response_required" and callback_requested
+              and (transfer_intent in {"live", "callback"} or specific_agent)):
+            reply = "Your callback request is already with the team."
+            timing["action"] = "callback_ack"
         elif event.get("interaction_type") == "response_required" and caller_text and (
             transfer_intent in {"live", "callback"} or specific_agent
         ):
@@ -1250,12 +1267,14 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 caller_text,
                 call_id,
                 specific_agent.get("name") if specific_agent else "",
-                f"The caller asked to speak with a specific team member, but a live transfer was not available. Please follow up.",
+                "The caller requested a callback. Please follow up using the caller's phone number.",
                 contact_email=contact_email_from_messages(transcript),
             )
             transfer_service.update_transfer(call_id, "requested", destination)
             _trace(f"retell_human_callback_requested call={call_id} response_id={response_id}")
-            reply = f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
+            reply = (f"I have marked your request for {destination}. Our team will contact you using this number as soon as possible."
+                     if re.fullmatch(r"\+?[0-9 ()-]{8,}", caller_number)
+                     else f"I have marked your request for {destination}. What phone number should the team use?")
         else:
             answer_parts: List[str] = []
             reminder = event.get("interaction_type") == "reminder_required"

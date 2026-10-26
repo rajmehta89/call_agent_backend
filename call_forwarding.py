@@ -209,13 +209,8 @@ def requested_agent(caller_text: str, settings: Optional[Dict[str, Any]] = None)
 
 
 def explicit_callback_request(caller_text: str) -> bool:
-    """Fast, high-confidence callback phrases that should work with forwarding disabled too."""
-    text = re.sub(r"[^a-z0-9]+", " ", str(caller_text or "").lower()).strip()
-    return bool(re.search(
-        r"\b(?:call|ring|phone|contact|get back to)\b.{0,48}\b(?:back|later|tomorrow|today|me|us)\b|"
-        r"\b(?:callback|call back|ring back)\b",
-        text,
-    ))
+    """Semantic callback check, including when live forwarding is disabled."""
+    return handoff_intent(caller_text) == "callback"
 
 
 def assign_lead_to_requested_agent(
@@ -379,7 +374,13 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
     # Embeddings sometimes put "arrange a call now" and "arrange a call tomorrow"
     # almost on top of each other. Ask a small language model to resolve only
     # that close live/callback tie, preserving the rest of the fast classifier.
-    if max(live, callback) >= HANDOFF_ACTION.min_score and abs(live - callback) <= 0.02 and unclear <= max(live, callback) + 0.03:
+    if (max(live, callback) >= HANDOFF_ACTION.min_score and max(live, callback) >= other + 0.02
+            and abs(live - callback) <= 0.02 and unclear <= max(live, callback) + 0.03):
+        from turn_meaning import HANDOFF_REPLY
+        replies = HANDOFF_REPLY.rank(caller_text)
+        if (replies and replies[0][0] in {"live", "callback"} and replies[0][1] >= 0.85
+                and replies[0][1] - replies[1][1] >= 0.07):
+            return replies[0][0]
         decided = _adjudicate_handoff(caller_text, earlier)
         if decided:
             return decided
@@ -396,15 +397,46 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
     return result
 
 
+def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_requested: bool = False) -> Optional[str]:
+    """Resolve the caller's meaning against our offer and completed callback state.
+
+    Run off the event loop. None leaves substantive requests to handoff_intent;
+    an empty string means no new handoff. No lexical intent rules are used.
+    """
+    from turn_meaning import HANDOFF_OFFER, HANDOFF_REPLY, AGENT_ASKED
+    from meaning import vectors
+    try:
+        vectors([part for part in (caller_text, agent_text) if part.strip()])
+    except Exception:
+        return None
+    ranked = HANDOFF_REPLY.rank(caller_text)
+    if not ranked or ranked[0][1] < HANDOFF_REPLY.min_score or ranked[0][1] - ranked[1][1] < HANDOFF_REPLY.close_call:
+        return None
+    reply = ranked[0][0]
+    if reply not in {"accept", "decline", "live", "callback"}:
+        return None
+    if callback_requested and reply == "accept":
+        # Agreement is not a phone number when we still need a reachable number.
+        return "" if AGENT_ASKED.best(agent_text) == "phone" else "callback_ack"
+    offer = HANDOFF_OFFER.best(agent_text) if agent_text else "other"
+    if offer not in {"live", "callback", "choice"}:
+        return "" if reply in {"accept", "decline"} else None
+    if reply == "decline":
+        return "declined"
+    if reply in {"live", "callback"}:
+        return reply
+    return "unclear" if offer == "choice" else offer
+
+
 @lru_cache(maxsize=256)
 def _adjudicate_handoff(caller_text: str, earlier: str = "") -> str:
     """Resolve an embedding tie using the actual caller wording and context."""
     try:
         from ai_services import AIServices
         services = AIServices()
-        model = os.getenv("HANDOFF_CLASSIFIER_MODEL") or ("openai/gpt-4.1-mini" if services.provider == "openrouter" else "gpt-4.1-mini")
+        model = os.getenv("HANDOFF_CLASSIFIER_MODEL") or os.getenv("VOICE_FAST_MODEL") or ("openai/gpt-4.1-mini" if services.provider == "openrouter" else "gpt-4.1-mini")
         message = f"Earlier caller request: {earlier}\nCurrent caller turn: {caller_text}" if earlier else caller_text
-        response = services.openai_client.with_options(timeout=6).chat.completions.create(
+        response = services.openai_client.with_options(timeout=2, max_retries=0).chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "Classify whether the caller wants to speak with a human team member. "

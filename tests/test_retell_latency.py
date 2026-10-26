@@ -66,7 +66,7 @@ def test_unfinished_pause_counts_preprocessing_time(monkeypatch, elapsed, expect
 
     async def run():
         return "".join([chunk async for chunk in retell._stream_reply(
-            services, [{"role": "user", "content": "What is Home DFO for—"}], "unknown", "test-call", 1, started_at=10)])
+            services, [{"role": "user", "content": "Can you tell me about the."}], "unknown", "test-call", 1, started_at=10)])
 
     assert "bathroom products" in asyncio.run(run())
     assert len(prompts) == 1  # reuse the prompt built during the checks

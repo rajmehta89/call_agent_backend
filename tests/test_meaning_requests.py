@@ -91,3 +91,11 @@ def test_duplicate_inputs_keep_the_requested_order(monkeypatch):
     monkeypatch.setattr(brain_module.brain_service, "_embeddings",
                         lambda texts: ([[1.0, 0.0] if text == "one" else [0.0, 1.0] for text in texts], "openrouter"))
     np.testing.assert_allclose(meaning.vectors(["one", "two", "one"]), [[1, 0], [0, 1], [1, 0]])
+
+
+def test_semantic_provider_failure_returns_unavailable_without_guessing(monkeypatch):
+    classifier = meaning.Classifier("unavailable", {"live": ["connect now"], "callback": ["call later"]})
+    def unavailable(*args):
+        raise RuntimeError("provider unavailable")
+    monkeypatch.setattr(meaning, "vectors", unavailable)
+    assert classifier.rank("Please put me through") is None
