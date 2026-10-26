@@ -11,6 +11,7 @@ def test_pending_handoff_does_not_start_another_reply_or_transfer(monkeypatch):
     monkeypatch.setenv("RETELL_CUSTOM_LLM_SECRET", "")
     monkeypatch.setattr(retell, "_enabled", lambda: True)
     monkeypatch.setattr(retell, "_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(retell, "prepare_turn_meaning", lambda *args: None)
     services = SimpleNamespace(is_llm_configured=lambda: True)
     monkeypatch.setattr(retell, "AIServices", lambda: services)
     monkeypatch.setattr(retell, "configure_voice_services", lambda client, model: client)

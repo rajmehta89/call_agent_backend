@@ -93,6 +93,23 @@ def kind_of_turn_text(caller_text: str) -> str:
     return text
 
 
+def prepare_turn_meaning(caller_text: str, agent_text: str = "") -> None:
+    """Batch the shared semantic inputs before the individual turn checks.
+
+    Network embeddings otherwise cost a separate round trip for the original,
+    generic and place-masked caller words and our last question. Classifiers
+    still make their usual decisions from these same vectors.
+    """
+    from meaning import vectors
+    masked = _PLACE_AFTER.sub(lambda match: match.group(0).replace(match.group(1), "that town"), caller_text)
+    texts = [caller_text, kind_of_turn_text(caller_text), masked, agent_text, agent_question(agent_text)]
+    try:
+        vectors(list(dict.fromkeys(text for text in texts if text.strip())))
+    except Exception:
+        # Preparing the cache is optional; normal checks retain their fallbacks.
+        pass
+
+
 def _simple_turn(caller_text: str, agent_text: str = "") -> Optional[bool]:
     """True when the turn needs no knowledge (see choose_voice_model); None when the meaning model is unavailable."""
     from turn_meaning import AGENT_ASKED, CALLER_TURN

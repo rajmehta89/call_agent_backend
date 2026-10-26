@@ -10,6 +10,7 @@ None of the examples hold facts about the business: they describe kinds of thing
 import logging
 import threading
 from collections import OrderedDict
+from concurrent.futures import Future
 from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 _CACHE: "OrderedDict[str, object]" = OrderedDict()
 _CACHE_SIZE = 512
 _CACHE_LOCK = threading.Lock()
+_INFLIGHT: Dict[str, Future] = {}
 
 
 def vectors(texts: Sequence[str]):
@@ -24,29 +26,50 @@ def vectors(texts: Sequence[str]):
     import numpy as np
     from brain_service import brain_service, local_embeddings
     keys = [" ".join((text or "").split()) for text in texts]
+    pending, owned = {}, []
     with _CACHE_LOCK:
-        missing = list(dict.fromkeys(key for key in keys if key not in _CACHE))
-    if missing:
-        fresh = local_embeddings(missing)
-        if not fresh:
-            fresh, _ = brain_service._embeddings(missing)
-        if len(fresh) != len(missing) or any(not vector for vector in fresh):
-            return None
+        for key in dict.fromkeys(keys):
+            if key in _CACHE:
+                done = Future()
+                done.set_result(_CACHE[key])
+                pending[key] = done
+            else:
+                if key not in _INFLIGHT:
+                    _INFLIGHT[key] = Future()
+                    owned.append(key)
+                pending[key] = _INFLIGHT[key]
+    if owned:
         normalized = []
-        for vector in fresh:
-            values = np.asarray(vector, dtype=float)
-            magnitude = np.linalg.norm(values)
-            if not magnitude:
-                return None
-            normalized.append(values / magnitude)
-        with _CACHE_LOCK:
-            for key, vector in zip(missing, normalized):
-                _CACHE[key] = vector
-                _CACHE.move_to_end(key)
-            while len(_CACHE) > _CACHE_SIZE:
-                _CACHE.popitem(last=False)
-    with _CACHE_LOCK:
-        found = [_CACHE.get(key) for key in keys]
+        try:
+            fresh = local_embeddings(owned)
+            if not fresh:
+                fresh, _ = brain_service._embeddings(owned)
+            if len(fresh) == len(owned) and all(len(vector) for vector in fresh):
+                for vector in fresh:
+                    values = np.asarray(vector, dtype=float)
+                    magnitude = np.linalg.norm(values)
+                    normalized.append(values / magnitude if magnitude else None)
+        except BaseException as error:
+            for key in owned:
+                pending[key].set_exception(error)
+            raise
+        else:
+            with _CACHE_LOCK:
+                for key, vector in zip(owned, normalized):
+                    if vector is not None:
+                        _CACHE[key] = vector
+                        _CACHE.move_to_end(key)
+                while len(_CACHE) > _CACHE_SIZE:
+                    _CACHE.popitem(last=False)
+            for index, key in enumerate(owned):
+                pending[key].set_result(normalized[index] if normalized else None)
+        finally:
+            with _CACHE_LOCK:
+                for key in owned:
+                    _INFLIGHT.pop(key, None)
+    # Wait outside the cache lock. Independent checks of the same caller words
+    # share one provider request, including when an older response is cancelled.
+    found = [pending[key].result() for key in keys]
     return None if any(vector is None for vector in found) else np.vstack(found)
 
 

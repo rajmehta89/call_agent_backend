@@ -21,6 +21,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
+from voice_turns import prepare_turn_meaning
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
@@ -359,8 +360,7 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
                 store = ""
             if store:
                 knowledge = [{"text": store}, *knowledge]
-        if caller_lookup is not None:
-            caller_lookup.result(timeout=5)
+        caller = caller_lookup.result(timeout=5) if caller_lookup is not None else ""
         if not language and phone:
             from voice_languages import language_for_phone
             language = language_for_phone(phone)
@@ -369,7 +369,6 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         if language:
             from voice_languages import language_label, normalize_language
             channel = {**channel, "language": language_label(normalize_language(language))}
-        caller = brain_service.customer_context(phone) if phone else ""
     except Exception:
         knowledge, business, channel, caller = [], "", {}, ""
     custom = agent_config.get_voice_prompt()
@@ -779,14 +778,18 @@ async def _stream_reply(
 
     prompt_started = perf_counter()
     if reminder:
-        turn_model, (details_note, details_problem) = None, ("", False)
+        turn_model, (details_note, details_problem), places = None, ("", False), ""
     else:
         # Semantic decisions can use network embeddings in production. Keep
         # them off the receive loop and overlap independent work.
-        turn_model, (details_note, details_problem) = await asyncio.gather(
+        def check_places():
+            return place_note(caller_text, brain_service.knowledge_text(), last_agent_text(transcript))
+
+        turn_model, (details_note, details_problem), places = await asyncio.gather(
             asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript)),
             asyncio.to_thread(contact_check, caller_text, last_agent_text(transcript),
                               earlier_caller_texts(transcript, caller_text), caller_region(caller_number)),
+            asyncio.to_thread(check_places),
         )
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
@@ -806,7 +809,6 @@ async def _stream_reply(
             else:
                 await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
             yield bridge + " "
-    places = "" if reminder else await asyncio.to_thread(place_note, caller_text, await asyncio.to_thread(brain_service.knowledge_text), last_agent_text(transcript))
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
     if prompt_task is not None:
@@ -840,6 +842,7 @@ async def _stream_reply(
     )
 
     iterator = None
+    model_started = perf_counter()
     try:
         iterator = services.stream_chat_completion(
             messages,
@@ -861,7 +864,8 @@ async def _stream_reply(
                 first_token_logged = True
                 _trace(
                     f"retell_llm_first_token call={call_id} response_id={response_id} "
-                    f"elapsed_ms={(perf_counter() - request_started) * 1000:.0f}"
+                    f"elapsed_ms={(perf_counter() - request_started) * 1000:.0f} "
+                    f"model_wait_ms={(perf_counter() - model_started) * 1000:.0f}"
                 )
             if spoken:
                 yield spoken
@@ -1113,10 +1117,19 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             transfer_service.append_message(call_id, "user", caller_text)
 
         streamed = False
-        transfer_intent = await asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if caller_text else ""
+        if caller_text:
+            semantic_started = perf_counter()
+            await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
+            _trace(f"retell_semantic_prepared call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - semantic_started) * 1000:.0f}")
+            transfer_intent, ending = await asyncio.gather(
+                asyncio.to_thread(call_forwarding.handoff_intent, caller_text),
+                asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)),
+            )
+        else:
+            transfer_intent, ending = "", False
         _trace(f"retell_turn_intent call={call_id} response_id={response_id} elapsed_ms={(perf_counter() - turn_started) * 1000:.0f}")
         specific_agent = await asyncio.to_thread(call_forwarding.requested_agent, caller_text) if caller_text and transfer_intent in {"callback", "unclear"} else None
-        if event.get("interaction_type") == "response_required" and caller_text and await asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)):
+        if event.get("interaction_type") == "response_required" and caller_text and ending:
             # We said goodbye and the caller only said bye back: hang up instead of another goodbye per fragment.
             _trace(f"retell_call_over call={call_id} response_id={response_id} caller={caller_text!r}")
             await send_event({"response_type": "response", "response_id": response_id, "content": "",
