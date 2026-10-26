@@ -71,15 +71,18 @@ those acknowledgements. The caller-to-acknowledgement interval was longer becaus
 Retell had not yet declared the caller's turn complete; the bridge timer begins
 only after `response_required` arrives.
 
-The Retell connection now sets maximum responsiveness and asks for one follow-up
-after seven seconds of caller silence following agent speech. Custom Flux's
-silence backstop is 1.8 seconds by default (configurable with
+Both Retell and custom Twilio now ask once whether the caller needs anything else
+after seven seconds of silence following the completed answer. Retell sets maximum
+responsiveness. Custom Flux's silence backstop is 1.8 seconds by default (configurable with
 `CUSTOM_FLUX_EOT_TIMEOUT_MS`; increase it for callers who pause longer between
 clauses). The short bridge already covers delayed simple answers and contact
 details; it improves perceived wait time but does not make the full model answer
 finish sooner.
 
-Production health must show `2026-10-26-voice-turn-repair-5` after deployment.
+The shared reminder timing is configurable with `VOICE_REMINDER_TRIGGER_MS`;
+the Retell reminder count is configurable with `VOICE_REMINDER_MAX_COUNT`.
+
+Production health must show `2026-10-26-voice-turn-repair-6` after deployment.
 
 Primary references:
 

@@ -99,7 +99,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "release": "2026-10-26-voice-turn-repair-5"}
+    return {"status": "healthy", "release": "2026-10-26-voice-turn-repair-6"}
 
 # Register all routers
 app.include_router(config_api.router)

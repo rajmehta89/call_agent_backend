@@ -1353,11 +1353,11 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 except ValueError:
                     responsiveness = 1.0
                 try:
-                    reminder_trigger_ms = max(1000, int(os.getenv("RETELL_REMINDER_TRIGGER_MS", "7000")))
+                    reminder_trigger_ms = max(1000, int(os.getenv("VOICE_REMINDER_TRIGGER_MS", "7000")))
                 except ValueError:
                     reminder_trigger_ms = 7000
                 try:
-                    reminder_max_count = max(0, int(os.getenv("RETELL_REMINDER_MAX_COUNT", "1")))
+                    reminder_max_count = max(0, int(os.getenv("VOICE_REMINDER_MAX_COUNT", "1")))
                 except ValueError:
                     reminder_max_count = 1
                 await send_event({"response_type": "update_agent", "agent_config": {

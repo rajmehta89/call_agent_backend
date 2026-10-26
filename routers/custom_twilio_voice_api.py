@@ -772,6 +772,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     send_lock = asyncio.Lock()
     utterance: List[str] = []
     reply_task: Optional[asyncio.Task[Any]] = None
+    silence_reminder_task: Optional[asyncio.Task[Any]] = None
     transfer_pending = False  # Once promised, a new caller fragment must not cancel the handoff.
     earlier_handoff_text = ""  # keep an unclear team request so a short follow-up is read in context
     contact_phone = ""  # valid number spoken on a browser call, which has no phone caller ID
@@ -819,6 +820,38 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     def bot_busy() -> bool:
         return bool(pending_mark) or bool(reply_task and not reply_task.done())
+
+    def cancel_silence_reminder() -> None:
+        nonlocal silence_reminder_task
+        if silence_reminder_task and not silence_reminder_task.done():
+            silence_reminder_task.cancel()
+        silence_reminder_task = None
+
+    def schedule_silence_reminder() -> None:
+        nonlocal silence_reminder_task
+        cancel_silence_reminder()
+
+        async def remind_if_still_silent() -> None:
+            try:
+                while active and pending_mark:
+                    await asyncio.sleep(0.05)
+                if not active:
+                    return
+                trigger_ms = int(_env_number("VOICE_REMINDER_TRIGGER_MS", 7000, 1000, 60000))
+                await asyncio.sleep(trigger_ms / 1000)
+                if not active or bot_busy():
+                    return
+                line = "Is there anything else I can help you with?"
+                await speak(line)
+                memory.add_assistant(line)
+                responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
+                save_progress()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("custom voice silence reminder failed: %s", type(error).__name__)
+
+        silence_reminder_task = asyncio.create_task(remind_if_still_silent())
 
     async def interrupt(force: bool = False) -> None:
         """Caller started talking: stop thinking/speaking and flush audio Twilio has buffered."""
@@ -1128,6 +1161,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             async for sentence in sentences:
                 spoken.append(sentence)
                 await speak(sentence)
+            if active and spoken:
+                schedule_silence_reminder()
         finally:
             if not first.done():
                 first.cancel()  # interrupted before the first sentence: stop the model request too
@@ -1146,6 +1181,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     def heard_changed(text: str) -> None:
         """The caller's words so far changed: an early reply for different words is no longer any use."""
         nonlocal heard_text, heard_changed_at, early_reply
+        cancel_silence_reminder()
         if text != heard_text:
             heard_text, heard_changed_at = text, perf_counter()
             if not transfer_pending:
@@ -1228,6 +1264,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             heard_changed(text)
         if event == "StartOfTurn":
             flux_turn_started, flux_turn_logged = perf_counter(), False
+            cancel_silence_reminder()
         elif text and flux_turn_started and not flux_turn_logged and perf_counter() - flux_turn_started > 4:
             # So the log shows what Flux had heard if a turn ever stays open too long.
             flux_turn_logged = True
@@ -1323,6 +1360,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             try:
                 payload = json.loads(raw)
                 kind = payload.get("type")
+                if kind == "SpeechStarted":
+                    cancel_silence_reminder()
+                    continue
                 if kind == "TurnInfo":  # Deepgram Flux
                     words = str(payload.get("transcript") or "").split()
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
@@ -1448,6 +1488,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         break
         finally:
                 active = False
+                cancel_silence_reminder()
                 drop_reply(early_reply)  # a reply started early for a turn that never ended
                 if reply_task and not reply_task.done():
                     reply_task.cancel()
