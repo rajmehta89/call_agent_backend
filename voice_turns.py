@@ -927,9 +927,9 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
 
 
 def bridge_model_seconds() -> float:
-    """VOICE_BRIDGE_MODEL_MS: hard limit for the small model to select a safe wait line while the answer runs."""
+    """VOICE_BRIDGE_MODEL_MS: hard limit (at most 450 ms) for selecting a wait line while the answer runs."""
     try:
-        return max(0.1, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "450"))) / 1000
+        return min(450.0, max(100.0, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "450")))) / 1000
     except ValueError:
         return 0.45
 

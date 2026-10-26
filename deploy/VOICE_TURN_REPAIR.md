@@ -313,3 +313,9 @@ whether it selected a line or timed out, and the bridge and answer timings.
 Production health must show `2026-10-27-voice-bridge-async-17` after deployment.
 A new call should confirm bridge selection and main-answer timings separately,
 and show whether the remaining wait is Nova turn detection or response work.
+
+## Release 18: enforce the bridge timeout ceiling
+
+The bridge timeout can be lowered with `VOICE_BRIDGE_MODEL_MS`, but code now
+caps it at 450 ms even if the production environment contains a higher value.
+Production health must show `2026-10-27-voice-bridge-async-18` after deployment.

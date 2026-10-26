@@ -396,6 +396,14 @@ def test_delayed_question_bridge_still_excludes_short_replies_and_contact_detail
         assert voice_turns.wait_bridge_phrase(text) == ""
 
 
+def test_bridge_model_timeout_can_be_lowered_but_not_raised(monkeypatch):
+    import voice_turns
+    monkeypatch.setenv("VOICE_BRIDGE_MODEL_MS", "180")
+    assert voice_turns.bridge_model_seconds() == 0.18
+    monkeypatch.setenv("VOICE_BRIDGE_MODEL_MS", "1500")
+    assert voice_turns.bridge_model_seconds() == 0.45
+
+
 def test_completed_open_request_gets_a_bridge_when_answer_is_still_running(monkeypatch):
     import voice_turns
     from turn_meaning import CALLER_TURN, TURN_COMPLETION, WAIT_QUESTION
