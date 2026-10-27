@@ -479,6 +479,24 @@ def test_yes_or_no_to_the_agents_question_goes_to_the_main_model(monkeypatch):
     assert choose_voice_model("My name is Raj.", "May I have your name, please?") is not None
 
 
+def test_close_semantic_scores_allow_fast_route_for_mixed_acknowledgement_and_question(monkeypatch):
+    import store_intent
+    from turn_meaning import AGENT_ASKED, CALLER_TURN
+
+    fast = "meta-llama/llama-3.1-8b-instruct"
+    monkeypatch.setenv("VOICE_FAST_MODEL", fast)
+    monkeypatch.setattr(CALLER_TURN, "best", lambda *args: "acknowledge")
+    monkeypatch.setattr(CALLER_TURN, "rank", lambda *args: [
+        ("acknowledge", 0.659), ("clarify", 0.651), ("question", 0.641), ("search", 0.640),
+    ])
+    monkeypatch.setattr(AGENT_ASKED, "best", lambda *args: "other")
+    monkeypatch.setattr(store_intent, "wanted", lambda text: [])
+    monkeypatch.setattr(store_intent, "rank", lambda *args: [("none", 0.82), ("product", 0.45), ("order", 0.35)])
+
+    greeting = "Hello, thanks for calling Home DFO. How can I help you today?"
+    assert choose_voice_model("Yes sir so what is home dear for his", greeting) == fast
+
+
 def test_business_name_mishearings_get_a_note():
     from voice_turns import name_note
     assert "Home DFO" in name_note("So what is home data price for?", "Home DFO")

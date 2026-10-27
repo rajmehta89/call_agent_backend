@@ -58,6 +58,20 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
 
     from turn_meaning import CALLER_TURN
     kind = CALLER_TURN.best(kind_of_turn_text(caller_text))
+    if kind is None:
+        return None
+    if kind == "acknowledge":
+        # STT often joins a polite acknowledgement to a question without punctuation. If the semantic
+        # classifier sees a real caller intent almost as strongly as the acknowledgement, route by that
+        # intent; a clear standalone yes/no remains on the careful model.
+        ranked_kinds = CALLER_TURN.rank(kind_of_turn_text(caller_text))
+        if not ranked_kinds:
+            return None
+        score = ranked_kinds[0][1]
+        substantive = next(((label, value) for label, value in ranked_kinds
+                            if label not in {"acknowledge", "closing", "detail"}), None)
+        if substantive and score - substantive[1] < CALLER_TURN.close_call:
+            kind = substantive[0]
     if kind in {None, "", "acknowledge", "closing", "detail"}:
         # Acknowledgements to our own question and unsolicited details need the conversation context.
         return None
