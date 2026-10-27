@@ -207,14 +207,28 @@ HANDOFF_ACTION = Classifier("handoff action", {
 HANDOFF_OFFER = Classifier("agent handoff offer", {
     "live": ["Would you like me to connect you with the team for full product details?",
              "Shall I put you through to a colleague?", "I can transfer you to someone now, if you like.",
-             "Would speaking with a person on this call help?"],
+             "Would speaking with a person on this call help?", "Would you like me to connect you with the team now?"],
     "callback": ["Would you like someone to call you back?", "Shall I arrange for the team to phone you later?",
                  "I can ask a colleague to contact you after this call. Would that help?"],
     "choice": ["Would you like me to connect you now or have someone call you back later?",
                "Shall I put you through, or would you prefer a callback?"],
     "other": ["Would you like the basin sizes and finishes?", "Anything else?",
               "The team will call you on this number.", "Your callback request is already with the team.",
-              "What phone number should the team call?", "Would you like more information about delivery?"],
+              "What phone number should the team call?", "Would you like more information about delivery?",
+              # Everything else an agent says is not an offer to connect. With only the lines above, 80 of 251 agent
+              # lines on real calls read as offers, and a caller's "Okay." after a business description started a transfer.
+              "I'm working through the details now.", "We sell a wide range of products and offer friendly customer support.",
+              "We deliver Australia-wide and our team is happy to help.",
+              "Hello, thanks for calling. How can I help you today?", "What can I help you with today?",
+              "What kind of product or project are you interested in?", "Could you please clarify what you mean?",
+              "Could I please have your full name?", "Could you please spell your email address for me?",
+              "Just to confirm, your email is john at gmail dot com. Is that correct?",
+              "You said zero four one two, three four five. Is that correct?",
+              "I've passed your request to the team and they'll contact you soon.",
+              "Is there anything else you'd like help with?", "Have a great day. Goodbye.", "You're welcome.",
+              "Of course. Go ahead.", "Would you like me to repeat that?",
+              "I don't have details on that. Could you please clarify what you're asking about?",
+              "Could you please say your full phone number again?"],
 }, min_score=0.58, close_call=0.025)
 
 HANDOFF_REPLY = Classifier("caller response to handoff offer", {

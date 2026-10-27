@@ -423,7 +423,11 @@ def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_r
         if AGENT_ASKED.best(agent_text) == "phone":
             return ""
         return "callback_ack" if CALLBACK_ACK_CONTEXT.best(agent_text) == "confirmed" else None
-    offer = HANDOFF_OFFER.best(agent_text) if agent_text else "other"
+    # Only a clear offer counts. From a production call: a business description ending "...and friendly customer
+    # support." scored live 0.590 against other 0.574 (a close call), and the caller's "Okay." started a live transfer.
+    # A close call between two kinds of offer is still an offer (which kind is unclear: ask, via "choice").
+    offers = HANDOFF_OFFER.close(agent_text) if agent_text else ["other"]
+    offer = "other" if not offers or "other" in offers else offers[0] if len(offers) == 1 else "choice"
     if offer not in {"live", "callback", "choice"}:
         return "" if reply in {"accept", "decline"} else None
     if reply == "decline":

@@ -691,3 +691,20 @@ def test_a_product_question_that_starts_with_okay_goes_to_the_careful_model(monk
     assert store_question("Do you have matte black basins?", lead=STORE_ROUTE_LEAD)
     assert not store_question("What can I do?", lead=STORE_ROUTE_LEAD)  # a broad question stays a general one
     assert choose_voice_model(list(measured)[0], "We sell bathroom products.") is None
+
+
+@pytest.mark.parametrize("agent, caller, expected", [
+    # From a production call: "Okay." after a business description started a live transfer.
+    ("I'm working through the details now. We're an online retailer specialising in premium bathroom and kitchen products, "
+     "and we offer Australia-wide delivery and friendly customer support.", "Okay.", ""),
+    ("Hello, thanks for calling. How can I help you today?", "Yes.", ""),
+    ("Could you please spell your email address for me?", "Yes.", ""),
+    ("Would you like the basin sizes and finishes?", "Yes.", ""),
+    ("Would you like me to connect you with the team now?", "Yes, please.", "live"),
+    ("Would you like someone to call you back?", "Yeah.", "callback"),
+    ("Would you like me to connect you now or have someone call you back later?", "Okay.", "unclear"),
+    ("Shall I put you through to a colleague?", "No, thanks.", "declined"),
+])
+def test_only_a_clear_offer_turns_a_yes_into_a_handoff(agent, caller, expected):
+    import call_forwarding
+    assert (call_forwarding.contextual_handoff_intent(caller, agent, False) or "") == expected
