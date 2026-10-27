@@ -425,9 +425,51 @@ def test_live_prices_are_reused_briefly_for_a_follow_up(indexed, monkeypatch):
     shop.search_products("freestanding oval bathtub", limit=1)
     shop.search_products("tell me more about the freestanding oval bathtub", limit=1)
     assert sum("nodes(ids:" in query for query in requests) == 1
-    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")  # expired: read live again
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")
+    monkeypatch.setenv("SHOPIFY_LIVE_MAX_SECONDS", "0")  # too old to use: read live before answering
     shop.search_products("freestanding oval bathtub", limit=1)
     assert sum("nodes(ids:" in query for query in requests) == 2
+
+
+def _wait_for_refresh():
+    import time
+    for _ in range(100):
+        if not shop._live_refreshing:
+            return
+        time.sleep(0.02)
+    raise AssertionError("background refresh did not finish")
+
+
+def test_an_older_price_answers_at_once_and_refreshes_in_the_background(indexed, monkeypatch):
+    graphql, requests = indexed
+    shop.search_products("freestanding oval bathtub", limit=1)
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")  # older than "fresh", still usable
+    graphql.price_change = ("Freestanding Oval Bathtub", "649")
+    first = shop.search_products("freestanding oval bathtub", limit=1)
+    assert first[0]["min_price"] != "649"  # answered at once from memory, no wait
+    _wait_for_refresh()
+    assert sum("nodes(ids:" in query for query in requests) == 2  # re-read in the background
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "60")
+    assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "649"  # next turn: new price
+
+
+def test_after_a_restart_prices_are_read_live_first(indexed, monkeypatch):
+    graphql, requests = indexed
+    shop.search_products("freestanding oval bathtub", limit=1)
+    monkeypatch.setattr(shop, "_live_products", {})  # what a restart leaves: nothing remembered
+    graphql.price_change = ("Freestanding Oval Bathtub", "649")
+    assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "649"
+    assert sum("nodes(ids:" in query for query in requests) == 2
+
+
+def test_a_failed_background_refresh_keeps_the_remembered_price(indexed, monkeypatch):
+    graphql, requests = indexed
+    shop.search_products("freestanding oval bathtub", limit=1)
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")
+    monkeypatch.setattr(shop, "graphql", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Shopify down")))
+    assert shop.search_products("freestanding oval bathtub", limit=1)  # still answered
+    _wait_for_refresh()
+    assert shop.search_products("freestanding oval bathtub", limit=1)  # and again, within the usable age
 
 
 def test_prices_and_stock_are_live_even_from_memory(indexed):
@@ -564,3 +606,13 @@ def test_let_me_check_is_only_for_clear_store_questions(question, check):
     assert store_intent.clearly_wanted(question) is check
     if not check:
         assert store_intent.wanted(question) == []  # and off-topic chat does not reach the store at all
+
+
+def test_a_product_removed_from_the_store_is_not_offered_from_memory(indexed, monkeypatch):
+    assert shop.search_products("freestanding oval bathtub", limit=1)
+    monkeypatch.setattr(shop, "graphql", lambda query, variables=None: {"nodes": [None for _ in variables["ids"]]})
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")
+    shop.search_products("freestanding oval bathtub", limit=1)  # answered from memory, refreshed in the background
+    _wait_for_refresh()
+    titles = [product["title"] for product in shop.search_products("freestanding oval bathtub", limit=5)]
+    assert "Freestanding Oval Bathtub" not in titles  # the refresh saw it was gone

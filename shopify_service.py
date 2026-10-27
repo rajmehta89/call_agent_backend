@@ -266,6 +266,7 @@ class ShopifyService:
         self._vector_cache: Dict[str, List[float]] = {}  # product text hash -> vector (only changed products are re-embedded)
         self._live_products: Dict[str, tuple] = {}  # product id -> (read at, live prices/stock), see _with_live_prices
         self._live_lock = threading.Lock()
+        self._live_refreshing: set = set()  # product ids being re-read in the background
 
     # ------------------------------------------------------------------ connection
     def configure(self, store_domain: str, access_token: str = "", api_version: str = DEFAULT_API_VERSION,
@@ -624,36 +625,79 @@ class ShopifyService:
         nouns = self.catalog_nouns(re.sub(r"\d+\s*[x×*]\s*\d+[^ ]*", " ", name))  # sizes like 360x360x120mm are not things
         return nouns[-1] if nouns else ""
 
+    @staticmethod
+    def _seconds_setting(name: str, default: float) -> float:
+        try:
+            return max(0.0, float(os.getenv(name, str(default))))
+        except ValueError:
+            return default
+
+    def _read_live(self, product_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Current prices, sale prices, stock and options for these products, in one request; remembered with the time."""
+        stock = "inventoryQuantity" if self.has_scope("read_inventory") else ""
+        data = self.graphql(
+            "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id " + ("totalInventory " if stock else "")
+            + "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } } "
+            + f"variants(first: 25) {{ nodes {{ title price compareAtPrice sku availableForSale {stock} }} }} }} }} }}",
+            {"ids": product_ids})
+        fetched = {node["id"]: self._normalize_product(node) for node in data.get("nodes") or [] if node}
+        read_at = time.time()
+        with self._live_lock:
+            for product_id in product_ids:
+                if product_id in fetched:
+                    self._live_products[product_id] = (read_at, fetched[product_id])
+                else:
+                    self._live_products.pop(product_id, None)  # removed from the store: never offered from memory
+        return fetched
+
+    def _refresh_live_later(self, product_ids: List[str]) -> None:
+        """Re-read these products in the background (once at a time each); the caller is already answered."""
+        with self._live_lock:
+            ids = [product_id for product_id in product_ids if product_id not in self._live_refreshing]
+            self._live_refreshing.update(ids)
+        if not ids:
+            return
+
+        def refresh() -> None:
+            try:
+                self._read_live(ids)
+            except Exception as error:  # the remembered data stays until it is too old to use (SHOPIFY_LIVE_MAX_SECONDS)
+                logger.warning("shopify: background price refresh failed: %s", error)
+            finally:
+                with self._live_lock:
+                    self._live_refreshing.difference_update(ids)
+
+        threading.Thread(target=refresh, name="shopify-live-refresh", daemon=True).start()
+
     def _with_live_prices(self, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """The same products with their current prices, sale prices, stock and options, read live in one request.
-        Each product's live data is reused for SHOPIFY_LIVE_SECONDS (default 60): a follow-up about the same product,
-        or an early reply re-run while the caller is still speaking, read it again each time (0.4-0.9 s per turn)."""
+        """The same products with their current prices, sale prices, stock and options.
+        Every product turn used to read these live (Shopify "nodes", 0.4-0.9 s), six times in one production turn for
+        the same products. Now, per product:
+        - read within SHOPIFY_LIVE_SECONDS (60): used as is;
+        - older, up to SHOPIFY_LIVE_MAX_SECONDS (600): used at once and re-read in the background for the next turn;
+        - older than that, or never read (also after a restart, when memory starts empty): read live before answering."""
         if not products:
             return []
-        try:
-            fresh_for = max(0.0, float(os.getenv("SHOPIFY_LIVE_SECONDS", "60")))
-        except ValueError:
-            fresh_for = 60.0
+        fresh_for = self._seconds_setting("SHOPIFY_LIVE_SECONDS", 60)
+        usable_for = max(fresh_for, self._seconds_setting("SHOPIFY_LIVE_MAX_SECONDS", 600))
         now_time = time.time()
         live: Dict[str, Dict[str, Any]] = {}
+        stale: List[str] = []
         with self._live_lock:
             for product in products:
                 cached = self._live_products.get(product["id"])
-                if cached and now_time - cached[0] < fresh_for:
+                if not cached:
+                    continue
+                age = now_time - cached[0]
+                if age < usable_for:
                     live[product["id"]] = cached[1]
+                    if age >= fresh_for:
+                        stale.append(product["id"])
         missing = [product["id"] for product in products if product["id"] not in live]
         if missing:
-            stock = "inventoryQuantity" if self.has_scope("read_inventory") else ""
-            data = self.graphql(
-                "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id " + ("totalInventory " if stock else "")
-                + "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } } "
-                + f"variants(first: 25) {{ nodes {{ title price compareAtPrice sku availableForSale {stock} }} }} }} }} }}",
-                {"ids": missing})
-            fetched = {node["id"]: self._normalize_product(node) for node in data.get("nodes") or [] if node}
-            with self._live_lock:
-                for product_id, value in fetched.items():
-                    self._live_products[product_id] = (now_time, value)
-            live.update(fetched)
+            live.update(self._read_live(missing))
+        if stale:
+            self._refresh_live_later(stale)
         merged = []
         for product in products:
             now = live.get(product["id"])
