@@ -398,6 +398,7 @@ def live_nodes(ids, price_change=None):
 @pytest.fixture
 def indexed(store, monkeypatch):
     monkeypatch.setattr(shop, "_index", ([shop._normalize_product(node) for node in CATALOGUE], __import__("time").time()))
+    monkeypatch.setattr(shop, "_live_products", {})  # each test reads live prices afresh
     requests = []
 
     def graphql(query, variables=None):
@@ -416,6 +417,17 @@ def test_products_are_found_in_memory_with_one_live_price_request(indexed):
     found = shop.search_products("is the lydia wall mixer with diverter in stock", limit=5)
     assert found[0]["title"] == "Lydia Series Wall Mixer with Diverter"
     assert len(requests) == 1 and "nodes(ids:" in requests[0]  # one small request: prices and stock only
+
+
+def test_live_prices_are_reused_briefly_for_a_follow_up(indexed, monkeypatch):
+    # A follow-up about the same product re-read its prices each turn (0.4-0.9 s on production calls).
+    _, requests = indexed
+    shop.search_products("freestanding oval bathtub", limit=1)
+    shop.search_products("tell me more about the freestanding oval bathtub", limit=1)
+    assert sum("nodes(ids:" in query for query in requests) == 1
+    monkeypatch.setenv("SHOPIFY_LIVE_SECONDS", "0")  # expired: read live again
+    shop.search_products("freestanding oval bathtub", limit=1)
+    assert sum("nodes(ids:" in query for query in requests) == 2
 
 
 def test_prices_and_stock_are_live_even_from_memory(indexed):

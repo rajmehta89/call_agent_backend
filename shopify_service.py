@@ -264,6 +264,8 @@ class ShopifyService:
         self._index_building = threading.Event()
         self._index_vectors: Any = None  # meaning vectors, row for row with the index
         self._vector_cache: Dict[str, List[float]] = {}  # product text hash -> vector (only changed products are re-embedded)
+        self._live_products: Dict[str, tuple] = {}  # product id -> (read at, live prices/stock), see _with_live_prices
+        self._live_lock = threading.Lock()
 
     # ------------------------------------------------------------------ connection
     def configure(self, store_domain: str, access_token: str = "", api_version: str = DEFAULT_API_VERSION,
@@ -623,16 +625,35 @@ class ShopifyService:
         return nouns[-1] if nouns else ""
 
     def _with_live_prices(self, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """The same products with their current prices, sale prices, stock and options, read live in one request."""
+        """The same products with their current prices, sale prices, stock and options, read live in one request.
+        Each product's live data is reused for SHOPIFY_LIVE_SECONDS (default 60): a follow-up about the same product,
+        or an early reply re-run while the caller is still speaking, read it again each time (0.4-0.9 s per turn)."""
         if not products:
             return []
-        stock = "inventoryQuantity" if self.has_scope("read_inventory") else ""
-        data = self.graphql(
-            "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id " + ("totalInventory " if stock else "")
-            + "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } } "
-            + f"variants(first: 25) {{ nodes {{ title price compareAtPrice sku availableForSale {stock} }} }} }} }} }}",
-            {"ids": [product["id"] for product in products]})
-        live = {node["id"]: self._normalize_product(node) for node in data.get("nodes") or [] if node}
+        try:
+            fresh_for = max(0.0, float(os.getenv("SHOPIFY_LIVE_SECONDS", "60")))
+        except ValueError:
+            fresh_for = 60.0
+        now_time = time.time()
+        live: Dict[str, Dict[str, Any]] = {}
+        with self._live_lock:
+            for product in products:
+                cached = self._live_products.get(product["id"])
+                if cached and now_time - cached[0] < fresh_for:
+                    live[product["id"]] = cached[1]
+        missing = [product["id"] for product in products if product["id"] not in live]
+        if missing:
+            stock = "inventoryQuantity" if self.has_scope("read_inventory") else ""
+            data = self.graphql(
+                "query($ids: [ID!]!) { nodes(ids: $ids) { ... on Product { id " + ("totalInventory " if stock else "")
+                + "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } } "
+                + f"variants(first: 25) {{ nodes {{ title price compareAtPrice sku availableForSale {stock} }} }} }} }} }}",
+                {"ids": missing})
+            fetched = {node["id"]: self._normalize_product(node) for node in data.get("nodes") or [] if node}
+            with self._live_lock:
+                for product_id, value in fetched.items():
+                    self._live_products[product_id] = (now_time, value)
+            live.update(fetched)
         merged = []
         for product in products:
             now = live.get(product["id"])
