@@ -841,7 +841,7 @@ SEARCH_BRIDGES = ("Let's see what would work best for you.", "Let me think about
 # Explaining a problem they have (not an urgent or upset one).
 PROBLEM_BRIDGES = ("I see what you mean. Let's work through that.", "Ah, I see. Let's sort that out.")
 # Several things at once, or a long, detailed request.
-DETAIL_BRIDGES = ("There are a couple of things to consider here.", "Got it, I'll take all of that into account.")
+DETAIL_BRIDGES = ("Okay, let me go through that.", "Got it, I'll take all of that into account.")
 # Telling us about their situation or plans ("I just bought a new home").
 STATEMENT_BRIDGES = ("Ah, okay.", "Got it.")  # neutral: "Oh, nice." did not fit news that was not good news
 # Asking for a callback, a quote or a person.

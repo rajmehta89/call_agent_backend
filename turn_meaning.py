@@ -170,6 +170,10 @@ HANDOFF_ACTION = Classifier("handoff action", {
         "I want a callback when someone is free.", "Ask a staff member to phone me next week.",
         "Can you take my number so the team can call me?", "I cannot talk now; call me this afternoon.",
         "Have someone contact me after this call.", "Please arrange for the team to call me later.",
+        # Asking to log a question for a later call (a real caller: "can you just add this query so someone will call
+        # me later?" tied live with callback and waited 8 s for a tie-break that answered "unclear").
+        "Can you just add this query so someone will call me later?", "Note my question down and have the team call me back.",
+        "Log this request so someone gets back to me later.", "Pass my query on and ask someone to ring me later.",
         "Can you arrange a call from your team tomorrow?", "Can you transfer my call tomorrow?",
         "Can your team call me back later?", "I would rather have the team call me another time.",
         "Could your people phone me once they have a moment?",

@@ -118,9 +118,13 @@ async def ready_check():
     except ValueError:
         ceiling = 240.0
     waited = time.monotonic() - _started_at
+    # Which embeddings this server uses: "local" (the model in this process, ~35 ms a check) or "network" (an API
+    # call per new text, 1-1.5 s): the main reason turn checks are fast or slow. No settings values are shown.
+    from brain_service import _LOCAL_EMBEDDER
+    embeddings = "local" if _LOCAL_EMBEDDER is not None else "network"
     if _voice_warm.is_set() or waited >= ceiling:
-        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited)}
-    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited)})
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings})
 
 # Register all routers
 app.include_router(config_api.router)
