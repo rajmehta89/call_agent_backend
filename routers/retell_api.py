@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
-from voice_turns import pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
+from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
@@ -819,18 +819,39 @@ async def _stream_reply(
     started_at: Optional[float] = None,
     timings: Optional[Dict[str, Any]] = None,
     inline_bridge: bool = True,
+    facts_prompt: Optional["asyncio.Future[str]"] = None,
 ):
-    """Yield model deltas while recording the latency of each voice turn."""
+    """Yield model deltas while recording the latency of each voice turn.
+    facts_prompt: the prompt with business facts, already being built (started with the turn's handoff check)."""
     request_started = started_at if started_at is not None else perf_counter()
     caller_text = _last_user_message(transcript)
     if not caller_text:
         yield "Could you please tell me how I can help?"
         return
+    if facts_prompt is None and not reminder:
+        facts_prompt = start_facts_prompt(caller_text, transcript, caller_number)
+    try:
+        async for chunk in _stream_reply_with_facts(services, transcript, caller_number, call_id, response_id, reminder,
+                                                    request_started, timings, inline_bridge, caller_text, facts_prompt):
+            yield chunk
+    finally:
+        if facts_prompt is not None and not facts_prompt.done():
+            facts_prompt.cancel()
+
+
+def start_facts_prompt(caller_text: str, transcript: List[Dict[str, str]], caller_number: str) -> "asyncio.Future[str]":
+    """Start building the prompt with business facts now. Most turns need it (questions, and every main-model turn);
+    built only after the turn checks it added 0.7-2.2 s on production calls. A fast turn that needs no facts drops it."""
+    return asyncio.ensure_future(asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, True))
+
+
+async def _stream_reply_with_facts(services, transcript, caller_number, call_id, response_id, reminder, request_started,
+                                   timings, inline_bridge, caller_text, facts_prompt):
     if _log_content_enabled():
         _trace(f"retell_llm_request call={call_id} response_id={response_id} caller={caller_text!r}")
 
     prompt_started = perf_counter()
-    prepared_prompt = None
+    question = False
     earlier_text = " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:])
     if reminder:
         turn_model, (details_note, details_problem), places = None, ("", False), ""
@@ -840,17 +861,13 @@ async def _stream_reply(
         def check_places():
             return place_note(caller_text, brain_service.knowledge_text(), last_agent_text(transcript))
 
-        def prepare_question():
-            if needs_facts(caller_text):
-                return _system_prompt(search_text(caller_text, transcript), caller_number, "", transcript, True)
-            return None
-
-        turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
+        # The prompt with facts is already being built (facts_prompt); these checks only decide whether it is used.
+        turn_model, (details_note, details_problem), places, question = await asyncio.gather(
             asyncio.to_thread(choose_voice_model, caller_text, last_agent_text(transcript), earlier_text),
             asyncio.to_thread(contact_check, caller_text, last_agent_text(transcript),
                               earlier_caller_texts(transcript, caller_text), caller_region(caller_number)),
             asyncio.to_thread(check_places),
-            asyncio.to_thread(prepare_question),
+            asyncio.to_thread(needs_facts, caller_text),
         )
     if not reminder and await asyncio.to_thread(sounds_unfinished, caller_text):
         # Preprocessing already gave the caller time to continue. Only wait for
@@ -861,17 +878,12 @@ async def _stream_reply(
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
     bridge = ""
-    prompt_task = None
     if inline_bridge and not reminder and bridges_enabled() and turn_model is None:
-        # A short acknowledgement while the model works; non-question lookups
-        # can still prepare their prompt while this phrase is selected.
+        # A short acknowledgement while the model works; the prompt keeps building while this phrase is selected.
         said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
         recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
         bridge = await asyncio.to_thread(bridge_phrase, caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
         if bridge:
-            # Reuse a question prompt already prepared alongside the checks.
-            if prepared_prompt is None:
-                prompt_task = asyncio.ensure_future(asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, True))
             if bridge in LOOKUP_BRIDGES:
                 bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), bridge, call_id, response_id)
             else:
@@ -879,12 +891,12 @@ async def _stream_reply(
             yield bridge + " "
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    if prompt_task is not None:
-        system_prompt = await prompt_task  # built with the knowledge, as a bridged turn always uses the main model
-    elif prepared_prompt is not None:
-        # Non-product questions can use the fast model while keeping relevant business facts in context.
-        system_prompt = prepared_prompt
+    if facts_prompt is not None and (question or turn_model is None or places):
+        # Questions (also on the fast model) and every main-model turn get the relevant business facts.
+        system_prompt = await facts_prompt
     else:
+        if facts_prompt is not None:
+            facts_prompt.cancel()
         system_prompt = await asyncio.to_thread(_system_prompt, search_text(caller_text, transcript), caller_number, "", transcript, turn_model is None or bool(places))
     retrieval_ms = (perf_counter() - prompt_started) * 1000
     if timings is not None:
@@ -1203,7 +1215,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             ]
             transfer_service.append_message(call_id, "user", caller_text)
 
-        if caller_text and await asyncio.to_thread(pause_request, caller_text):
+        # Retell handles barge-in itself, so this is a finished turn: a "Sorry?" here asks to hear the reply again.
+        if caller_text and await asyncio.to_thread(pause_request, caller_text) and not await asyncio.to_thread(asks_to_repeat, caller_text):
             reply = pause_reply(caller_text)
             await send_event({"response_type": "response", "response_id": response_id,
                               "content": reply, "content_complete": True})
@@ -1237,6 +1250,19 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         bridge_ready = asyncio.create_task(prepare_notice())
         asyncio.current_task().add_done_callback(lambda _: bridge_ready.cancel())
+        # The prompt with business facts builds while the handoff check runs: on production it took 0.7-2.2 s.
+        facts_prompt = (start_facts_prompt(caller_text, transcript, caller_number)
+                        if caller_text and event.get("interaction_type") == "response_required" else None)
+        if facts_prompt is not None:
+            asyncio.current_task().add_done_callback(lambda _: facts_prompt.cancel())
+        # The answer also starts now, alongside the handoff check (as the custom pipeline does): waiting for that check
+        # first added 0.5-1 s per turn. A turn routed to a transfer, callback or goodbye drops it unheard.
+        early_reply = early_first = None
+        if facts_prompt is not None:
+            early_reply = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=False,
+                                        started_at=turn_started, timings=timing, inline_bridge=False, facts_prompt=facts_prompt)
+            early_first = asyncio.ensure_future(anext(early_reply))
+            asyncio.current_task().add_done_callback(lambda _: early_first.cancel())
 
         async def routing_notice():
             line = await asyncio.shield(bridge_ready)
@@ -1323,8 +1349,18 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         else:
             answer_parts: List[str] = []
             reminder = event.get("interaction_type") == "reminder_required"
-            source = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=reminder,
-                                   started_at=turn_started, timings=timing, inline_bridge=False)
+            if early_first is not None:
+                async def continue_early_reply():
+                    try:
+                        yield await early_first
+                    except StopAsyncIteration:
+                        return
+                    async for chunk in early_reply:
+                        yield chunk
+                source = continue_early_reply()
+            else:
+                source = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=reminder,
+                                       started_at=turn_started, timings=timing, inline_bridge=False, facts_prompt=facts_prompt)
             async def make_bridge():
                 return await asyncio.shield(bridge_ready)
 

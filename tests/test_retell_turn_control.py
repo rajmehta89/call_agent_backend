@@ -233,3 +233,49 @@ def test_slow_retell_routing_gets_only_one_bridge_for_the_whole_turn(app, monkey
         assert socket.receive_json()["content"].strip() == "Just putting that together for you."
         assert socket.receive_json()["content"] == "Here is the answer."
         assert socket.receive_json()["content_complete"] is True
+
+
+def test_answer_starts_alongside_the_handoff_check(app, monkeypatch):
+    # Production Retell turns waited 0.5-1 s for the handoff check before the answer even started.
+    import time
+    order = []
+
+    def slow_handoff(*args):
+        time.sleep(0.4)
+        order.append("handoff done")
+        return ""
+
+    async def answer(*args, **kwargs):
+        order.append("answer started")
+        yield "We sell bathroom products."
+
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", slow_handoff)
+    monkeypatch.setattr(retell, "_stream_reply", answer)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "What do you sell?"}]})
+        assert socket.receive_json()["content"] == "We sell bathroom products."
+    assert order == ["answer started", "handoff done"]
+
+
+def test_a_callback_turn_never_sends_the_early_answer(app, monkeypatch):
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda *args: "callback")
+    monkeypatch.setattr(retell.call_forwarding, "requested_agent", lambda *args: None)
+    monkeypatch.setattr(retell.call_forwarding, "create_callback_outreach", lambda *args, **kwargs: "Human team")
+    monkeypatch.setattr(retell.transfer_service, "request_transfer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(retell.transfer_service, "update_transfer", lambda *args, **kwargs: None)
+
+    async def answer(*args, **kwargs):
+        yield "EARLY ANSWER"
+
+    monkeypatch.setattr(retell, "_stream_reply", answer)
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early-callback") as socket:
+        socket.receive_json()
+        socket.receive_json()
+        socket.send_json({"interaction_type": "response_required", "response_id": 1,
+                          "transcript": [{"role": "user", "content": "Someone call me later."}]})
+        response = socket.receive_json()
+        assert "marked your request" in response["content"] and "EARLY" not in response["content"]
+        assert response["content_complete"] is True

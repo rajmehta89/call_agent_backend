@@ -201,3 +201,40 @@ def test_disconnecting_or_starting_a_reply_discards_queued_prefetch(monkeypatch)
 
     asyncio.run(run())
     assert not calls
+
+
+def test_retell_main_model_turn_builds_facts_alongside_the_checks(monkeypatch):
+    """Production Retell calls spent 0.7-2.2 s building the facts prompt after the turn checks; now both run at once."""
+    import time
+    seen = {}
+
+    def slow(*args):
+        time.sleep(0.3)
+
+    monkeypatch.setattr(retell, "choose_voice_model", lambda *args: slow() or None)
+    monkeypatch.setattr(retell, "needs_facts", lambda text: False)
+    monkeypatch.setattr(retell, "place_note", lambda *args: "")
+    monkeypatch.setattr(retell, "contact_check", lambda *args: ("", False))
+    monkeypatch.setattr(retell, "sounds_unfinished", lambda text: False)
+    monkeypatch.setattr(retell, "bridges_enabled", lambda: False)
+    monkeypatch.setattr(retell, "search_text", lambda text, messages: text)
+    monkeypatch.setattr(retell, "_system_prompt", lambda *args: slow() or ("Business facts" if args[4] else "No facts"))
+    monkeypatch.setattr(retell, "_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(retell.brain_service, "knowledge_text", lambda: "")
+
+    def complete(messages, *args, **kwargs):
+        seen["system"] = messages[0]["content"]
+        yield "Could I have your full name?"
+
+    services = SimpleNamespace(fallback_model="fallback", config=SimpleNamespace(OPENROUTER_MODEL="main"),
+                               stream_chat_completion=complete)
+    timings = {}
+
+    async def run():
+        transcript = [{"role": "assistant", "content": "Shall I pass your details on?"}, {"role": "user", "content": "Yeah. Yeah."}]
+        return "".join([chunk async for chunk in retell._stream_reply(
+            services, transcript, "unknown", "call", 1, timings=timings)])
+
+    asyncio.run(run())
+    assert seen["system"] == "Business facts"
+    assert timings["preparation_ms"] < 550, timings  # 0.3 s + 0.3 s one after the other would be >= 600 ms
