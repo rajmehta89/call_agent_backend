@@ -643,3 +643,32 @@ def test_a_complete_spoken_email_is_read_back_not_asked_again():
     from voice_turns import contact_check
     note, problem = contact_check("Yeah. It is Raj m. Two six seven seven four seven at g mail dot com.", "Could you please provide your email address?")
     assert not problem and "rajm267747@gmail.com" in note.replace(" ", "") or "r a j m" in note
+
+
+@pytest.mark.parametrize("said", ["Sorry?", "Sorry? Like...", "Excuse me?", "Sorry, can you say that again?"])
+def test_sorry_after_the_agent_finished_asks_to_repeat_not_to_pause(said):
+    # From a real call: "Sorry?" to a finished question got "Of course. Go ahead." twice.
+    from voice_turns import asks_to_repeat
+    assert asks_to_repeat(said)
+    assert not asks_to_repeat(said, spoke_over_agent=True)  # said over the agent: the caller wants it to stop
+
+
+@pytest.mark.parametrize("said", ["Wait a second.", "Hold on a moment.", "Stop.", "Sorry. Sorry.", "Let me finish."])
+def test_real_pause_requests_still_pause(said):
+    from voice_turns import asks_to_repeat
+    assert pause_request(said) and not asks_to_repeat(said)
+
+
+@pytest.mark.parametrize("said", ["I couldn't hear you.", "You broke up there.", "Huh?", "Sorry, I missed that.",
+                                  "I lost you for a second.", "It was not clear, can you tell me again?"])
+def test_not_hearing_the_agent_is_a_repeat_request_by_meaning(said):
+    from voice_turns import asks_to_repeat
+    assert asks_to_repeat(said)
+
+
+@pytest.mark.parametrize("said", ["What is your home beer voice for?", "Sorry, do you have black basins?",
+                                  "I'm sorry to hear that.", "Sorry, my name is Raj."])
+def test_a_real_ask_or_remark_with_sorry_is_not_a_repeat_request(said):
+    # "What is your home beer voice for?" is a misheard business question: a close call is answered, not repeated.
+    from voice_turns import asks_to_repeat
+    assert not asks_to_repeat(said)

@@ -36,6 +36,20 @@ def pause_request(caller_text: str) -> bool:
                 and ranked[0][1] - ranked[1][1] >= PAUSE_TURN.close_call)
 
 
+def asks_to_repeat(caller_text: str, spoke_over_agent: bool = False) -> bool:
+    """A "Sorry?" or "Excuse me?" after the agent finished asks it to say that again; the same words said over the agent
+    ask it to stop. Judged by meaning together with that call state: from a real call, "Sorry?" to a finished question
+    got "Of course. Go ahead." twice instead of the question again."""
+    if spoke_over_agent:
+        return False
+    from turn_meaning import CALLER_TURN
+    # "Say that again" must be the closest meaning. When a real ask is a close call (a misheard question such as "What
+    # is your home beer voice for?"), the turn is answered as usual rather than guessed to be a repeat request; a close
+    # acknowledgement or remark ("Huh?", "Sorry, I missed that.") changes nothing.
+    kinds = CALLER_TURN.close(kind_of_turn_text(caller_text))
+    return bool(kinds) and kinds[0] == "clarify" and not set(kinds[1:]) & {"question", "search", "request", "compound"}
+
+
 def pause_reply(caller_text: str) -> str:
     return "Of course. Go ahead."
 

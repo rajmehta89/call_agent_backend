@@ -43,9 +43,13 @@ CALLER_TURN = Classifier("caller turn", {
                 "Could the team ring me about a product?", "Can someone call me about the vanity unit?", "I'd like a quote for a product.",
                 "Can I get a callback about some tiles?", "Have someone phone me about the bath please."],
     "clarify": ["What do you mean?", "Sorry, can you say that again?", "I didn't catch that.", "Can you repeat that?",
-                "What does that mean?", "Pardon?", "I don't understand.", "Come again?"],
+                "What does that mean?", "Pardon?", "I don't understand.", "Come again?",
+                # Not hearing the agent asks for the same thing: from real calls, "Sorry?" after a finished question.
+                "I couldn't hear you.", "You broke up a bit there.", "The line cut out for a second.", "Your voice is breaking up.",
+                "I can't hear you properly."],
     "statement": ["I'm renovating my bathroom.", "We just bought a new house.", "I already have the tiles.", "I'm a builder.",
-                  "The room is quite small.", "We're doing the kitchen next month.", "My partner likes black fittings.", "I saw it on your website."],
+                  "The room is quite small.", "We're doing the kitchen next month.", "My partner likes black fittings.", "I saw it on your website.",
+                  "I'm sorry to hear that."],
 })
 
 AGENT_ASKED = Classifier("agent asked", {

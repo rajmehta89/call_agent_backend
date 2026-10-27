@@ -29,7 +29,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
-from voice_turns import pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
+from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, complete_nova_turn
@@ -514,12 +514,13 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     checks_started = perf_counter()
     facts_prompt = asyncio.ensure_future(asyncio.to_thread(prompt_with_facts, True))
     try:
-        turn_model, (details_note, details_problem), places, question, _ = await asyncio.gather(
+        turn_model, (details_note, details_problem), places, question, _, repeat = await asyncio.gather(
             asyncio.to_thread(choose_voice_model, text, agent_text, earlier_text),
             asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
             asyncio.to_thread(check_places),
             asyncio.to_thread(needs_facts, text),
             asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text),
+            asyncio.to_thread(asks_to_repeat, text) if agent_text else asyncio.sleep(0, False),
         )
         checks_ms = round((perf_counter() - checks_started) * 1000)
         if details_problem:
@@ -563,6 +564,10 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         messages.append({"role": "system", "content": f"The caller has already provided a valid contact number: {verified_phone}. Keep it for this call. Do not call it incomplete or ask for it again."})
     if places:
         messages.append({"role": "system", "content": places})
+    if repeat:
+        messages.append({"role": "system", "content": "The caller did not catch your last reply and asked you to say it again. "
+                         "Say its main point again, shorter and in plain words, and ask again any question it asked. "
+                         "Do not add new information or move the conversation on."})
     offered = yes_to_offer_note(text, last_agent_text(history))
     if offered:
         messages.append({"role": "system", "content": offered})
@@ -859,6 +864,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     # Question currently being answered, until its reply starts playing.
     unanswered_text = ""
     interrupted_pending_turn = False
+    spoke_over_agent = False  # the caller's current turn was said while the agent was speaking or about to
     recently_completed_turn_text = ""
     recently_completed_turn_at = 0.0
     active = True
@@ -1576,8 +1582,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
         nonlocal interrupted_pending_turn
         nonlocal turn_word_end, completion_text, completion_task, nova_speech_final_text
-        nonlocal recently_completed_turn_text, recently_completed_turn_at
+        nonlocal recently_completed_turn_text, recently_completed_turn_at, spoke_over_agent
         completion_text = ""
+        over_agent, spoke_over_agent = spoke_over_agent, False
         if completion_task is not None:
             completion_task.cancel()
             completion_task = None
@@ -1616,7 +1623,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
             save_progress()
             return
-        if await asyncio.to_thread(pause_request, text):
+        if await asyncio.to_thread(pause_request, text) and not await asyncio.to_thread(asks_to_repeat, text, over_agent):
             drop_reply(prepared)
             if reply_task and not reply_task.done():
                 reply_task.cancel()
@@ -1674,7 +1681,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal completion_task, completion_text
         nonlocal stt_result_events, stt_final_events, stt_speech_final_events, stt_flux_end_of_turn_events
         nonlocal stt_speech_started_events, stt_nonempty_transcript_events, stt_empty_speech_final_events
-        nonlocal recently_completed_turn_text, recently_completed_turn_at
+        nonlocal recently_completed_turn_text, recently_completed_turn_at, spoke_over_agent
         def record_words(words):
             nonlocal latest_word_end, turn_word_end, heard_changed_at
             end = max((float(word.get("end") or 0) for word in words or []), default=0.0)
@@ -1699,6 +1706,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     words = str(payload.get("transcript") or "").split()
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
                     if bot_busy() and payload.get("event") in {"Update", "StartOfTurn"}:
+                        spoke_over_agent = spoke_over_agent or bool(words)
                         if payload.get("event") == "StartOfTurn" and len(words) >= 2 and not early_reply:
                             await interrupt(preserve_unanswered=True)
                         elif payload.get("event") == "Update" and words:
@@ -1753,6 +1761,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     recently_completed_turn_text = ""
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
                 if bot_busy():
+                    spoke_over_agent = True
                     pause = await asyncio.to_thread(pause_request, text)
                     if pause:
                         await interrupt(force=True)
