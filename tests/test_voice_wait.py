@@ -145,6 +145,7 @@ def test_fast_model_selects_only_an_approved_wait_line(monkeypatch):
     fallback = "Let's see what would work best for you."
     diagnostics = {}
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    monkeypatch.setenv("VOICE_BRIDGE_MODEL", "true")
     monkeypatch.setattr(voice_turns, "bridge_model_seconds", lambda: 0.4)
     line = asyncio.run(wait_message(services, fallback, "What should I do with the drawing room?", diagnostics=diagnostics))
 
@@ -161,6 +162,7 @@ def test_wait_line_falls_back_when_fast_model_is_unavailable(monkeypatch):
     from voice_wait import wait_message
 
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    monkeypatch.setenv("VOICE_BRIDGE_MODEL", "true")
     services = SimpleNamespace(openai_client=None)
     diagnostics = {}
     fallback = "Just putting that together for you."
@@ -187,6 +189,7 @@ def test_slow_bridge_selection_uses_the_semantic_line_within_its_budget(monkeypa
                     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 1}'))])
 
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    monkeypatch.setenv("VOICE_BRIDGE_MODEL", "true")
     monkeypatch.setattr(voice_turns, "bridge_model_seconds", lambda: 0.1)
     services = SimpleNamespace(openai_client=Client(), _openrouter_extra_body=lambda model: None)
     diagnostics = {}
@@ -202,3 +205,20 @@ def test_slow_bridge_selection_uses_the_semantic_line_within_its_budget(monkeypa
     assert elapsed < 0.18
     assert diagnostics["bridge_selector"] == "semantic_fallback"
     assert diagnostics["bridge_model_status"] == "timeout"
+
+
+def test_bridge_line_chosen_by_meaning_is_used_without_a_model_request(monkeypatch):
+    from types import SimpleNamespace
+    from voice_wait import wait_message
+
+    class Client:
+        def with_options(self, **options):
+            raise AssertionError("no bridge model request by default")
+
+    monkeypatch.delenv("VOICE_BRIDGE_MODEL", raising=False)
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    diagnostics = {}
+    line = asyncio.run(wait_message(SimpleNamespace(openai_client=Client()), "Let me check that for you.", "Do you have it in black?",
+                                    diagnostics=diagnostics))
+    assert line == "Let me check that for you."
+    assert diagnostics["bridge_selector"] == "semantic" and diagnostics["bridge_model_attempted"] is False

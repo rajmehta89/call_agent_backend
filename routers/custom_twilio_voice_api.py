@@ -1924,6 +1924,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                                      # Why this call listened with Nova or Flux (no secrets): the settings that decide it.
+                                      "stt_selection": {"custom_stt": os.getenv("CUSTOM_STT", "flux (default)"),
+                                                        "auto_language": _auto_language_enabled(),
+                                                        "language": preferred_language,
+                                                        "flux_wanted": _use_flux_for_language(preferred_language)},
                                       "stt_connected": deepgram is not None,
                                       "input_audio_seconds": round(audio_received_seconds, 1),
                                       "stt_result_events": stt_result_events,

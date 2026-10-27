@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from time import perf_counter
 
 
@@ -11,6 +12,14 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
         return ""
     started = perf_counter()
     from voice_turns import STATUS_PHRASES, bridge_model_seconds, fast_voice_model
+
+    # VOICE_BRIDGE_MODEL (default off): the line passed in is already chosen by meaning for this turn. Asking the
+    # small model to re-pick it timed out on 4 of 10 production Retell attempts (450 ms each) for no better line.
+    if os.getenv("VOICE_BRIDGE_MODEL", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        if diagnostics is not None:
+            diagnostics.update(bridge_selector="semantic", bridge_model_attempted=False,
+                               bridge_model_status="off", bridge_model_ms=0)
+        return fallback
 
     model = fast_voice_model()
     client = getattr(services, "openai_client", None)
