@@ -48,6 +48,6 @@ services:
       - key: ELEVENLABS_MODEL_ID
         value: eleven_v4_turbo
       - key: CUSTOM_AUTO_LANGUAGE
-        value: "true"
+        value: "false"
       - key: CUSTOM_STT
         value: flux
