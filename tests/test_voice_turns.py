@@ -7,7 +7,7 @@ from voice_turns import pause_request, search_text
 
 
 def test_explicit_pause_is_not_a_new_product_request():
-    for text in ["Sorry", "Yeah, sorry, sorry.", "Wait, please.", "Hold on a second.", "Stop."]:
+    for text in ["Sorry", "Sorry?", "Yeah, sorry, sorry.", "Wait, please.", "Hold on a second.", "Stop."]:
         assert pause_request(text)
     for text in ["Sorry, what sizes do you have?", "I want a stop valve.", "The delivery wait is too long."]:
         assert not pause_request(text)
@@ -16,6 +16,7 @@ def test_explicit_pause_is_not_a_new_product_request():
 def test_nova_turn_completion_only_fast_closes_confidently_complete_meaning(monkeypatch):
     from turn_meaning import CONTACT, TURN_COMPLETION
 
+    monkeypatch.setattr(voice_turns, "pause_request", lambda _text: False)
     monkeypatch.setattr(CONTACT, "best", lambda text: "other")
     monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: [
         ("unfinished", 0.90), ("complete", 0.70)])
@@ -31,6 +32,12 @@ def test_nova_turn_completion_only_fast_closes_confidently_complete_meaning(monk
 
     monkeypatch.setattr(TURN_COMPLETION, "rank", lambda text: None)
     assert voice_turns.complete_nova_turn("A question") is None
+
+
+def test_semantic_pause_closes_nova_turn_early(monkeypatch):
+    monkeypatch.setattr(voice_turns, "pause_request", lambda _text: True)
+    assert voice_turns.complete_nova_turn("a short interruption") is True
+    assert voice_turns.pause_reply("Sorry?") == "Of course. Go ahead."
 
 
 def test_would_love_to_preserves_the_product_context_for_an_accepted_offer(monkeypatch):

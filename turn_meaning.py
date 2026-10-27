@@ -243,12 +243,13 @@ CALLBACK_ACK_CONTEXT = Classifier("callback confirmation context", {
 
 
 PAUSE_TURN = Classifier("caller pause", {
-    "pause": ["Sorry. Sorry.", "Wait a second.", "Please stop.", "Hold on a moment.",
-              "Hang on please.", "Excuse me.", "Let me finish.", "Sorry.", "Wait, please.", "Stop."],
-    "other": ["Sorry, can you explain the delivery options?", "I didn't catch that, could you repeat it?",
-              "Can you stop the delivery?", "I am waiting for my order.", "Yes, please.",
+    "pause": ["Sorry. Sorry.", "Sorry?", "Sorry there.", "Wait a second.", "Please stop.", "Hold on a moment.",
+              "Hang on please.", "Excuse me.", "Excuse me?", "Let me finish.", "Sorry.", "Wait, please.", "Stop."],
+    "other": ["Sorry, what sizes do you have?", "Sorry, can you explain the delivery options?",
+              "I didn't catch that, could you repeat it?", "Can you stop the delivery?",
+              "I want a stop valve.", "I am waiting for my order.", "Yes, please.",
               "What is the price?", "Someone call me later.", "Please transfer me."],
-}, min_score=0.75, close_call=0.04)
+}, min_score=0.78, close_call=0.04)
 
 AGENT_FAREWELL = Classifier("agent farewell", {
     "farewell": ["Thank you for calling. Goodbye.", "Have a great day, Raj. Goodbye.",

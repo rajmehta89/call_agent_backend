@@ -37,7 +37,7 @@ def pause_request(caller_text: str) -> bool:
 
 
 def pause_reply(caller_text: str) -> str:
-    return "Would you like me to repeat that?" if caller_text.strip().endswith("?") else "Of course. Go ahead."
+    return "Of course. Go ahead."
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:
@@ -1053,13 +1053,15 @@ def caller_country_line(caller_id: str) -> str:
 
 
 def complete_nova_turn(caller_text: str) -> Optional[bool]:
-    """A confident complete meaning may close a stalled Nova turn after real silence.
+    """A complete meaning or explicit request to pause may close a stalled Nova turn after real silence.
 
     Contact dictation keeps the longer watchdog so a pause cannot cut a number
     or email in half. None means there was no confident semantic decision, so
     callers can fall back to Deepgram's end-of-speech signal. No phrase rules decide completion.
     """
     from turn_meaning import TURN_COMPLETION, CONTACT
+    if pause_request(caller_text):
+        return True
     contact = CONTACT.best(caller_text)
     if contact is None:
         return None

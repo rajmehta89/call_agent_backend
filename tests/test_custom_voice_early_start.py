@@ -323,6 +323,55 @@ def test_one_word_sorry_cancels_the_pending_answer_without_a_new_product_lookup(
     assert any(event.get("event") == "clear" for event in outgoing)
 
 
+def test_speech_started_stops_reply_and_keeps_the_unfinished_caller_turn(monkeypatch):
+    outgoing = []
+    original = custom.WebSocket.send_text
+
+    async def record(socket, text):
+        outgoing.append(json.loads(text))
+        await original(socket, text)
+
+    monkeypatch.setattr(custom.WebSocket, "send_text", record)
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
+    script = [
+        (0.2, "What do you sell?", True, True),
+        (1.0, {"type": "SpeechStarted"}),
+        (1.2, "I meant the bathroom products.", True, True),
+    ]
+    starts, finished = run_call(monkeypatch, script, model_seconds=1.0, call_seconds=4.0)
+
+    assert any(event.get("event") == "clear" for event in outgoing)
+    assert len(starts) == 2, starts
+    assert starts[1][1] == "What do you sell? I meant the bathroom products."
+    assert finished == ["What do you sell? I meant the bathroom products."]
+
+
+def test_any_speech_start_clears_audio_already_playing(monkeypatch):
+    outgoing = []
+    original = custom.WebSocket.send_text
+
+    async def record(socket, text):
+        outgoing.append(json.loads(text))
+        await original(socket, text)
+
+    monkeypatch.setattr(custom.WebSocket, "send_text", record)
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
+    script = [
+        (0.2, "What do you sell?", True, True),
+        (1.1, {"type": "SpeechStarted"}),
+        (1.3, "Actually, I meant the bathroom products.", True, True),
+    ]
+    starts, finished = run_call(monkeypatch, script, model_seconds=0.05, call_seconds=3.5)
+
+    media_indices = [index for index, event in enumerate(outgoing) if event.get("event") == "media"]
+    clear_indices = [index for index, event in enumerate(outgoing) if event.get("event") == "clear"]
+    assert len(media_indices) >= 2, outgoing  # greeting plus the answer that was interrupted
+    assert clear_indices and clear_indices[0] > media_indices[1], outgoing
+    assert len(starts) == 2, starts
+    assert starts[1][1] == "Actually, I meant the bathroom products."
+    assert finished == ["What do you sell?", "Actually, I meant the bathroom products."]
+
+
 def test_early_reply_is_dropped_when_the_caller_goes_on(monkeypatch):
     script = [(0.5, "do you sell", False, False),     # pause: an early reply starts
               (1.0, "do you sell basins", False, False),  # caller goes on: dropped
