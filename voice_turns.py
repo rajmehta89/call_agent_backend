@@ -1074,8 +1074,13 @@ def complete_nova_turn(caller_text: str) -> Optional[bool]:
         return None
     # Only a confident result may override Nova's fixed-gap signal. A close
     # or low-confidence result falls back to that signal so multilingual calls
-    # keep their normal response time.
+    # keep their normal response time. For a one- or two-word utterance with a
+    # clear terminal mark, its prosody has already conveyed the turn boundary
+    # even when the completeness classifier finds the words ambiguous.
     if (ranked[0][1] < TURN_COMPLETION.min_score
             or ranked[0][1] - ranked[1][1] < 0.04):
+        has_terminal_mark = bool(re.search(r"[.!?][\"'’)]*$", caller_text.strip()))
+        if has_terminal_mark and len(re.findall(r"[^\W_]+", caller_text)) <= 2:
+            return True
         return None
     return ranked[0][0] == "complete"

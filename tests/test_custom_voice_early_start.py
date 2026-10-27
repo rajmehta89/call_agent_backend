@@ -323,7 +323,7 @@ def test_one_word_sorry_cancels_the_pending_answer_without_a_new_product_lookup(
     assert any(event.get("event") == "clear" for event in outgoing)
 
 
-def test_speech_started_stops_reply_and_keeps_the_unfinished_caller_turn(monkeypatch):
+def test_recognized_barge_in_stops_reply_and_keeps_the_unfinished_caller_turn(monkeypatch):
     outgoing = []
     original = custom.WebSocket.send_text
 
@@ -340,13 +340,12 @@ def test_speech_started_stops_reply_and_keeps_the_unfinished_caller_turn(monkeyp
     ]
     starts, finished = run_call(monkeypatch, script, model_seconds=1.0, call_seconds=4.0)
 
-    assert any(event.get("event") == "clear" for event in outgoing)
     assert len(starts) == 2, starts
     assert starts[1][1] == "What do you sell? I meant the bathroom products."
     assert finished == ["What do you sell? I meant the bathroom products."]
 
 
-def test_any_speech_start_clears_audio_already_playing(monkeypatch):
+def test_recognized_speech_clears_audio_already_playing(monkeypatch):
     outgoing = []
     original = custom.WebSocket.send_text
 
@@ -372,33 +371,37 @@ def test_any_speech_start_clears_audio_already_playing(monkeypatch):
     assert finished == ["What do you sell?", "Actually, I meant the bathroom products."]
 
 
-def test_empty_speech_final_recovers_instead_of_leaving_dead_air(monkeypatch):
-    spoken, logged = [], []
+def test_vad_noise_during_greeting_does_not_interrupt_or_claim_caller_was_unclear(monkeypatch):
+    outgoing, logged = [], []
+    original = custom.WebSocket.send_text
+
+    async def record(socket, text):
+        outgoing.append(json.loads(text))
+        await original(socket, text)
+
+    monkeypatch.setattr(custom.WebSocket, "send_text", record)
+    monkeypatch.setenv("VOICE_REMINDER_TRIGGER_MS", "1000")
     monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
     monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
     monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
-
-    async def tts(text, engine, language="en"):
-        spoken.append(text)
-        yield b"\xff" * 160
-
     script = [
-        (0.2, "What do you sell?", True, True),
-        (1.1, {"type": "SpeechStarted"}),
-        (1.3, "", True, True),
+        (0.1, {"type": "SpeechStarted"}),
+        (0.3, {"type": "Results", "is_final": True, "speech_final": True,
+               "channel": {"alternatives": [{"transcript": ""}]}}),
     ]
-    run_call(monkeypatch, script, tts=tts, model_seconds=0.05, call_seconds=2.4, logged=logged)
+    run_call(monkeypatch, script, model_seconds=0.05, call_seconds=2.5, logged=logged)
 
-    assert "I couldn't hear you clearly. Please say that again." in spoken
+    spoken = [item["content"] for item in logged[-1]["ai_responses"]]
+    assert "I couldn't hear you clearly. Please say that again." not in spoken
+    assert "I'm here whenever you're ready. What can I help you with?" in spoken
+    assert not any(event.get("event") == "clear" for event in outgoing)
     metadata = logged[-1]["provider_metadata"]
     assert metadata["stt_speech_started_events"] == 1
     assert metadata["stt_empty_speech_final_events"] == 1
-    assert metadata["stt_nonempty_transcript_events"] == 1
-    assert logged[-1]["voice_turn_timings"][-1]["action"] == "speech_recovery_prompt"
+    assert metadata["stt_nonempty_transcript_events"] == 0
 
 
-def test_unrecognized_barge_in_retries_a_question_that_has_not_been_answered(monkeypatch):
-    monkeypatch.setenv("CUSTOM_SPEECH_RECOVERY_MS", "500")
+def test_vad_without_transcript_does_not_cancel_or_repeat_the_pending_answer(monkeypatch):
     monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
     monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
     monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
@@ -407,7 +410,7 @@ def test_unrecognized_barge_in_retries_a_question_that_has_not_been_answered(mon
 
     starts, finished = run_call(monkeypatch, script, model_seconds=1.2, call_seconds=3.5)
 
-    assert [text for _, text in starts] == [question, question]
+    assert [text for _, text in starts] == [question]
     assert finished == [question]
 
 

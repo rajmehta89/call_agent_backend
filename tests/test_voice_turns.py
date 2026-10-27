@@ -34,6 +34,18 @@ def test_nova_turn_completion_only_fast_closes_confidently_complete_meaning(monk
     assert voice_turns.complete_nova_turn("A question") is None
 
 
+def test_short_terminal_utterance_closes_when_completion_scores_are_ambiguous(monkeypatch):
+    from turn_meaning import CONTACT, TURN_COMPLETION
+
+    monkeypatch.setattr(voice_turns, "pause_request", lambda _text: False)
+    monkeypatch.setattr(CONTACT, "best", lambda _text: "other")
+    monkeypatch.setattr(TURN_COMPLETION, "rank", lambda _text: [
+        ("unfinished", 0.714), ("complete", 0.688)])
+
+    assert voice_turns.complete_nova_turn("Hello?") is True
+    assert voice_turns.complete_nova_turn("Could you tell me") is None
+
+
 def test_semantic_pause_closes_nova_turn_early(monkeypatch):
     monkeypatch.setattr(voice_turns, "pause_request", lambda _text: True)
     assert voice_turns.complete_nova_turn("a short interruption") is True
