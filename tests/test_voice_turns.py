@@ -672,3 +672,22 @@ def test_a_real_ask_or_remark_with_sorry_is_not_a_repeat_request(said):
     # "What is your home beer voice for?" is a misheard business question: a close call is answered, not repeated.
     from voice_turns import asks_to_repeat
     assert not asks_to_repeat(said)
+
+
+def test_a_product_question_that_starts_with_okay_goes_to_the_careful_model(monkeypatch):
+    # Production call: "Okay. ... the handle and the basin ... So is it possible?" was judged by its last sentence,
+    # answered on the fast model and got no products. Margins below are the measured store-intent scores.
+    import store_intent
+    measured = {
+        "Okay. So I just bought a new house, and I was thinking about the handle and the basin. So is it possible?":
+            [("product", 0.745), ("none", 0.661), ("order", 0.601)],
+        "Do you have matte black basins?": [("product", 0.710), ("none", 0.658), ("order", 0.559)],
+        "What can I do?": [("product", 0.782), ("none", 0.742), ("order", 0.688)],
+    }
+    monkeypatch.setattr(store_intent, "rank", lambda text, earlier="": measured.get(text, [("none", 0.8), ("product", 0.5)]))
+    monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    from voice_turns import store_question, STORE_ROUTE_LEAD
+    assert store_question(list(measured)[0], lead=STORE_ROUTE_LEAD)
+    assert store_question("Do you have matte black basins?", lead=STORE_ROUTE_LEAD)
+    assert not store_question("What can I do?", lead=STORE_ROUTE_LEAD)  # a broad question stays a general one
+    assert choose_voice_model(list(measured)[0], "We sell bathroom products.") is None

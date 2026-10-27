@@ -96,11 +96,15 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
     return selected
 
 
-async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None):
-    """Race the first answer against the wait deadline and bridge generation."""
+async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None,
+                           late_line="", late_after=0.0):
+    """Race the first answer against the wait deadline and bridge generation.
+    late_line/late_after: when no bridge was said (a "Yeah." turn does not get one) and the answer has still not started
+    late_after seconds after started_at, say late_line once, so the caller does not sit in a long silence."""
     iterator = source.__aiter__()
     first = asyncio.create_task(anext(iterator))
     choice = None
+    said = False
     try:
         if after_seconds > 0:
             remaining = max(0.0, after_seconds - (perf_counter() - started_at))
@@ -122,9 +126,18 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
                         except Exception:
                             line = fallback
                     if line:
+                        said = True
                         if on_bridge is not None:
                             on_bridge(line)
                         yield line + " "
+        if not said and late_line and late_after > 0 and not first.done():
+            remaining = late_after - (perf_counter() - started_at)
+            if remaining > 0:
+                await asyncio.wait({first}, timeout=remaining)
+            if not first.done():
+                if on_bridge is not None:
+                    on_bridge(late_line)
+                yield late_line + " "
         try:
             yield await first
         except StopAsyncIteration:

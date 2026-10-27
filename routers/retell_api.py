@@ -25,7 +25,7 @@ from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import with_wait_bridge, wait_message
-from voice_turns import wait_bridge_phrase
+from voice_turns import wait_bridge_phrase, late_filler, late_filler_seconds
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
@@ -416,7 +416,9 @@ def _no_lookup_turn(caller_text: str) -> bool:
     """"Sorry?", "Yes.", "Thanks, bye": nothing to look up in the store (the reply re-explains or carries on from the
     call so far). Judged by meaning; a store lookup otherwise costs up to a second or two on these turns."""
     from turn_meaning import CALLER_TURN
-    from voice_turns import kind_of_turn_text
+    from voice_turns import kind_of_turn_text, store_question
+    if store_question(caller_text):
+        return False  # "Okay. ... the handle and the basin ... is it possible?" is a product question, not an "okay"
     if pause_request(caller_text) or is_acknowledgement(caller_text):
         return True
     try:
@@ -1388,7 +1390,9 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
             stream = with_wait_bridge(source, make_bridge, fallback,
                                       status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, speech_ended,
-                                      on_bridge=record_bridge)
+                                      on_bridge=record_bridge,
+                                      late_line="" if reminder or bridge_prelude or not bridges_enabled() else late_filler(recent),
+                                      late_after=late_filler_seconds())
             async with contextlib.aclosing(stream):
                 async for chunk in stream:
                     if response_id != latest_response_id:

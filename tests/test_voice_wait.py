@@ -222,3 +222,39 @@ def test_bridge_line_chosen_by_meaning_is_used_without_a_model_request(monkeypat
                                     diagnostics=diagnostics))
     assert line == "Let me check that for you."
     assert diagnostics["bridge_selector"] == "semantic" and diagnostics["bridge_model_attempted"] is False
+
+
+def _late_run(answer_after, bridge_line):
+    async def run():
+        async def source():
+            await asyncio.sleep(answer_after)
+            yield "The answer."
+
+        async def bridge():
+            return bridge_line
+
+        said = []
+        stream = with_wait_bridge(source(), bridge, "", 0.01, perf_counter(), said.append,
+                                  late_line="Mm, one moment.", late_after=0.05)
+        return [part async for part in stream], said
+
+    return asyncio.run(run())
+
+
+def test_a_turn_without_its_own_filler_gets_one_short_late_line():
+    # "Yeah. Yeah. I will." got no acknowledgement and then 5 s of silence on a production call.
+    parts, said = _late_run(0.15, "")
+    assert parts == ["Mm, one moment. ", "The answer."] and said == ["Mm, one moment."]
+
+
+def test_no_late_line_after_a_filler_or_for_a_quick_answer():
+    parts, _ = _late_run(0.15, "Let me check that for you.")
+    assert parts == ["Let me check that for you. ", "The answer."]  # one filler only
+    parts, _ = _late_run(0.0, "")
+    assert parts == ["The answer."]  # the answer was ready: nothing extra said
+
+
+def test_late_filler_never_repeats_the_last_one():
+    from voice_turns import LATE_FILLERS, late_filler
+    assert late_filler([LATE_FILLERS[0]]) == LATE_FILLERS[1]
+    assert late_filler([LATE_FILLERS[1]]) == LATE_FILLERS[0]

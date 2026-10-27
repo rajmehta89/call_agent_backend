@@ -32,7 +32,7 @@ from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import with_wait_bridge, wait_message
-from voice_turns import wait_bridge_phrase, complete_nova_turn
+from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
@@ -1338,7 +1338,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 bridge_timing["bridge_ms"] = round((perf_counter() - heard_at) * 1000)
 
             deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
-            stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge)
+            stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge,
+                                      late_line="" if prefix or not bridges_enabled() else late_filler(recent_bridges),
+                                      late_after=late_filler_seconds())
             try:
                 sentence = ""
                 async with contextlib.aclosing(stream):

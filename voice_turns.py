@@ -64,6 +64,12 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
     fast = fast_voice_model()
     if not fast:
         return None
+    # The whole turn, judged by meaning, clearly asks about the store's products or an order: the careful model, which
+    # gets the live store data. The checks below read only the last sentence: "Okay. So I just bought a new house and
+    # I was thinking about the handle and the basin. So is it possible?" was judged by "So is it possible?" and a
+    # production call answered it on the fast model with no products at all.
+    if store_question(caller_text, " ".join(part for part in (earlier, agent_text) if part), lead=STORE_ROUTE_LEAD):
+        return None
     is_simple = _simple_turn(caller_text, agent_text)
     if is_simple is True:
         return fast
@@ -847,10 +853,27 @@ STATUS_PHRASES = ("I'm working through the details now.", "Just putting that tog
 # A question the live store answers (a price, stock, sizes, a warranty, an order): the store lookup really runs, so
 # saying so is true, and it fills the ~2 s the lookup and the model take. Only for those turns (store_lookup_runs).
 LOOKUP_BRIDGES = ("Let me check that for you.", "One sec, I'll have a look.", "Let me just look that up.", "Bear with me, I'll check.")
-ALL_BRIDGES = (*SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES,
+# Said only when a turn without its own acknowledgement ("Yeah.") still has no answer after VOICE_LATE_FILLER_MS.
+LATE_FILLERS = ("Mm, one moment.", "Okay, just a moment.")
+ALL_BRIDGES = (*LATE_FILLERS, *SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES,
                *STATUS_PHRASES, *LOOKUP_BRIDGES)
 
 _bridge_turn = 0
+
+
+def late_filler(recent=()) -> str:
+    """The late filler to say now: never the one said last."""
+    recent = list(recent or ())
+    return next((line for line in LATE_FILLERS if not recent or line != recent[-1]), LATE_FILLERS[0])
+
+
+def late_filler_seconds() -> float:
+    """VOICE_LATE_FILLER_MS: after this long with nothing said, a turn that got no acknowledgement gets a short
+    "Mm, one moment." (0 = never). From a production call: "Yeah. Yeah. I will." was followed by 5 s of silence."""
+    try:
+        return max(0.0, float(os.getenv("VOICE_LATE_FILLER_MS", "2000"))) / 1000
+    except ValueError:
+        return 2.0
 
 
 def bridge_delay_seconds() -> float:
@@ -874,6 +897,30 @@ def status_after_seconds() -> float:
 def bridges_enabled() -> bool:
     """VOICE_BRIDGE: say a short acknowledgement that fits what the caller said, while the answer is prepared."""
     return os.getenv("VOICE_BRIDGE", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+STORE_ROUTE_LEAD = 0.05  # how far products or an order must lead "none" for the whole turn to go to the careful model
+
+
+def store_question(caller_text: str, earlier: str = "", lead: Optional[float] = None) -> bool:
+    """The whole turn asks for the store's products or an order (store_intent, by meaning), whatever it starts with
+    ("Okay. ...") or ends with ("... is it possible?"). lead=None: the store lookup's own test (clearly_wanted); a number:
+    products or an order must lead "none" by that much. Measured on real turns: "Do you have matte black basins?" leads
+    by 0.052 and the handle-and-basin turn by 0.084, while a broad "What can I do?" (0.040) stays a general question.
+    False when the meaning model is unavailable."""
+    try:
+        import store_intent
+        context = " ".join((earlier or "").split()[-25:])
+        if lead is None:
+            return bool(store_intent.clearly_wanted(caller_text, context))
+        ranked = store_intent.rank(caller_text, context)
+        if not ranked:
+            return False
+        scores = dict(ranked)
+        best = max(scores.get("product", 0.0), scores.get("order", 0.0))
+        return best >= store_intent.STORE.min_score and best - scores.get("none", 0.0) >= lead
+    except Exception:
+        return False
 
 
 def store_lookup_runs(caller_text: str, earlier: str = "") -> bool:

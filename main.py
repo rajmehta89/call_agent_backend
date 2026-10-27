@@ -68,7 +68,7 @@ app.add_middleware(
 )
 
 # Polling endpoints would drown out everything else at INFO.
-QUIET_PATHS = ("/health", "/api/platform/notifications")
+QUIET_PATHS = ("/health", "/ready", "/api/platform/notifications")
 
 
 @app.middleware("http")
@@ -100,6 +100,27 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "release": "2026-10-27-voice-fast-first-audio-21"}
+
+
+# Set when the startup warm-up (embedding model, turn classifiers, product catalogue) has finished.
+_voice_warm = __import__("threading").Event()
+_started_at = time.monotonic()
+
+
+@app.get("/ready")
+async def ready_check():
+    """Health check for deploys (Render: Settings > Health Check Path = /ready). 503 until the warm-up has finished,
+    so a new server takes calls only once it is fast: a call 11 minutes after a push had turn checks of up to 5.8 s
+    while the warm-up still ran. After READY_MAX_SECONDS (default 240) it reports ready anyway, so a failed warm-up can
+    never block a deploy. /health stays a plain liveness check."""
+    try:
+        ceiling = max(0.0, float(os.getenv("READY_MAX_SECONDS", "240")))
+    except ValueError:
+        ceiling = 240.0
+    waited = time.monotonic() - _started_at
+    if _voice_warm.is_set() or waited >= ceiling:
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited)}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited)})
 
 # Register all routers
 app.include_router(config_api.router)
@@ -239,8 +260,15 @@ async def warm_local_embeddings() -> None:
             for classifier in vars(turn_meaning).values():
                 if isinstance(classifier, Classifier):
                     classifier.rank("hello")
+            # The product catalogue copy is built in the background: product questions are only fast once it exists.
+            deadline = time.monotonic() + 120
+            while shopify_service.configured and not shopify_service.catalog_index() and time.monotonic() < deadline:
+                time.sleep(1)
+            logging.getLogger(__name__).info("startup warm-up finished in %.0fs", time.monotonic() - _started_at)
         except Exception as error:
             logging.getLogger(__name__).warning("startup warm-up failed: %s", error)
+        finally:
+            _voice_warm.set()
 
     threading.Thread(target=warm, name="warm-voice", daemon=True).start()
 
