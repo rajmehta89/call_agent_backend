@@ -372,6 +372,45 @@ def test_any_speech_start_clears_audio_already_playing(monkeypatch):
     assert finished == ["What do you sell?", "Actually, I meant the bathroom products."]
 
 
+def test_empty_speech_final_recovers_instead_of_leaving_dead_air(monkeypatch):
+    spoken, logged = [], []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
+
+    async def tts(text, engine, language="en"):
+        spoken.append(text)
+        yield b"\xff" * 160
+
+    script = [
+        (0.2, "What do you sell?", True, True),
+        (1.1, {"type": "SpeechStarted"}),
+        (1.3, "", True, True),
+    ]
+    run_call(monkeypatch, script, tts=tts, model_seconds=0.05, call_seconds=2.4, logged=logged)
+
+    assert "I couldn't hear you clearly. Please say that again." in spoken
+    metadata = logged[-1]["provider_metadata"]
+    assert metadata["stt_speech_started_events"] == 1
+    assert metadata["stt_empty_speech_final_events"] == 1
+    assert metadata["stt_nonempty_transcript_events"] == 1
+    assert logged[-1]["voice_turn_timings"][-1]["action"] == "speech_recovery_prompt"
+
+
+def test_unrecognized_barge_in_retries_a_question_that_has_not_been_answered(monkeypatch):
+    monkeypatch.setenv("CUSTOM_SPEECH_RECOVERY_MS", "500")
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: True)
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", lambda *args: "")
+    question = "What do you sell?"
+    script = [(0.2, question, True, True), (1.0, {"type": "SpeechStarted"})]
+
+    starts, finished = run_call(monkeypatch, script, model_seconds=1.2, call_seconds=3.5)
+
+    assert [text for _, text in starts] == [question, question]
+    assert finished == [question]
+
+
 def test_early_reply_is_dropped_when_the_caller_goes_on(monkeypatch):
     script = [(0.5, "do you sell", False, False),     # pause: an early reply starts
               (1.0, "do you sell basins", False, False),  # caller goes on: dropped

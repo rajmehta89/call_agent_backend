@@ -846,6 +846,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     # Question currently being answered, until its reply starts playing.
     unanswered_text = ""
     interrupted_pending_turn = False
+    awaiting_barge_in_transcript = False
+    speech_recovery_task: Optional[asyncio.Task[Any]] = None
     active = True
     stream_failure = ""
     callback_requested = False
@@ -875,6 +877,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     stt_result_events = 0
     stt_final_events = 0
     stt_speech_final_events = 0
+    stt_speech_started_events = 0
+    stt_nonempty_transcript_events = 0
+    stt_empty_speech_final_events = 0
     stt_flux_end_of_turn_events = 0
     latest_word_end = 0.0
     turn_word_end = 0.0
@@ -951,6 +956,72 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if stream_sid:
             pending_mark = ""
             await send_twilio({"event": "clear", "streamSid": stream_sid})
+
+    def cancel_speech_recovery() -> None:
+        nonlocal speech_recovery_task, awaiting_barge_in_transcript
+        awaiting_barge_in_transcript = False
+        if speech_recovery_task and not speech_recovery_task.done():
+            speech_recovery_task.cancel()
+        speech_recovery_task = None
+
+    async def speech_recovery_prompt(trigger: str, waited_ms: int) -> None:
+        line = "I couldn't hear you clearly. Please say that again."
+        started = perf_counter()
+        first_audio = await speak(line)
+        voice_turn_timings.append({
+            "pipeline": "custom_twilio", "tts_engine": engine,
+            "action": "speech_recovery_prompt", "turn_end_trigger": trigger,
+            "recovery_wait_ms": waited_ms,
+            "first_audio_ms": round((perf_counter() - started) * 1000),
+            "tts_first_audio_ms": round(first_audio * 1000),
+        })
+        memory.add_assistant(line)
+        responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
+        save_progress()
+        if active:
+            schedule_silence_reminder()
+
+    def schedule_speech_recovery(delay_seconds: Optional[float] = None, trigger: str = "speech_start_timeout") -> None:
+        """Avoid dead air when VAD hears speech but STT produces no words or completed turn."""
+        nonlocal speech_recovery_task, awaiting_barge_in_transcript, reply_task
+        if not awaiting_barge_in_transcript:
+            return
+        if speech_recovery_task and not speech_recovery_task.done():
+            speech_recovery_task.cancel()
+        wait_seconds = delay_seconds
+        if wait_seconds is None:
+            wait_seconds = _env_number("CUSTOM_SPEECH_RECOVERY_MS", 2200, 500, 6000) / 1000
+
+        async def recover_if_still_unheard() -> None:
+            nonlocal speech_recovery_task, awaiting_barge_in_transcript, reply_task
+            try:
+                await asyncio.sleep(max(0.0, wait_seconds))
+                if not active or transfer_pending or not awaiting_barge_in_transcript:
+                    return
+                if heard_text:
+                    awaiting_barge_in_transcript = False
+                    return
+                awaiting_barge_in_transcript = False
+                speech_recovery_task = None
+                if bot_busy():
+                    return
+                heard_at = perf_counter()
+                if unanswered_text:
+                    # The reply was stopped before any sentence started; retry the pending turn.
+                    if call_sid:
+                        reply_task = asyncio.create_task(answer_or_forward(unanswered_text, heard_at, None, None))
+                    else:
+                        reply_task = asyncio.create_task(answer(unanswered_text, heard_at))
+                else:
+                    reply_task = asyncio.create_task(speech_recovery_prompt(trigger, round(wait_seconds * 1000)))
+                reply_task.add_done_callback(log_reply_failure)
+            except asyncio.CancelledError:
+                raise
+            finally:
+                if speech_recovery_task is asyncio.current_task():
+                    speech_recovery_task = None
+
+        speech_recovery_task = asyncio.create_task(recover_if_still_unheard())
 
     async def end_call_after_playback() -> None:
         """Hang up once the goodbye already sent to Twilio has finished playing (its playback mark came back)."""
@@ -1250,7 +1321,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                      turn_timing: Optional[Dict[str, Any]] = None) -> None:
         """Think and speak at the same time: each sentence goes to ElevenLabs as soon as the model finishes it.
         `prepared`: the reply already started while the caller was finishing (see speculate)."""
-        nonlocal unanswered_text, services, contact_phone
+        nonlocal unanswered_text, interrupted_pending_turn, services, contact_phone
         bind_call(call_sid)  # tasks copy their context when created, before the call id was known
         contact_history = memory.history()
         contact_question = last_agent_text(contact_history)
@@ -1333,6 +1404,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 sentence = "Sorry, I could not answer that just now."
             brain_seconds = perf_counter() - heard_at
             unanswered_text = ""  # committed: from here a new utterance is a new turn
+            interrupted_pending_turn = False
             spoken.append(sentence)
             spoke_at = spoke_at or utc_iso()  # the transcript shows when the agent started speaking, not when it finished
             first_audio = await speak(sentence)
@@ -1630,6 +1702,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal embedding_task, latest_word_end, turn_word_end, heard_changed_at, nova_speech_final_text
         nonlocal completion_task, completion_text
         nonlocal stt_result_events, stt_final_events, stt_speech_final_events, stt_flux_end_of_turn_events
+        nonlocal stt_speech_started_events, stt_nonempty_transcript_events, stt_empty_speech_final_events
+        nonlocal awaiting_barge_in_transcript
         def record_words(words):
             nonlocal latest_word_end, turn_word_end, heard_changed_at
             end = max((float(word.get("end") or 0) for word in words or []), default=0.0)
@@ -1642,20 +1716,31 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 payload = json.loads(raw)
                 kind = payload.get("type")
                 if kind == "SpeechStarted":
+                    stt_speech_started_events += 1
                     cancel_silence_reminder()
                     heard_changed_at = perf_counter()
                     if bot_busy():
                         await interrupt(preserve_unanswered=True)
+                        if not transfer_pending:
+                            awaiting_barge_in_transcript = True
+                            schedule_speech_recovery()
                     continue
                 if kind == "TurnInfo":  # Deepgram Flux
                     if payload.get("event") == "EndOfTurn":
                         stt_flux_end_of_turn_events += 1
                     record_words(payload.get("words"))
                     words = str(payload.get("transcript") or "").split()
+                    if words:
+                        cancel_speech_recovery()
+                    elif payload.get("event") == "EndOfTurn" and awaiting_barge_in_transcript:
+                        schedule_speech_recovery(0.35, "flux_empty_end_of_turn")
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
                     if bot_busy() and payload.get("event") in {"Update", "StartOfTurn"}:
                         if payload.get("event") == "StartOfTurn":
                             await interrupt(preserve_unanswered=True)
+                            if not transfer_pending:
+                                awaiting_barge_in_transcript = True
+                                schedule_speech_recovery()
                         else:
                             pause = await asyncio.to_thread(pause_request, " ".join(words))
                             if len(words) >= 2 or pause:
@@ -1668,6 +1753,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if kind == "UtteranceEnd":
                     if float(payload.get("last_word_end") or 0) + 0.001 < latest_word_end:
                         continue  # A delayed gap signal from an older finalized segment; the caller has continued.
+                    if awaiting_barge_in_transcript and not heard_text:
+                        schedule_speech_recovery(0.35, "nova_empty_utterance_end")
                     if not flux and heard_text:
                         # Treat the fixed-gap signal as a candidate end. Semantic completion or the
                         # incomplete-turn grace period decides whether the caller is actually done.
@@ -1688,11 +1775,17 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         languages_used.add(detected)
                 text = str(alternative.get("transcript") or "").strip()
                 if not text:
+                    if payload.get("is_final") and payload.get("speech_final"):
+                        stt_empty_speech_final_events += 1
+                        if awaiting_barge_in_transcript and not heard_text:
+                            schedule_speech_recovery(0.35, "nova_empty_speech_final")
                     # Deepgram can end a turn with an empty final transcript for a short word it showed in the partial
                     # one ("kitchen"): keep the final signal so semantic completion or the watchdog can use it.
                     if payload.get("is_final") and payload.get("speech_final") and heard_text and not bot_busy():
                         nova_speech_final_text = heard_text
                     continue
+                stt_nonempty_transcript_events += 1
+                cancel_speech_recovery()
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
                 if bot_busy():
                     pause = await asyncio.to_thread(pause_request, text)
@@ -1802,6 +1895,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         finally:
                 active = False
                 cancel_silence_reminder()
+                recovery_task = speech_recovery_task
+                cancel_speech_recovery()
                 drop_reply(early_reply)  # a reply started early for a turn that never ended
                 if reply_task and not reply_task.done():
                     reply_task.cancel()
@@ -1810,7 +1905,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if transcript_task:
                     transcript_task.cancel()
                     await asyncio.gather(transcript_task, return_exceptions=True)
-                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task, deepgram_ready)
+                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task,
+                                                   recovery_task, deepgram_ready)
                                  if task is not None]
                 for task in closing_tasks:
                     task.cancel()
@@ -1847,6 +1943,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                                       "stt_result_events": stt_result_events,
                                       "stt_final_events": stt_final_events,
                                       "stt_speech_final_events": stt_speech_final_events,
+                                      "stt_speech_started_events": stt_speech_started_events,
+                                      "stt_nonempty_transcript_events": stt_nonempty_transcript_events,
+                                      "stt_empty_speech_final_events": stt_empty_speech_final_events,
                                       "stt_flux_end_of_turn_events": stt_flux_end_of_turn_events,
                                       **({"stream_error": stream_failure} if stream_failure else {})},
                 "transcription": [{"type": "user", **item} for item in transcript],
