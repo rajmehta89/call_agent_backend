@@ -23,7 +23,7 @@ class FakeCollection:
             total += 1
         return total
 
-    def find(self, query):
+    def find(self, query, projection=None):
         rows = [doc for doc in self.docs if doc.get("status") in query.get("status", {}).get("$in", [])]
         return FakeCursor(rows)
 
@@ -114,6 +114,30 @@ class CampaignControlsIntegrationTests(unittest.TestCase):
             result = email_campaign.process_email_outbox()
         send.assert_not_called()
         self.assertEqual(result["skipped_for_approval"], 1)
+
+    def test_worker_sends_drafts_approved_by_default_but_not_review_drafts(self):
+        import asyncio
+        docs = [{"_id": "approved-1", "status": "approved"}, {"_id": "scheduled-1", "status": "scheduled"},
+                {"_id": "review-1", "status": "awaiting_owner_review"}, {"_id": "pending-1", "status": "pending_approval"}]
+        fake = FakeMongo(docs)
+        delivered = []
+
+        async def one_cycle():
+            calls = {"n": 0}
+
+            async def sleep(_seconds):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    raise asyncio.CancelledError
+
+            with patch("asyncio.sleep", sleep), patch.object(email_campaign, "mongo_client", fake),                  patch.object(email_campaign, "refill_campaign_candidates"),                  patch.object(email_campaign, "notify_pending_approval_digest"),                  patch.object(email_campaign, "process_email_outbox", side_effect=lambda ids: delivered.extend(ids)):
+                try:
+                    await email_campaign.email_campaign_worker()
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(one_cycle())
+        self.assertEqual(sorted(delivered), ["approved-1", "scheduled-1"])
 
     def test_timezone_reset_is_utc_naive_and_uses_policy_timezone(self):
         policy = {"timezone": "America/New_York"}

@@ -448,11 +448,12 @@ async def email_campaign_worker() -> None:
             # remain responsive during discovery and delivery.
             await asyncio.to_thread(refill_campaign_candidates)
             await asyncio.to_thread(notify_pending_approval_digest)
-            # The background worker only delivers drafts explicitly approved in
-            # the outbox. Discovery can still prepare candidates for review.
+            # The background worker delivers drafts approved in the outbox and drafts created while approval
+            # was off ("scheduled": approved by default). "pending_approval" and "awaiting_owner_review"
+            # drafts still wait for the owner.
             approved_ids = await asyncio.to_thread(
                 lambda: [str(item["_id"]) for item in mongo_client.email_outbox.find(
-                    {"status": "approved"}, {"_id": 1}).sort("created_at", 1).limit(100)]
+                    {"status": {"$in": ["approved", "scheduled"]}}, {"_id": 1}).sort("created_at", 1).limit(100)]
             )
             if approved_ids:
                 await asyncio.to_thread(process_email_outbox, approved_ids)
