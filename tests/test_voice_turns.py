@@ -209,6 +209,19 @@ def test_spoken_email():
     assert spoken_email("I'm at the shop") == ""
 
 
+@pytest.mark.parametrize("said, email", [
+    # From a real call: the start was spelled, then the whole address said; it was saved as rajrajm267747@gmail.com.
+    ("Yeah. It's Raj Mehta. Yeah. So it is r a j, Rajm267747@Gmail.com.", "rajm267747@gmail.com"),
+    ("j o h n, john at gmail dot com", "john@gmail.com"),
+    ("r a j m two six seven seven four seven at gmail dot com", "rajm267747@gmail.com"),  # spelled only: kept
+    ("it is j jones at outlook dot com", "jjones@outlook.com"),  # one letter may be a real initial
+    ("s m smithers at gmail dot com", "smithers@gmail.com"),
+    ("a b c xyz at gmail dot com", "abcxyz@gmail.com"),  # spelled letters that are not the next piece are kept
+])
+def test_spoken_email_spelled_then_said_whole(said, email):
+    assert spoken_email(said) == email
+
+
 def test_email_checks():
     note, problem = contact_check("my email is raj at gmail dot com")
     assert not problem and "r a j at gmail dot com" in note  # short name parts are spelled out so the caller can check them

@@ -431,7 +431,11 @@ def _spoken_reply(text: str) -> str:
 def _voice_services() -> AIServices:
     """One model client per call, on the voice model (shared with Retell: RETELL_OPENROUTER_MODEL, or CUSTOM_VOICE_MODEL)."""
     services = AIServices()
-    return configure_voice_services(services, os.getenv("CUSTOM_VOICE_MODEL") or os.getenv("RETELL_OPENROUTER_MODEL") or services.config.OPENROUTER_MODEL)
+    # OPENROUTER_MODEL is only the last choice: the voice call runs on RETELL_OPENROUTER_MODEL whenever it is set.
+    source = next((name for name in ("CUSTOM_VOICE_MODEL", "RETELL_OPENROUTER_MODEL") if os.getenv(name)), "OPENROUTER_MODEL")
+    services = configure_voice_services(services, os.getenv(source) or services.config.OPENROUTER_MODEL)
+    services.voice_model_source = source
+    return services
 
 
 _SENTENCE_BREAK = re.compile(r"[.!?](?=\s)")
@@ -498,34 +502,39 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     def check_places():
         return place_note(text, brain_service.knowledge_text(), agent_text)
 
-    def prepare_question():
-        if needs_facts(text):
-            return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, True, language)
-        return None
+    def prompt_with_facts(with_knowledge: bool) -> str:
+        return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, with_knowledge, language)
 
     # Meaning preparation used to finish before any other per-turn work began. On Render it can
     # need a network embedding request, so overlap it with model choice, contact/place checks and
     # knowledge retrieval. The shared embedding cache lets all of these checks reuse the same vectors.
+    # The prompt with business facts starts with the checks on every turn, not only on questions: a "Yeah." or a name
+    # usually stays on the main model, which needs those facts too, and building them after the checks added 0.6-1.6 s.
+    # It is not awaited by the checks, so a fast turn that needs no facts never waits for the knowledge search.
     checks_started = perf_counter()
-    turn_model, (details_note, details_problem), places, prepared_prompt, _ = await asyncio.gather(
-        asyncio.to_thread(choose_voice_model, text, agent_text, earlier_text),
-        asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
-        asyncio.to_thread(check_places),
-        asyncio.to_thread(prepare_question),
-        asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text),
-    )
-    checks_ms = round((perf_counter() - checks_started) * 1000)
-    if details_problem:
-        turn_model = None  # a wrong number or email needs the careful model
-    if places:
-        turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
-    if prepared_prompt is not None:
-        # The fast model handles non-product questions too, with the same relevant business facts as the main model.
-        system = prepared_prompt
-    else:
-        def prepare_selected_prompt():
-            return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, turn_model is None or bool(places), language)
-        system = await asyncio.to_thread(prepare_selected_prompt)
+    facts_prompt = asyncio.ensure_future(asyncio.to_thread(prompt_with_facts, True))
+    try:
+        turn_model, (details_note, details_problem), places, question, _ = await asyncio.gather(
+            asyncio.to_thread(choose_voice_model, text, agent_text, earlier_text),
+            asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
+            asyncio.to_thread(check_places),
+            asyncio.to_thread(needs_facts, text),
+            asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text),
+        )
+        checks_ms = round((perf_counter() - checks_started) * 1000)
+        if details_problem:
+            turn_model = None  # a wrong number or email needs the careful model
+        if places:
+            turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
+        if question or turn_model is None or places:
+            # The fast model handles non-product questions too, with the same relevant business facts as the main model.
+            system = await facts_prompt
+        else:
+            facts_prompt.cancel()
+            system = await asyncio.to_thread(prompt_with_facts, False)
+    except BaseException:
+        facts_prompt.cancel()
+        raise
     if call_forwarding.forwarding_on():
         system += ("\n\n# Live team transfer on this call\n"
                    "A live transfer to the human team is available. If the caller asks to speak with the team now, "
@@ -536,7 +545,11 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     prompt_ms = (perf_counter() - started) * 1000
     requested_model = turn_model or services.config.OPENROUTER_MODEL
     if timings is not None:
-        timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms), semantic_checks_ms=checks_ms)
+        route = "careful" if places and turn_model else "fast" if turn_model else "main"
+        timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms), semantic_checks_ms=checks_ms,
+                       model_route=route, provider=getattr(services, "provider", ""), with_facts=bool(question or turn_model is None or places),
+                       model_source=getattr(services, "voice_model_source", "") if route == "main" else
+                       "VOICE_FAST_MODEL" if route == "fast" else "VOICE_CAREFUL_MODEL")
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()
     conversation = [*history, {"role": "user", "content": text}]
@@ -1291,6 +1304,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         prefix = (turn_timing or {}).get("bridge_text", "")
         spoken: List[str] = [prefix] if prefix else []
         spoke_at = utc_iso() if prefix else ""
+        filler_spoken = bool(prefix)
+        timing: Optional[Dict[str, Any]] = None
         try:
             if await asyncio.to_thread(sounds_unfinished, text):
                 # Probably a pause mid-sentence ("what are the popular ..."): give the caller a moment to finish. The
@@ -1298,7 +1313,6 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 waited = max(0.0, unfinished_wait_seconds() - (perf_counter() - prepared["started"]))
                 if waited:
                     await asyncio.sleep(waited)
-            filler_spoken = bool(prefix)
             bridge_pending = False
             bridge_timing: Dict[str, Any] = dict(prepared.get("bridge_diagnostics") or {})
             bridge_timing.update({key: value for key, value in (turn_timing or {}).items() if key.startswith("bridge_")})
@@ -1350,7 +1364,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             spoken.append(sentence)
             spoke_at = spoke_at or utc_iso()  # the transcript shows when the agent started speaking, not when it finished
             first_audio = await speak(sentence)
-            timing = {"pipeline": "custom_twilio", "tts_engine": engine,
+            timing = {"pipeline": "custom_twilio", "tts_engine": engine, "turn_id": len(voice_turn_timings) + 1,
+                                       "filler_played": filler_spoken,
                                        **(turn_timing or {}),
                                        **bridge_timing,
                                        **prepared.get("reply_timings", {}),
@@ -1365,9 +1380,19 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             async for sentence in sentences:
                 spoken.append(sentence)
                 await speak(sentence)
+            timing["interrupted"] = False
+            timing["reply_sent_ms"] = round((perf_counter() - heard_at) * 1000)  # last audio handed to Twilio
             if active and spoken:
                 schedule_silence_reminder()
         finally:
+            if timing is None:
+                # Interrupted (or failed) before the first sentence was heard: keep the turn in the latency record too.
+                voice_turn_timings.append({"pipeline": "custom_twilio", "tts_engine": engine, "turn_id": len(voice_turn_timings) + 1,
+                                           "filler_played": filler_spoken, **(turn_timing or {}),
+                                           **prepared.get("reply_timings", {}), "interrupted": True,
+                                           "stopped_ms": round((perf_counter() - heard_at) * 1000)})
+            elif "interrupted" not in timing:
+                timing["interrupted"] = True
             prepared["bridge_ready"].cancel()
             if not first.done():
                 first.cancel()  # interrupted before the first sentence: stop the model request too

@@ -475,6 +475,26 @@ _EMAIL_LEAD_IN = {"is", "it's", "its", "it", "email", "e-mail", "mail", "address
                   "ok", "um", "uh", "and", "that's", "thats", "id", "me", "at", "on", "use", "please", "sure", "right", "well"}
 
 
+def _without_spelled_repeats(pieces: List[str]) -> List[str]:
+    """Callers often spell the start of the address and then say it whole: "r a j, rajm267747 at gmail dot com" is
+    rajm267747@gmail.com, not rajrajm267747@gmail.com (a real call saved that). Two or more spelled letters right before
+    a piece that starts with exactly those letters are the same characters said twice, so they are kept once. A single
+    letter ("j jones") may be a real initial and is always kept."""
+    kept: List[str] = []
+    index = 0
+    while index < len(pieces):
+        end = index
+        while end < len(pieces) and len(pieces[end]) == 1 and pieces[end].isalpha():
+            end += 1
+        spelled = "".join(pieces[index:end])
+        if end - index >= 2 and end < len(pieces) and pieces[end].startswith(spelled):
+            index = end  # drop the spelling; the whole piece follows
+            continue
+        kept.extend(pieces[index:end] if end > index else pieces[index:index + 1])
+        index = end if end > index else index + 1
+    return kept
+
+
 def spoken_email(text: str) -> str:
     """The email address in what a caller said, rebuilt from speech, or '' when none was said. Callers say it in
     pieces: the name part ("raj m two six seven seven four seven"), "at" (or "at the rate", which speech recognition may
@@ -508,6 +528,7 @@ def spoken_email(text: str) -> str:
         if piece in _EMAIL_LEAD_IN or not re.fullmatch(r"[a-z0-9._%+\-]+", piece):
             break
         name.insert(0, piece)
+    name = _without_spelled_repeats(name)
     # The provider and ending: the pieces after "@" up to the last ending ("gmail . com", "g mail . com . au").
     domain: List[str] = []
     for index, token in enumerate(tokens[at + 1:]):
