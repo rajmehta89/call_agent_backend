@@ -22,7 +22,9 @@ load_project_env()
 from ai_services import warm_model_connection
 from brain_service import brain_service, _local_embedder
 from meaning import Classifier
-from routers.custom_twilio_voice_api import _voice_services, _voice_sentences, _tts_stream, _warm_tts_connection, _DeepgramSpeaker
+from routers.custom_twilio_voice_api import (_voice_services, _voice_sentences, _tts_stream,
+                                             _warm_tts_connection, _DeepgramSpeaker,
+                                             _deepgram_speaker_stream)
 from routers.retell_api import _system_prompt
 import turn_meaning
 
@@ -59,14 +61,18 @@ async def benchmark(args):
     for repeat in range(args.repeats):
         for question in questions:
             started = perf_counter()
-            stream = _voice_sentences(services, question, history, "unknown", "").__aiter__()
+            timings = {}
+            stream = _voice_sentences(services, question, history, "unknown", "", timings=timings).__aiter__()
             try:
                 sentence = await anext(stream)
                 first_sentence = perf_counter() - started
                 row = {"question": question, "repeat": repeat + 1,
-                       "first_sentence_ms": round(first_sentence * 1000)}
+                       "first_sentence_ms": round(first_sentence * 1000),
+                       **{key: timings[key] for key in ("requested_model", "preparation_ms", "semantic_checks_ms",
+                                                        "first_model_text_ms", "model_wait_ms") if key in timings}}
                 if args.audio:
-                    speech = speaker.stream(sentence) if speaker else _tts_stream(sentence, args.engine)
+                    speech = (_deepgram_speaker_stream(speaker, sentence) if speaker else
+                              _tts_stream(sentence, args.engine))
                     try:
                         audio = await anext(speech)
                         if not audio:

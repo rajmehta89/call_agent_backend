@@ -396,6 +396,14 @@ def test_delayed_question_bridge_still_excludes_short_replies_and_contact_detail
         assert voice_turns.wait_bridge_phrase(text) == ""
 
 
+def test_one_word_what_does_not_trigger_a_wait_bridge(monkeypatch):
+    import voice_turns
+    monkeypatch.setattr(voice_turns, "store_lookup_runs", lambda *args: False)
+    monkeypatch.setattr(voice_turns, "pause_request", lambda *args: False)
+    monkeypatch.setattr(voice_turns, "is_acknowledgement", lambda *args: False)
+    assert voice_turns.wait_bridge_phrase("What") == ""
+
+
 def test_bridge_model_timeout_can_be_lowered_but_not_raised(monkeypatch):
     import voice_turns
     monkeypatch.setenv("VOICE_BRIDGE_MODEL_MS", "180")

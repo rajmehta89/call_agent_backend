@@ -14,6 +14,10 @@ def test_custom_pipeline_checks_and_retrieval_overlap_off_the_audio_loop(monkeyp
 
     def prepare(*args):
         assert get_ident() != loop_thread
+        # Semantic vectors are shared by all turn checks. Their warmup must
+        # overlap prompt retrieval and the independent safety checks.
+        assert place_started.wait(3)
+        assert prompt_started.wait(3)
 
     def choose(*args):
         assert get_ident() != loop_thread
@@ -45,14 +49,17 @@ def test_custom_pipeline_checks_and_retrieval_overlap_off_the_audio_loop(monkeyp
     services = SimpleNamespace(fallback_model="fallback", config=SimpleNamespace(OPENROUTER_MODEL="main"),
                                stream_chat_completion=complete)
 
+    timings = {}
+
     async def run():
         return "".join([sentence async for sentence in custom._voice_sentences(
-            services, "Do you deliver to Darwin?", [], "unknown", "", language="ar")])
+            services, "Do you deliver to Darwin?", [], "unknown", "", language="ar", timings=timings)])
 
     assert "confirm coverage" in asyncio.run(run())
     assert seen["model"] == "careful-model"
     assert seen["language"] == "ar"
     assert any("not been confirmed" in message["content"] for message in seen["messages"])
+    assert timings["semantic_checks_ms"] >= 0
 
 
 @pytest.mark.parametrize("problem, expected_model, with_facts", [(False, "fast", False), (True, None, True)])

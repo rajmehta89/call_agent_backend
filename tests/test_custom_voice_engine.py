@@ -65,3 +65,36 @@ def test_elevenlabs_retries_on_a_fresh_connection_when_no_audio_comes(monkeypatc
 
     audio, took = asyncio.run(run())
     assert audio and len(attempts) == 2 and took < 2.0
+
+
+def test_deepgram_tts_retries_over_rest_when_websocket_first_audio_stalls(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("CUSTOM_DEEPGRAM_TTS_FIRST_AUDIO_TIMEOUT_MS", "500")
+    websocket_cancelled = asyncio.Event()
+    rest_calls = []
+
+    class SlowSpeaker:
+        async def stream(self, text):
+            try:
+                await asyncio.sleep(10)
+                yield b"websocket-audio"
+            finally:
+                websocket_cancelled.set()
+
+    async def rest_stream(text, language="en"):
+        rest_calls.append((text, language))
+        yield b"rest-audio"
+
+    monkeypatch.setattr(custom, "_deepgram_tts_stream", rest_stream)
+
+    async def run():
+        started = asyncio.get_running_loop().time()
+        chunks = [chunk async for chunk in custom._deepgram_speaker_stream(SlowSpeaker(), "Hello", "en")]
+        return chunks, asyncio.get_running_loop().time() - started
+
+    chunks, elapsed = asyncio.run(run())
+    assert chunks == [b"rest-audio"]
+    assert rest_calls == [("Hello", "en")]
+    assert websocket_cancelled.is_set()
+    assert elapsed < 1.5

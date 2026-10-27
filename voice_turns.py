@@ -911,6 +911,9 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     """Choose one acknowledgement only after the reply has actually missed its wait deadline."""
     if pause_request(caller_text) or is_acknowledgement(caller_text):
         return ""
+    words = re.findall(r"[a-z']+", caller_text.lower())
+    if len(words) < 3 and not (earlier and store_lookup_runs(caller_text, earlier)):
+        return ""  # Do not turn a one-word repair like "What?" into a wait or clarification loop.
     phrase = bridge_phrase(caller_text, recent, earlier)
     if phrase:
         return phrase

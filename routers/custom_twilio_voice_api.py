@@ -346,6 +346,37 @@ class _DeepgramSpeaker:
         await self._drop()
 
 
+def _deepgram_tts_first_audio_timeout() -> float:
+    """Bound a cold or stuck Deepgram WebSocket before retrying the same voice over REST."""
+    try:
+        return max(0.5, float(os.getenv("CUSTOM_DEEPGRAM_TTS_FIRST_AUDIO_TIMEOUT_MS", "1500")) / 1000)
+    except ValueError:
+        return 1.5
+
+
+async def _deepgram_speaker_stream(speaker: _DeepgramSpeaker, text: str, language: str = "en") -> AsyncIterator[bytes]:
+    """Prefer the kept-alive WebSocket; use Deepgram REST if it stalls before its first audio chunk."""
+    stream = speaker.stream(text)
+    try:
+        first = await asyncio.wait_for(stream.__anext__(), timeout=_deepgram_tts_first_audio_timeout())
+    except Exception as error:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
+        logger.warning(
+            "Deepgram TTS WebSocket produced no first audio within %.1fs (%s); retrying over REST",
+            _deepgram_tts_first_audio_timeout(), type(error).__name__,
+        )
+        async for chunk in _deepgram_tts_stream(text, language):
+            yield chunk
+        return
+
+    yield first
+    async for chunk in stream:
+        yield chunk
+
+
 async def _warm_tts_connection(engine: str) -> None:
     """Open the kept-alive connection to the voice provider before the first sentence needs it."""
     url = "https://api.deepgram.com/v1/projects" if engine == "deepgram" else "https://api.elevenlabs.io/v1/models"
@@ -463,7 +494,6 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     started = perf_counter()
     agent_text = last_agent_text(history)
     earlier_text = " ".join(" ".join(earlier_caller_texts(history, text)[-8:]).split()[-25:])
-    await asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text)
 
     def check_places():
         return place_note(text, brain_service.knowledge_text(), agent_text)
@@ -473,12 +503,18 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
             return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, True, language)
         return None
 
-    turn_model, (details_note, details_problem), places, prepared_prompt = await asyncio.gather(
+    # Meaning preparation used to finish before any other per-turn work began. On Render it can
+    # need a network embedding request, so overlap it with model choice, contact/place checks and
+    # knowledge retrieval. The shared embedding cache lets all of these checks reuse the same vectors.
+    checks_started = perf_counter()
+    turn_model, (details_note, details_problem), places, prepared_prompt, _ = await asyncio.gather(
         asyncio.to_thread(choose_voice_model, text, agent_text, earlier_text),
         asyncio.to_thread(contact_check, text, agent_text, earlier_caller_texts(history, text), caller_region(caller)),
         asyncio.to_thread(check_places),
         asyncio.to_thread(prepare_question),
+        asyncio.to_thread(prepare_turn_meaning, text, agent_text, earlier_text),
     )
+    checks_ms = round((perf_counter() - checks_started) * 1000)
     if details_problem:
         turn_model = None  # a wrong number or email needs the careful model
     if places:
@@ -500,7 +536,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     prompt_ms = (perf_counter() - started) * 1000
     requested_model = turn_model or services.config.OPENROUTER_MODEL
     if timings is not None:
-        timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms))
+        timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms), semantic_checks_ms=checks_ms)
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder()
     conversation = [*history, {"role": "user", "content": text}]
@@ -1112,7 +1148,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             try:
                 # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
                 # once, which releases the live Deepgram line instead of holding it until garbage collection.
-                audio = selected_speaker.stream(text) if selected_speaker else _tts_stream(text, selected_engine, preferred_language)
+                audio = _deepgram_speaker_stream(selected_speaker, text, preferred_language) if selected_speaker else _tts_stream(text, selected_engine, preferred_language)
                 async with contextlib.aclosing(audio):
                     async for chunk in audio:
                         if not active:

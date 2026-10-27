@@ -319,3 +319,34 @@ and show whether the remaining wait is Nova turn detection or response work.
 The bridge timeout can be lowered with `VOICE_BRIDGE_MODEL_MS`, but code now
 caps it at 450 ms even if the production environment contains a higher value.
 Production health must show `2026-10-27-voice-bridge-async-18` after deployment.
+
+## Release 21: overlap fast-model routing checks and bound first Deepgram audio
+
+The 08:22 IST local call on 27 October had the first answer text ready in 946 ms,
+but Deepgram's WebSocket took 9.914 seconds to return its first answer audio.
+The next two turns returned TTS audio in 625 and 630 ms. A bridge was audible
+within 944 ms, so model generation was not the main cause of the first reply's
+long silent gap. The same call used Nova and received a bridge for the one-word
+repair "What?"; the running local server reported release 13, so it had not
+loaded the current source.
+
+Custom Deepgram voice now gives the WebSocket 1.5 seconds by default to produce
+its first audio chunk. If it stalls or ends without audio, the same text is
+retried through Deepgram's REST TTS stream, then the remaining speech continues
+as before. The limit is configurable with
+`CUSTOM_DEEPGRAM_TTS_FIRST_AUDIO_TIMEOUT_MS`. A one- or two-word fragment no
+longer triggers a generic wait bridge unless earlier product context makes it
+a real store lookup.
+
+Llama is the direct answer model for ordinary conversation and general business
+questions; the separate small-model bridge provides a brief status line while
+an answer is still pending. Product and order questions keep the accurate live
+lookup path. Custom voice now prepares semantic vectors alongside prompt
+retrieval and contact/place checks, instead of waiting for vector preparation
+to finish first.
+
+Production health must show `2026-10-27-voice-fast-first-audio-21` after deployment.
+Measure a fresh call with a restarted local service; the 08:22 call predates
+this change and cannot validate it. The Render service health endpoint currently
+returns 503 with "Service Suspended", so production timing cannot be checked
+until that service is active again.
