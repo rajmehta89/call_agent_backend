@@ -238,3 +238,21 @@ def test_retell_main_model_turn_builds_facts_alongside_the_checks(monkeypatch):
     asyncio.run(run())
     assert seen["system"] == "Business facts"
     assert timings["preparation_ms"] < 550, timings  # 0.3 s + 0.3 s one after the other would be >= 600 ms
+
+
+def test_filler_wait_is_timed_from_when_the_caller_stopped_speaking():
+    transcript = [{"role": "agent", "content": "Hello", "words": [{"word": "Hello", "start": 0.4, "end": 0.9}]},
+                  {"role": "user", "content": "What do you sell?", "words": [{"word": "What", "start": 4.0, "end": 4.2},
+                                                                              {"word": "sell?", "start": 5.5, "end": 6.0}]}]
+    # The call connected at clock 100; Retell sent the turn at 106.6, 0.6 s after the last word ended (6.0 s in).
+    assert retell.speech_end_clock(transcript, 100.0, 106.6) == pytest.approx(106.0)
+
+
+@pytest.mark.parametrize("transcript, now, expected", [
+    ([{"role": "user", "content": "Hi"}], 105.0, 105.0),                                         # no word times
+    ([{"role": "user", "content": "Hi", "words": [{"end": 1.0}]}], 110.0, 108.5),                  # lag capped at 1.5 s
+    ([{"role": "user", "content": "Hi", "words": [{"end": 9.0}]}], 105.0, 105.0),                  # clock mismatch: never later
+    (None, 105.0, 105.0),
+])
+def test_speech_end_clock_never_skips_or_delays_the_wait(transcript, now, expected):
+    assert retell.speech_end_clock(transcript, 100.0, now) == pytest.approx(expected)

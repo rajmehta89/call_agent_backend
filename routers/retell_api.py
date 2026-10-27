@@ -130,6 +130,22 @@ def _serialize_messages(messages: List[Dict[str, str]], message_type: str) -> Li
     ]
 
 
+def speech_end_clock(transcript: Any, call_started_clock: float, now: float, max_lag: float = 1.5) -> float:
+    """When the caller stopped speaking, on our perf_counter clock: the end of their last word (Retell gives word times
+    in seconds from the start of the call) placed on the clock started when the call connected. Retell sends the turn
+    ~0.6 s after that, so a wait timed from our receipt left the caller in silence longer than intended. The lag is
+    capped (max_lag) and never negative, so a clock mismatch can only shift a wait slightly, never skip it."""
+    for item in reversed(transcript if isinstance(transcript, list) else []):
+        if isinstance(item, dict) and item.get("role") == "user":
+            ends = [word.get("end") for word in item.get("words") or [] if isinstance(word, dict)]
+            ends = [float(end) for end in ends if isinstance(end, (int, float))]
+            if not ends:
+                break
+            lag = (now - call_started_clock) - max(ends)
+            return now - min(max_lag, max(0.0, lag))
+    return now
+
+
 def _transcript_as_messages(transcript: Any) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = []
     for item in transcript or []:
@@ -1199,6 +1215,9 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         nonlocal callback_requested, user_messages, handoff_pending
         turn_started = perf_counter()
         timing: Dict[str, Any] = {"response_id": response_id, "pipeline": "retell"}
+        # Waits (the filler) are timed from when the caller stopped speaking, not from when Retell sent the turn.
+        speech_ended = speech_end_clock(event.get("transcript"), started_clock, turn_started)
+        timing["speech_end_lag_ms"] = round((turn_started - speech_ended) * 1000)
         if handoff_pending:
             await send_event({"response_type": "response", "response_id": response_id,
                               "content": "", "content_complete": True})
@@ -1286,7 +1305,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         if caller_text:
             async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "",
-                    status_after_seconds() if bridges_enabled() else 0, turn_started)) as routed:
+                    status_after_seconds() if bridges_enabled() else 0, speech_ended)) as routed:
                 async for item in routed:
                     if isinstance(item, tuple):
                         transfer_intent, ending = item
@@ -1368,7 +1387,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             def record_bridge(line):
                 timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
             stream = with_wait_bridge(source, make_bridge, fallback,
-                                      status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, turn_started,
+                                      status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, speech_ended,
                                       on_bridge=record_bridge)
             async with contextlib.aclosing(stream):
                 async for chunk in stream:
