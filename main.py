@@ -132,16 +132,25 @@ async def attach_realtime() -> None:
 
 @app.on_event("startup")
 async def start_email_campaign_worker() -> None:
-    """Process approved campaign drafts while the backend is running."""
+    """Process campaign drafts while the backend is running. Production (Render) only answers calls: discovery
+    and sending there competed with live Retell calls (pings up to 9.5 s), so the campaign runs on the local
+    machine unless EMAIL_CAMPAIGN_WORKER=true."""
     import asyncio
     from email_campaign import email_campaign_worker
 
+    app.state.email_campaign_task = None
+    configured = os.getenv("EMAIL_CAMPAIGN_WORKER", "").strip().lower()
+    production = bool(os.getenv("RENDER")) or _environment in {"prod", "production"}
+    if configured in {"0", "false", "no", "off"} or (production and configured not in {"1", "true", "yes", "on"}):
+        logging.getLogger(__name__).info("email campaign worker off on this server (production voice only)")
+        return
     app.state.email_campaign_task = asyncio.create_task(email_campaign_worker())
 
 
 @app.on_event("shutdown")
 async def stop_email_campaign_worker() -> None:
-    app.state.email_campaign_task.cancel()
+    if app.state.email_campaign_task is not None:
+        app.state.email_campaign_task.cancel()
 
 
 @app.on_event("startup")

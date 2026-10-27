@@ -339,6 +339,13 @@ def refill_campaign_candidates() -> Dict[str, Any]:
     needed = max(0, target_buffer - queued)
     if needed == 0:
         return {"status": "buffer_ready", "needed": 0, "queued": queued}
+    # Discovery searches Places and scrapes ~20 websites inside the server that also answers live calls. With a
+    # large hourly limit it ran twice a minute (190 runs in 90 min) and stalled Retell calls for up to 15 s, so
+    # every worker together waits CAMPAIGN_DISCOVERY_COOLDOWN_MINUTES after the latest run.
+    cooldown = timedelta(minutes=max(1.0, float(os.getenv("CAMPAIGN_DISCOVERY_COOLDOWN_MINUTES", "10") or 10)))
+    latest = mongo_client.discovery_runs.find_one({}, sort=[("created_at", -1)])
+    if latest and isinstance(latest.get("created_at"), datetime) and datetime.utcnow() - latest["created_at"] < cooldown:
+        return {"status": "cooldown", "needed": needed, "queued": queued}
 
     configured_query = campaign.get("discovery_query") or DEFAULT_EMAIL_CAMPAIGN["discovery_query"]
     location = campaign.get("discovery_location") or DEFAULT_EMAIL_CAMPAIGN["discovery_location"]

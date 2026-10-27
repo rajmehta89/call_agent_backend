@@ -145,6 +145,22 @@ class CampaignControlsIntegrationTests(unittest.TestCase):
         self.assertIsNone(reset.tzinfo)
         self.assertGreater(reset, datetime.utcnow())
 
+    def test_discovery_waits_for_the_shared_cooldown_whatever_the_hourly_limit(self):
+        # A 400/hour limit made every worker search and scrape twice a minute, stalling live calls.
+        fake = Mock(is_connected=lambda: True)
+        fake.discovery_runs.find_one.return_value = {"created_at": datetime.utcnow() - timedelta(minutes=2)}
+        campaign = {"status": "running", "discovery_enabled": True, "max_emails": 400, "daily_limit": 500}
+        with patch.object(email_campaign, "mongo_client", fake), \
+             patch.object(email_campaign, "get_email_campaign", return_value=campaign), \
+             patch.object(email_campaign, "get_email_policy", return_value={}), \
+             patch.object(email_campaign, "_daily_count", return_value=0), \
+             patch.object(email_campaign, "_pending_campaign_candidates", return_value=10), \
+             patch.dict("os.environ", {"GOOGLE_PLACES_API_KEY": "test"}), \
+             patch("prospect_discovery.discover_prospects") as discover:
+            result = email_campaign.refill_campaign_candidates()
+        self.assertEqual(result["status"], "cooldown")
+        discover.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
