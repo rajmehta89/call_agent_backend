@@ -28,6 +28,20 @@ def test_flux_selects_language_by_model_and_has_no_language_parameter(monkeypatc
     assert params["eot_timeout_ms"] == ["1800"]
 
 
+def test_english_calls_use_flux_by_default_and_preserve_multilingual_nova(monkeypatch):
+    monkeypatch.delenv("CUSTOM_AUTO_LANGUAGE", raising=False)
+    monkeypatch.delenv("CUSTOM_STT", raising=False)
+    assert custom._use_flux_for_language("en")
+    assert not custom._use_flux_for_language("ar")
+    assert not custom._use_flux_for_language("ur")
+
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "true")
+    assert not custom._use_flux_for_language("en")
+    monkeypatch.setenv("CUSTOM_STT", "nova")
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "false")
+    assert not custom._use_flux_for_language("en")
+
+
 def test_twilio_stream_uses_custom_parameters_instead_of_a_query_string(monkeypatch):
     monkeypatch.setattr(custom, "provider_snapshot", lambda: {
         "retell": {"enabled": False, "ready": True},

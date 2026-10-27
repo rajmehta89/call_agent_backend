@@ -817,7 +817,7 @@ def status_after_seconds() -> float:
     """VOICE_STATUS_AFTER_MS: a short status update ("I'm working through the details now.") if the answer still has
     not started this long after the caller finished (0 = never)."""
     try:
-        return max(0.0, float(os.getenv("VOICE_STATUS_AFTER_MS", "1200"))) / 1000
+        return max(0.0, float(os.getenv("VOICE_STATUS_AFTER_MS", "800"))) / 1000
     except ValueError:
         return 1.2
 
@@ -918,9 +918,13 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     # contact details and unfinished fragments do not get one merely because a provider is slow.
     from turn_meaning import CALLER_TURN, TURN_COMPLETION, WAIT_QUESTION
     question_probe = f"{' '.join((earlier or '').split()[-35:])} {kind_of_turn_text(caller_text)}".strip()
-    kind = CALLER_TURN.best(kind_of_turn_text(caller_text))
+    kind = CALLER_TURN.best(kind_of_turn_text(caller_text), earlier=earlier)
     complete_question = WAIT_QUESTION.best(question_probe) == "complete"
-    complete_request = kind in {"question", "search", "request"} and TURN_COMPLETION.best(caller_text) == "complete"
+    completion = TURN_COMPLETION.best(caller_text)
+    # The voice turn detector has already ended this utterance. If the meaning
+    # classifier recognizes a question/request and does not positively label it
+    # unfinished, a generic status is safer than leaving a long silent gap.
+    complete_request = kind in {"question", "search", "request"} and completion not in {None, "unfinished"}
     if complete_question or complete_request:
         return status_phrase(recent)
     return ""

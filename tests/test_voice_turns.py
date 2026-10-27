@@ -410,7 +410,7 @@ def test_completed_open_request_gets_a_bridge_when_answer_is_still_running(monke
     monkeypatch.setattr(voice_turns, "bridge_kind", lambda text, *args: "status" if text == "__status__" else "")
     monkeypatch.setattr(voice_turns, "pause_request", lambda *args: False)
     monkeypatch.setattr(voice_turns, "is_acknowledgement", lambda *args: False)
-    monkeypatch.setattr(CALLER_TURN, "best", lambda *args: "question")
+    monkeypatch.setattr(CALLER_TURN, "best", lambda *args, **kwargs: "question")
     monkeypatch.setattr(TURN_COMPLETION, "best", lambda *args: "unfinished")
     probes = []
     def complete_from_context(text):
@@ -428,7 +428,7 @@ def test_complete_semantic_question_can_bridge_without_a_template_match(monkeypa
     monkeypatch.setattr(voice_turns, "bridge_kind", lambda *args: "")
     monkeypatch.setattr(voice_turns, "pause_request", lambda *args: False)
     monkeypatch.setattr(voice_turns, "is_acknowledgement", lambda *args: False)
-    monkeypatch.setattr(CALLER_TURN, "best", lambda *args: "question")
+    monkeypatch.setattr(CALLER_TURN, "best", lambda *args, **kwargs: "question")
     monkeypatch.setattr(TURN_COMPLETION, "best", lambda *args: "complete")
     monkeypatch.setattr(WAIT_QUESTION, "best", lambda *args: "other")
     assert voice_turns.wait_bridge_phrase("Could you explain what I should do next?") in voice_turns.STATUS_PHRASES

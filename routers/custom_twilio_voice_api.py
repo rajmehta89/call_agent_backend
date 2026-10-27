@@ -69,8 +69,7 @@ def _to_ws_url(http_url: str) -> str:
 
 def _deepgram_url(language: str = "en") -> str:
     code = normalize_language(language)
-    auto_language = (os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
-                     and code != "ur")  # Urdu is supported by the dedicated Nova model, not Nova-3 multi.
+    auto_language = _auto_language_enabled() and code != "ur"  # Urdu is supported by the dedicated Nova model, not Nova-3 multi.
     model = os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
     # Words callers say that speech recognition could get wrong (business, brand and product names), taken from the
     # knowledge automatically (voice_keyterms.py) plus any extras in .env. Nova-3 listens for them ("keyterm").
@@ -89,6 +88,16 @@ def _use_flux() -> bool:
     """CUSTOM_STT: "flux" (default) = Deepgram Flux, which decides when the caller has finished their turn from what
     they say and how (built for voice agents); "nova" = Nova-3, which waits for a fixed silence (CUSTOM_ENDPOINTING_MS)."""
     return os.getenv("CUSTOM_STT", "flux").strip().lower() != "nova"
+
+
+def _auto_language_enabled() -> bool:
+    """CUSTOM_AUTO_LANGUAGE opts into Nova's wide language coverage and mid-call language switching."""
+    return os.getenv("CUSTOM_AUTO_LANGUAGE", "false").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _use_flux_for_language(language: str) -> bool:
+    """Use Flux for the common English path; keep Nova for explicit non-English and auto-switch calls."""
+    return _use_flux() and not _auto_language_enabled() and normalize_language(language) == "en"
 
 
 def _env_number(name: str, default: float, low: float, high: float) -> float:
@@ -812,8 +821,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     heard_text = ""             # the caller's words so far in this turn (final parts + the latest partial)
     heard_changed_at = 0.0      # when those words last changed
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
-    auto_language = os.getenv("CUSTOM_AUTO_LANGUAGE", "true").strip().lower() not in {"0", "false", "no", "off"}
-    flux = _use_flux() and not auto_language  # Nova-3 multilingual handles turn audio when callers can switch languages.
+    auto_language = _auto_language_enabled()
+    flux = _use_flux_for_language(preferred_language)
     forced_turn = ""            # the words of a Flux turn we already asked Flux to end (asked once per turn)
     forced_at = 0.0             # ForceEndTurn can go unanswered; then finish from the partial transcript.
     forced_fallback_text = ""
@@ -1356,7 +1365,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal completion_task, completion_text
         wait = _speculate_after_seconds()
         stuck_after = _turn_timeout_seconds()
-        incomplete_after = _env_number("CUSTOM_NOVA_INCOMPLETE_WAIT_MS", 1800, 1000, 5000) / 1000
+        incomplete_after = _env_number("CUSTOM_NOVA_INCOMPLETE_WAIT_MS", 1200, 500, 3000) / 1000
         while active:
             await asyncio.sleep(0.05)
             quiet_for = perf_counter() - heard_changed_at
@@ -1426,7 +1435,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             # With Nova-3 the same safeguard ends the turn here directly. The ¼-second early start applies to both (on a
             # real call Flux's EagerEndOfTurn mostly came together with EndOfTurn, giving no head start on its own).
             speech_final_pending = bool(nova_speech_final_text and _same_words(nova_speech_final_text, heard_text))
-            timeout_after = max(stuck_after, incomplete_after) if speech_final_pending else stuck_after
+            # Keep a short chance for the caller to continue after Nova's end signal, but
+            # don't let the normal no-signal watchdog add another full 2.5 seconds.
+            timeout_after = min(stuck_after, incomplete_after) if speech_final_pending and stuck_after else (
+                incomplete_after if speech_final_pending else stuck_after
+            )
             if not flux and heard_text and timeout_after and quiet_for >= timeout_after and not bot_busy():
                 # The caller's words have not changed for a while and Deepgram never said the turn ended: end it
                 # ourselves rather than leave the caller waiting in silence. After a final signal, incomplete
@@ -1706,7 +1719,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             return
                         # Use the authenticated Start parameters before opening STT.
                         # Flux's English model cannot transcribe Arabic or Urdu.
-                        flux = _use_flux() and not auto_language and preferred_language == "en"
+                        flux = _use_flux_for_language(preferred_language)
                         deepgram_ready = asyncio.create_task(open_deepgram())
                         greeting = await asyncio.to_thread(_greeting_text, preferred_language)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)

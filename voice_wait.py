@@ -45,9 +45,30 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
             extra_body=getattr(services, "_openrouter_extra_body", lambda _model: None)(model),
         )
         body = response.choices[0].message.content or "{}"
-        value = json.loads(body).get("index")
+        cleaned = body.strip()
+        payload = None
+        try:
+            payload = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            # Some small-model gateways wrap JSON in a code fence or include a
+            # short preamble. Decode the first JSON object without accepting
+            # any free-form bridge text.
+            start = cleaned.find("{")
+            if start >= 0:
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+                except json.JSONDecodeError:
+                    payload = None
+        value = payload.get("index") if isinstance(payload, dict) else payload
+        if isinstance(value, str) and value.strip().isdigit():
+            value = int(value.strip())
         if type(value) is int and 0 <= value < len(choices):
             return choices[value], True, "selected"
+        # Accept the exact approved line when the model ignores the JSON shape.
+        # Exact membership keeps the model from adding a second response or facts.
+        approved = cleaned.strip("` \n\r\t\"'")
+        if approved in choices:
+            return approved, True, "selected"
         return fallback, False, "invalid_response"
 
     selected = fallback

@@ -139,7 +139,7 @@ def test_fast_model_selects_only_an_approved_wait_line(monkeypatch):
                 @staticmethod
                 def create(**kwargs):
                     seen["request"] = kwargs
-                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"index": 1}'))])
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='```json\n{"index": "1"}\n```'))])
 
     services = SimpleNamespace(openai_client=Client(), _openrouter_extra_body=lambda model: {"model": model})
     fallback = "Let's see what would work best for you."

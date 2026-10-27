@@ -244,6 +244,20 @@ def test_nova_speech_final_does_not_route_an_incomplete_prefix(monkeypatch):
     assert logged[-1]["transfer_requested"] is False
 
 
+def test_nova_incomplete_final_uses_short_grace_instead_of_full_watchdog(monkeypatch):
+    logged = []
+    monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "2500")
+    monkeypatch.setenv("CUSTOM_NOVA_INCOMPLETE_WAIT_MS", "800")
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda _text: False)
+
+    starts, finished = run_call(monkeypatch, [(0.2, "Could you please tell me about the range", True, True)],
+                                logged=logged, model_seconds=0.05, call_seconds=2.0)
+
+    assert finished == ["Could you please tell me about the range"]
+    assert starts
+    assert logged[-1]["voice_turn_timings"][0]["turn_end_trigger"] == "nova_speech_final"
+
+
 def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(monkeypatch):
     spoken = []
     monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
