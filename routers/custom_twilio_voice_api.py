@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import base64
 import html
+from collections import OrderedDict
+import memory_care
 import json
 import logging
 import os
@@ -42,7 +44,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
-from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language
+from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language
 
 logger = logging.getLogger(__name__)
 
@@ -405,8 +407,28 @@ async def _speech(text: str, engine: str, language: str = "en") -> bytes:
     return b"".join([chunk async for chunk in _tts_stream(text, engine, language)])
 
 
-# Greeting and filler audio never change, so synthesize each phrase once per process.
-_cached_audio: Dict[str, bytes] = {}
+class _AudioCache(OrderedDict):
+    """Recorded phrases, least recently said dropped first: the fixed set (greetings, fillers) is small, but lines
+    written for one turn are cached too and, unbounded, piled up for as long as the server ran."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def get(self, key: str, default: Optional[bytes] = None) -> Optional[bytes]:
+        if key in self:
+            self.move_to_end(key)
+        return super().get(key, default)
+
+    def __setitem__(self, key: str, value: bytes) -> None:
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.limit:
+            self.popitem(last=False)
+
+
+# Greeting and filler audio never change, so synthesize each phrase once per process (~300 phrases, a few MB).
+_cached_audio: Dict[str, bytes] = _AudioCache(300)
 # Said when the reply is slow to start, the way a person says "Yeah..." while thinking (CUSTOM_FILLER_AFTER_SECONDS).
 
 
@@ -552,7 +574,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                        model_source=getattr(services, "voice_model_source", "") if route == "main" else
                        "VOICE_FAST_MODEL" if route == "fast" else "VOICE_CAREFUL_MODEL")
     first_token_ms = 0.0
-    reminder_text = voice_turn_reminder()
+    reminder_text = voice_turn_reminder(language, follow_caller=False)  # recognition and voice are in one language at a time
     conversation = [*history, {"role": "user", "content": text}]
     messages = [{"role": "system", "content": system}, *conversation] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
     if details_note:
@@ -902,6 +924,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     stt_flux_end_of_turn_events = 0
     latest_word_end = 0.0
     turn_word_end = 0.0
+    # Deepgram's word times count from the start of its connection. After a language switch opens a new one, this
+    # (the call audio already sent) keeps every word time on the call's own clock.
+    stt_time_offset = 0.0
+    language_switch_task: Optional[asyncio.Task[Any]] = None
 
     async def send_twilio(payload: Dict[str, Any]) -> None:
         async with send_lock:
@@ -1643,6 +1669,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice: both said goodbye, ending call=%s: %s", call_sid, text[:120])
             asyncio.create_task(end_call_after_playback())
             return
+        # "Can you speak Urdu?": decided by meaning, with the vector the checks above already made for these words.
+        wanted_language = await asyncio.to_thread(requested_language, text, preferred_language)
         if prepared and not _same_words(prepared["text"], text):
             drop_reply(prepared)
             prepared = None
@@ -1663,6 +1691,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         transcript.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
         logger.info("custom voice heard call=%s: %s", call_sid, text[:120])
         save_progress()
+        if wanted_language:
+            drop_reply(prepared)  # it was being written in the old language
+            prepared = None
+            switch_language(wanted_language)
         # All calls use the same semantic routing, even with live forwarding off.
         # Classification stays in the reply task, never in the STT event loop.
         if call_sid:
@@ -1687,6 +1719,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         def record_words(words):
             nonlocal latest_word_end, turn_word_end, heard_changed_at
             end = max((float(word.get("end") or 0) for word in words or []), default=0.0)
+            end = end + stt_time_offset if end else 0.0
             if end > latest_word_end:
                 latest_word_end = turn_word_end = end
                 heard_changed_at = perf_counter()
@@ -1723,7 +1756,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     logger.warning("custom voice: Deepgram %s %s: %s", kind.lower(), payload.get("code"), payload.get("description"))
                     continue
                 if kind == "UtteranceEnd":
-                    if float(payload.get("last_word_end") or 0) + 0.001 < latest_word_end:
+                    if float(payload.get("last_word_end") or 0) + stt_time_offset + 0.001 < latest_word_end:
                         continue  # A delayed gap signal from an older finalized segment; the caller has continued.
                     if not flux and heard_text:
                         # Treat the fixed-gap signal as a candidate end. Semantic completion or the
@@ -1829,6 +1862,45 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         transcript_task = asyncio.create_task(receive_transcripts(connection))
         speculation_task = asyncio.create_task(speculate())
 
+    def switch_language(code: str) -> None:
+        """The caller asked to talk in another language: the reply that follows is written and spoken in it at once
+        (speak() and the prompt read preferred_language), while speech recognition reconnects in that language in the
+        background. Caller audio meanwhile waits in audio_backlog, so nothing they say is lost. Called with no await
+        before the reply task is created: the old recognition task may be the one running this turn."""
+        nonlocal preferred_language, language_switch_task
+        previous, preferred_language = preferred_language, code
+        languages_used.add(code)
+        logger.info("custom voice: caller asked for %s; switching call=%s from %s", code, call_sid, previous)
+        if language_switch_task is not None and not language_switch_task.done():
+            language_switch_task.cancel()
+        language_switch_task = asyncio.create_task(reconnect_recognition(code, previous))
+        if bridges_enabled():
+            asyncio.create_task(_warm_audio_cache(tuple(dict.fromkeys((*STATUS_PHRASES, *LOOKUP_BRIDGES, *ALL_BRIDGES))), engine, code))
+
+    async def reconnect_recognition(code: str, previous: str) -> None:
+        nonlocal deepgram, transcript_task, speculation_task, flux, stt_time_offset, preferred_language
+        old_connection, old_transcripts, old_speculation = deepgram, transcript_task, speculation_task
+        deepgram = None  # the media loop queues caller audio until the new line is open
+        stt_time_offset = audio_received_seconds
+        for task in (old_speculation, old_transcripts):
+            if task is not None:
+                task.cancel()
+        if old_connection is not None:
+            with contextlib.suppress(Exception):
+                await old_connection.close()
+        for attempt in (code, previous):
+            flux = _use_flux_for_language(attempt)  # Flux listens in English only; Arabic and Urdu use Nova
+            try:
+                await open_deepgram()
+            except Exception as error:
+                logger.error("custom voice: could not open recognition in %s call=%s: %s", attempt, call_sid, error)
+                continue
+            if attempt != code:
+                preferred_language = attempt  # keep speaking the language the call can still hear
+            logger.info("custom voice: recognition now in %s (%s) call=%s", attempt, "flux" if flux else "nova", call_sid)
+            return
+        raise RuntimeError("speech recognition could not reconnect after a language switch")
+
     try:
         deepgram_ready = None
         try:
@@ -1837,6 +1909,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     event = message.get("event")
                     if deepgram_ready is not None and deepgram_ready.done() and deepgram_ready.exception():
                         raise deepgram_ready.exception()
+                    if (language_switch_task is not None and language_switch_task.done()
+                            and not language_switch_task.cancelled() and language_switch_task.exception()):
+                        raise language_switch_task.exception()
                     if event == "start":
                         start = message.get("start") or {}
                         stream_sid = str(start.get("streamSid") or message.get("streamSid") or "")
@@ -1894,7 +1969,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     transcript_task.cancel()
                     await asyncio.gather(transcript_task, return_exceptions=True)
                 closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task,
-                                                   deepgram_ready)
+                                                   deepgram_ready, language_switch_task)
                                  if task is not None]
                 for task in closing_tasks:
                     task.cancel()
@@ -1958,3 +2033,5 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "sentiment": "neutral",
                 "call_session_id": call_sid or stream_sid,
             })
+        # The call's objects are garbage now: give their memory back before the next call (memory_care).
+        asyncio.get_running_loop().run_in_executor(None, memory_care.release_after_call)

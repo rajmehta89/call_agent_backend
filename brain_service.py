@@ -25,20 +25,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-try:
-    from bs4 import BeautifulSoup
-    from pypdf import PdfReader
-    from llama_index.core import Document
-    from llama_index.core.ingestion import IngestionPipeline
-    from llama_index.core.node_parser import SentenceSplitter
-    from llama_index.embeddings.openai import OpenAIEmbedding
-except ImportError:
-    BeautifulSoup = None
-    PdfReader = None
-    Document = None
-    IngestionPipeline = None
-    SentenceSplitter = None
-    OpenAIEmbedding = None
+def _optional(module: str, name: str) -> Any:
+    """Import a document tool on first use. llama_index, pypdf and bs4 are only needed to add or re-index knowledge
+    (an upload, a website, a knowledge edit), never during a call; imported at startup they held ~60 MB on every
+    server, which a 512 MB Render instance could not spare. None when the package is not installed."""
+    try:
+        return getattr(__import__(module, fromlist=[name]), name)
+    except ImportError:
+        return None
 
 
 DEFAULT_TOOLS = {
@@ -76,12 +70,30 @@ _EMBEDDING_CACHE_SIZE = 512
 _EMBEDDING_LOCK = threading.Lock()
 _EMBEDDING_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
 _EMBEDDING_INFLIGHT: Dict[str, Future] = {}
-_TTL_CACHE: Dict[str, tuple] = {}
+_TTL_CACHE: Dict[str, tuple] = {}  # key -> (stored at, value, ttl seconds, family)
 _TTL_LOCK = threading.Lock()
+_TTL_MAX_ENTRIES = 256
 
 
-def _ttl_cached(key: str, ttl_seconds: float, load):
-    """Return a recent value for key, or load and remember it. Used only for reads that may be a few seconds stale."""
+def _ttl_store(key: str, value: Any, ttl_seconds: float, family: str = "", stored_at: Optional[float] = None) -> None:
+    """Remember a value, and forget what can no longer be used, so the cache stays flat over weeks of calls:
+    another version of the same family (each knowledge edit used to leave a full copy of the knowledge documents
+    behind), entries unused for ten times their lifetime (one per caller phone number), and the oldest beyond
+    _TTL_MAX_ENTRIES. Callers hold _TTL_LOCK."""
+    now = monotonic()
+    if family:
+        for other in [name for name, item in _TTL_CACHE.items() if item[3] == family and name != key]:
+            del _TTL_CACHE[other]
+    for old in [name for name, item in _TTL_CACHE.items() if now - item[0] > max(600.0, item[2] * 10)]:
+        del _TTL_CACHE[old]
+    _TTL_CACHE[key] = (now if stored_at is None else stored_at, value, ttl_seconds, family)
+    for oldest in sorted(_TTL_CACHE, key=lambda name: _TTL_CACHE[name][0])[:max(0, len(_TTL_CACHE) - _TTL_MAX_ENTRIES)]:
+        del _TTL_CACHE[oldest]
+
+
+def _ttl_cached(key: str, ttl_seconds: float, load, family: str = ""):
+    """Return a recent value for key, or load and remember it. Used only for reads that may be a few seconds stale.
+    family: the key without its version ("brain_documents" for "brain_documents:<version>")."""
     now = monotonic()
     with _TTL_LOCK:
         hit = _TTL_CACHE.get(key)
@@ -89,7 +101,7 @@ def _ttl_cached(key: str, ttl_seconds: float, load):
             return hit[1]
     value = load()
     with _TTL_LOCK:
-        _TTL_CACHE[key] = (now, value)
+        _ttl_store(key, value, ttl_seconds, family, stored_at=now)
     return value
 
 
@@ -120,7 +132,13 @@ def _local_embedder() -> Any:
                     threads = max(1, int(os.getenv("LOCAL_EMBEDDING_THREADS", "1" if os.getenv("RENDER_EXTERNAL_URL") else "2")))
                 except ValueError:
                     threads = 1
-                _LOCAL_EMBEDDER = TextEmbedding(os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"), cache_dir=cache_dir, threads=threads)
+                # ONNX Runtime's memory arena keeps the largest working set it ever needed: one batch of long
+                # knowledge chunks held ~100 MB for good, and with the model that left a 512 MB Render server
+                # crashing mid-call. Without it the memory goes back after every run; short questions are just as
+                # fast (~10 ms). LOCAL_EMBEDDING_ARENA=true restores the arena on a server with memory to spare.
+                arena = os.getenv("LOCAL_EMBEDDING_ARENA", "false").strip().lower() in {"1", "true", "yes", "on"}
+                _LOCAL_EMBEDDER = TextEmbedding(os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"), cache_dir=cache_dir,
+                                                threads=threads, enable_cpu_mem_arena=arena)
                 logger.info("local embedding model ready: %s", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"))
             except Exception as exc:
                 _LOCAL_EMBEDDER_FAILED = True
@@ -134,10 +152,12 @@ def local_embeddings(texts: List[str], query: bool = False) -> List[List[float]]
     if model is None or not texts:
         return []
     try:
+        # Small batches: 16 long chunks peak at +35 MB in batches of 2 against +150 MB in batches of 8, and finish
+        # sooner. Questions are one text at a time anyway.
         try:
-            batch_size = max(1, min(64, int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "8"))))
+            batch_size = max(1, min(64, int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "2"))))
         except ValueError:
-            batch_size = 8
+            batch_size = 2
         vectors = model.query_embed(texts, batch_size=batch_size) if query else model.passage_embed(texts, batch_size=batch_size)
         return [[float(value) for value in vector] for vector in vectors]
     except Exception as exc:
@@ -174,7 +194,7 @@ def _brain_version() -> int:
 _SWR_REFRESHING: set = set()
 
 
-def _swr_cached(key: str, ttl_seconds: float, load):
+def _swr_cached(key: str, ttl_seconds: float, load, family: str = ""):
     """Like _ttl_cached, but once a value exists a stale one is returned at once and refreshed in the background
     (stale-while-revalidate): live call turns never wait on a database round trip for it."""
     now = monotonic()
@@ -186,13 +206,13 @@ def _swr_cached(key: str, ttl_seconds: float, load):
         if refresh:
             _SWR_REFRESHING.add(key)
     if not hit:
-        return _ttl_cached(key, ttl_seconds, load)
+        return _ttl_cached(key, ttl_seconds, load, family)
     if refresh:
         def run() -> None:
             try:
                 value = load()
                 with _TTL_LOCK:
-                    _TTL_CACHE[key] = (monotonic(), value)
+                    _ttl_store(key, value, ttl_seconds, family)
             finally:
                 with _TTL_LOCK:
                     _SWR_REFRESHING.discard(key)
@@ -288,7 +308,11 @@ class BrainService:
             return getattr(self, "_embed_model", None)
         self._embed_model_checked = True
         provider = os.getenv("EMBEDDING_PROVIDER", "auto").strip().lower()
-        if provider not in {"auto", "openai"} or OpenAIEmbedding is None or not os.getenv("OPENAI_API_KEY"):
+        if provider not in {"auto", "openai"} or not os.getenv("OPENAI_API_KEY"):
+            self._embed_model = None
+            return None
+        OpenAIEmbedding = _optional("llama_index.embeddings.openai", "OpenAIEmbedding")
+        if OpenAIEmbedding is None:
             self._embed_model = None
             return None
         try:
@@ -383,7 +407,10 @@ class BrainService:
         return [self._gemini_embedding(chunk, "RETRIEVAL_DOCUMENT") for chunk in chunks]
 
     def _chunk_text(self, text: str, metadata: Optional[Dict[str, Any]] = None) -> List[str]:
-        if Document is not None and SentenceSplitter is not None:
+        Document = _optional("llama_index.core", "Document")
+        IngestionPipeline = _optional("llama_index.core.ingestion", "IngestionPipeline")
+        SentenceSplitter = _optional("llama_index.core.node_parser", "SentenceSplitter")
+        if Document is not None and IngestionPipeline is not None and SentenceSplitter is not None:
             try:
                 document = Document(text=text, metadata=metadata or {})
                 pipeline = IngestionPipeline(transformations=[SentenceSplitter(chunk_size=512, chunk_overlap=64)])
@@ -500,6 +527,7 @@ class BrainService:
         return self.index_status()
 
     def ingest_pdf(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
+        PdfReader = _optional("pypdf", "PdfReader")
         if PdfReader is None:
             raise RuntimeError("PDF support is not installed")
         reader = PdfReader(io.BytesIO(file_bytes))
@@ -516,6 +544,7 @@ class BrainService:
         return self.ingest_text("pdf", filename, "\n\n".join(pages), source_id=source_id, metadata={"filename": filename, "pages": len(reader.pages)})
 
     def ingest_url(self, url: str) -> Dict[str, Any]:
+        BeautifulSoup = _optional("bs4", "BeautifulSoup")
         if BeautifulSoup is None:
             raise RuntimeError("Web scraping support is not installed")
         import requests
@@ -751,7 +780,7 @@ class BrainService:
     def _knowledge_documents(self) -> List[Dict[str, Any]]:
         """The knowledge chunks (text and embeddings), cached briefly: the brain changes rarely, calls ask often."""
         collection = getattr(mongo_client, "brain_documents", None)
-        return _swr_cached(f"brain_documents:{_brain_version()}", 300, lambda: list(collection.find({}, {"text": 1, "embedding": 1, "embedding_local": 1, "source_name": 1, "source_type": 1}).limit(5000)))
+        return _swr_cached(f"brain_documents:{_brain_version()}", 300, lambda: list(collection.find({}, {"text": 1, "embedding": 1, "embedding_local": 1, "source_name": 1, "source_type": 1}).limit(5000)), family="brain_documents")
 
     def ensure_local_embeddings(self) -> int:
         """Give every knowledge chunk a local vector (older chunks predate them). Returns how many were added."""
@@ -821,7 +850,7 @@ class BrainService:
     def knowledge_text(self) -> str:
         """All knowledge as one text (cached with the documents), e.g. to check whether a place is mentioned at all."""
         documents = self._knowledge_documents() if mongo_client.is_connected() else []
-        return _swr_cached(f"knowledge_text:{_brain_version()}:{len(documents)}", 300, lambda: "\n".join(str(item.get("text", "")) for item in documents))
+        return _swr_cached(f"knowledge_text:{_brain_version()}:{len(documents)}", 300, lambda: "\n".join(str(item.get("text", "")) for item in documents), family="knowledge_text")
 
     def retrieve_knowledge(self, user_input: str, limit: int = 4, embed_budget_ms: Optional[int] = None) -> List[Dict[str, Any]]:
         collection = getattr(mongo_client, "brain_documents", None)
@@ -888,7 +917,7 @@ class BrainService:
             "knowledge_enabled": True,
             "shopify_access": True,
         }
-        stored = _swr_cached(f"setting:{channel}_agent:{_brain_version()}", 60, lambda: self._setting(f"{channel}_agent", {}))
+        stored = _swr_cached(f"setting:{channel}_agent:{_brain_version()}", 60, lambda: self._setting(f"{channel}_agent", {}), family=f"setting:{channel}_agent")
         return {**defaults, **stored} if isinstance(stored, dict) else defaults
 
     def _out_of_scope_response(self) -> str:

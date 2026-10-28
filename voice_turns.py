@@ -8,9 +8,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 def fast_voice_model() -> str:
     """VOICE_FAST_MODEL: the small model for non-product turns and simple details (empty = always main model)."""
@@ -396,12 +400,23 @@ def regions_where_valid(digits: str) -> List[str]:
     return found
 
 
+_REGION_NAMES: Optional[Dict[str, str]] = None
+
+
 def _region_name(region: str) -> str:
-    try:
-        from phonenumbers import geocoder
-        return geocoder._region_display_name(region, "en") or region
-    except Exception:
-        return region
+    """English name of a phone region ("AU" -> "Australia"), from data/region_names_en.json (built from
+    phonenumbers by scripts/build_region_names.py). phonenumbers' own table holds every language: importing it
+    for one name added ~95 MB to the server on the first call."""
+    global _REGION_NAMES
+    if _REGION_NAMES is None:
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "region_names_en.json")
+            with open(path, encoding="utf-8") as handle:
+                _REGION_NAMES = json.load(handle)
+        except (OSError, ValueError):
+            logger.warning("region names unavailable (data/region_names_en.json); using region codes")
+            _REGION_NAMES = {}
+    return _REGION_NAMES.get(region) or region
 
 
 # Countries a caller may name ("it's an Indian number", "I'm calling from the UK"): their region codes.
@@ -441,11 +456,12 @@ def caller_region(caller_id: str) -> str:
 
 
 def _country(parsed) -> str:
-    """The country's name ("Australia"); for some mobile numbers the library has no name, so it comes from the region."""
+    """The country's name ("Australia"), from the number's region (see _region_name for why not phonenumbers.geocoder)."""
     try:
         import phonenumbers
-        from phonenumbers import geocoder
-        return geocoder.country_name_for_number(parsed, "en") or geocoder._region_display_name(phonenumbers.region_code_for_number(parsed), "en")
+        region = phonenumbers.region_code_for_number(parsed) or ""
+        name = _region_name(region)
+        return "" if name == region else name
     except Exception:
         return ""
 

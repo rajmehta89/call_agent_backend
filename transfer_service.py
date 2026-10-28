@@ -4,13 +4,27 @@ from copy import deepcopy
 from datetime import datetime
 from timeutil import utc_iso
 from threading import RLock
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 
 class TransferService:
+    # A finished call's record is still read for a while (Retell's post-call webhooks, a handoff being completed),
+    # then dropped: kept forever, one record per call (with its messages) grew for as long as the server ran.
+    CLOSED_KEEP_SECONDS = 3600
+
     def __init__(self) -> None:
         self._lock = RLock()
         self._calls: Dict[str, Dict[str, Any]] = {}
+        self._closed_at: Dict[str, float] = {}
+
+    def _forget_finished_calls(self) -> None:
+        now = monotonic()
+        for session_id in [key for key, closed in self._closed_at.items() if now - closed > self.CLOSED_KEEP_SECONDS]:
+            self._closed_at.pop(session_id, None)
+            record = self._calls.get(session_id)
+            if record and record.get("status") not in {"active", "awaiting_human", "dialing", "ringing", "accepted"}:
+                self._calls.pop(session_id, None)
 
     def register_call(
         self,
@@ -20,6 +34,7 @@ class TransferService:
         direction: str = "inbound",
     ) -> Dict[str, Any]:
         with self._lock:
+            self._forget_finished_calls()
             existing = self._calls.get(session_id, {})
             record = {
                 "session_id": session_id,
@@ -145,6 +160,7 @@ class TransferService:
             if record.get("status") == "active":
                 record["status"] = "completed"
             record["updated_at"] = utc_iso()
+            self._closed_at[session_id] = monotonic()
 
     def get_active_handoffs(self) -> List[Dict[str, Any]]:
         with self._lock:

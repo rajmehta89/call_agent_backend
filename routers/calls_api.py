@@ -448,6 +448,11 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     # call_date stays when the call started (set by the first, live save); the final save must not move it.
                     **({} if existing.get("call_date") else {"call_date": call_record["call_date"]}),
                 }
+                if call_data.get("provisional") and existing.get("analysis_status"):
+                    # The provider's own record (Retell's webhook, or its fetch after the call) is already stored:
+                    # our end-of-call backup save must not put back its placeholder summary or default sentiment.
+                    for field in ("call_summary", "sentiment", "status", "duration", "transcription", "ai_responses", "messages"):
+                        update_data.pop(field, None)
                 if existing.get("transfer_mode") in FORWARDING_MODES:
                     # The call was moved to the team (call_forwarding.py): its outcome comes from Twilio's callbacks;
                     # the AI's end-of-call save must not reset it to "completed" / no transfer.
@@ -598,8 +603,14 @@ def call_scope(user: Dict[str, Any]) -> Dict[str, Any]:
     return {"lead_id": {"$in": lead_ids + [str(lead_id) for lead_id in lead_ids]}}  # lead_id is stored as a string or an ObjectId
 
 
-def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, scope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Get calls with optional filters"""
+# Per-call detail a list never shows: transcripts, model turns and per-turn timings. They were 85% of a 200-call
+# list (~580 KB on every 10 s refresh of Call history); the page fetches one call's full record when it is opened.
+LIST_EXCLUDED_FIELDS = {field: 0 for field in ("transcript_with_tool_calls", "messages", "voice_turn_timings", "ai_responses",
+                                               "transcription", "latency", "provider_metadata", "call_cost", "metadata")}
+
+
+def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, scope: Optional[Dict[str, Any]] = None, slim: bool = False) -> Dict[str, Any]:
+    """Get calls with optional filters. slim=True leaves out the per-call detail fields (LIST_EXCLUDED_FIELDS)."""
     try:
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
@@ -626,7 +637,7 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
 
         if scope:  # filters such as lead_id must not widen what this user may see
             query = {"$and": [dict(scope), query]}
-        calls = list(mongo_client.calls.find(query).sort("call_date", -1).skip(skip).limit(limit))
+        calls = list(mongo_client.calls.find(query, LIST_EXCLUDED_FIELDS if slim else None).sort("call_date", -1).skip(skip).limit(limit))
 
         lead_ids = list({c.get("lead_id") for c in calls if c.get("lead_id")})
         lead_map: Dict[str, Dict[str, Any]] = {}
@@ -652,8 +663,9 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
                     call["lead"] = lead_info
             else:
                 call["lead"] = call.get("lead") or None
-            call["transcription"] = call.get("transcription") or []
-            call["ai_responses"] = call.get("ai_responses") or []
+            if not slim:
+                call["transcription"] = call.get("transcription") or []
+                call["ai_responses"] = call.get("ai_responses") or []
             call["status"] = call.get("status", "completed")
             call["direction"] = call.get("direction", "outbound")
             cd = call.get("call_date")
@@ -719,41 +731,54 @@ def get_call_stats(user: Dict[str, Any] = Depends(require_user)):
             raise HTTPException(status_code=500, detail="Database not connected")
 
         scope = call_scope(user)
-        total_calls = mongo_client.calls.count_documents(scope)
-        inbound_calls = mongo_client.calls.count_documents({**scope, "direction": "inbound"})
-        outbound_calls = mongo_client.calls.count_documents({**scope, "direction": "outbound"})
-        completed_calls = mongo_client.calls.count_documents({**scope, "status": "completed"})
-        failed_calls = mongo_client.calls.count_documents({**scope, "status": "failed"})
-
+        # Every number in one round trip: these were 14 separate queries (~40 ms each to the database), run in a row
+        # on every 10 s refresh of Call history.
         today = local_midnight_utc()
-        calls_today = mongo_client.calls.count_documents({**scope, "call_date": {"$gte": today}})
-
         week_ago = local_midnight_utc(days_ago=7)
-        calls_this_week = mongo_client.calls.count_documents({**scope, "call_date": {"$gte": week_ago}})
-
-        pipeline = [
-            {"$match": {**scope, "duration": {"$exists": True, "$ne": None}}},
+        count = lambda condition: {"$sum": {"$cond": [condition, 1, 0]}}
+        has = lambda field: {"$gt": [{"$ifNull": [field, None]}, None]}
+        transfer_states = ["requested", "dialing", "ringing", "connected", "accepted", "completed"]
+        totals = next(iter(mongo_client.calls.aggregate([
+            {"$match": scope},
             {"$group": {
                 "_id": None,
+                "total": {"$sum": 1},
+                "inbound": count({"$eq": ["$direction", "inbound"]}),
+                "outbound": count({"$eq": ["$direction", "outbound"]}),
+                "completed": count({"$eq": ["$status", "completed"]}),
+                "failed": count({"$eq": ["$status", "failed"]}),
+                "missed": count({"$eq": ["$status", "missed"]}),
+                "today": count({"$gte": ["$call_date", today]}),
+                "week": count({"$gte": ["$call_date", week_ago]}),
+                "transfers": count({"$in": ["$transfer_status", transfer_states]}),
+                "interested": count({"$eq": ["$interest_analysis.interest_status", "interested"]}),
+                "not_interested": count({"$eq": ["$interest_analysis.interest_status", "not_interested"]}),
+                "neutral": count({"$eq": ["$interest_analysis.interest_status", "neutral"]}),
+                "with_analysis": count(has("$interest_analysis")),
+                # $sum and $avg skip missing and null durations, as the old duration query's match did.
                 "total_duration": {"$sum": "$duration"},
-                "avg_duration": {"$avg": "$duration"}
-            }}
-        ]
-        duration_stats = list(mongo_client.calls.aggregate(pipeline))
-        total_duration = duration_stats[0]["total_duration"] if duration_stats else 0
-        avg_duration = duration_stats[0]["avg_duration"] if duration_stats else 0
+                "avg_duration": {"$avg": "$duration"},
+            }},
+        ])), {})
+        total_calls = totals.get("total", 0)
+        inbound_calls = totals.get("inbound", 0)
+        outbound_calls = totals.get("outbound", 0)
+        completed_calls = totals.get("completed", 0)
+        failed_calls = totals.get("failed", 0)
+        calls_today = totals.get("today", 0)
+        calls_this_week = totals.get("week", 0)
+        total_duration = totals.get("total_duration") or 0
+        avg_duration = totals.get("avg_duration") or 0
 
         status_counts = {
             "completed": completed_calls,
             "failed": failed_calls,
-            "missed": mongo_client.calls.count_documents({**scope, "status": "missed"})
+            "missed": totals.get("missed", 0),
         }
 
-        interest_counts = {}
-        for interest in ["interested", "not_interested", "neutral"]:
-            interest_counts[interest] = mongo_client.calls.count_documents({**scope, "interest_analysis.interest_status": interest})
+        interest_counts = {interest: totals.get(interest, 0) for interest in ["interested", "not_interested", "neutral"]}
 
-        calls_with_analysis = mongo_client.calls.count_documents({**scope, "interest_analysis": {"$exists": True, "$ne": None}})
+        calls_with_analysis = totals.get("with_analysis", 0)
 
         stats = {
             "total_calls": total_calls,
@@ -762,7 +787,7 @@ def get_call_stats(user: Dict[str, Any] = Depends(require_user)):
             "completed_calls": completed_calls,
             "failed_calls": failed_calls,
             "missed_calls": status_counts["missed"],
-            "human_transfers": mongo_client.calls.count_documents({**scope, "transfer_status": {"$in": ["requested", "dialing", "ringing", "connected", "accepted", "completed"]}}),
+            "human_transfers": totals.get("transfers", 0),
             "leads_generated": mongo_client.leads.count_documents({**({} if not scope else {"assigned_to": str(user.get("_id"))}), "source": {"$in": ["voice", "call", "inbound_call"]}}),
             "calls_today": calls_today,
             "calls_this_week": calls_this_week,
@@ -792,6 +817,7 @@ def get_calls_endpoint(
         date_to: Optional[str] = Query(None),
         limit: int = Query(50),
         skip: int = Query(0),
+        view: Optional[str] = Query(None, description="'list' leaves out transcripts and timings; open a call for them"),
         user: Dict[str, Any] = Depends(require_user),
 ):
     """Get calls with filters"""
@@ -812,7 +838,7 @@ def get_calls_endpoint(
         if date_to:
             filters["date_to"] = date_to
 
-        result = get_calls(filters, limit, skip, call_scope(user))
+        result = get_calls(filters, limit, skip, call_scope(user), slim=view == "list")
 
         if not result.get("success"):
             raise HTTPException(status_code=500, detail=result.get("error", "Failed to get calls"))

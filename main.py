@@ -31,6 +31,10 @@ from logging_setup import bind_call, setup_logging
 setup_logging()
 logger = logging.getLogger("relaydesk.http")
 
+import memory_care
+
+memory_care.limit_malloc_arenas()  # before the routers start their worker threads
+
 from datetime import datetime
 
 import fastapi.encoders
@@ -122,9 +126,11 @@ async def ready_check():
     # call per new text, 1-1.5 s): the main reason turn checks are fast or slow. No settings values are shown.
     from brain_service import _LOCAL_EMBEDDER
     embeddings = "local" if _LOCAL_EMBEDDER is not None else "network"
+    # memory_mb: this process's resident memory (Linux; null elsewhere). A 512 MB instance near its limit crashes mid-call.
+    memory = memory_care.resident_mb()
     if _voice_warm.is_set() or waited >= ceiling:
-        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings}
-    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings})
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory})
 
 # Register all routers
 app.include_router(config_api.router)
@@ -272,9 +278,22 @@ async def warm_local_embeddings() -> None:
         except Exception as error:
             logging.getLogger(__name__).warning("startup warm-up failed: %s", error)
         finally:
+            # Before /ready reports ready: the one full collection runs now, not during a call.
+            memory_care.freeze_startup_objects()
             _voice_warm.set()
 
     threading.Thread(target=warm, name="warm-voice", daemon=True).start()
+
+    def recover_call_summaries() -> None:
+        # Calls cut short by a restart never got Retell's summary: fetch it, once the warm-up has finished.
+        _voice_warm.wait(timeout=300)
+        try:
+            from routers.retell_api import recover_retell_outcomes
+            recover_retell_outcomes()
+        except Exception as error:
+            logging.getLogger(__name__).warning("call summary recovery failed: %s", error)
+
+    threading.Thread(target=recover_call_summaries, name="recover-summaries", daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

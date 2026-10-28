@@ -307,3 +307,34 @@ TURN_COMPLETION = Classifier("caller sentence completion", {
                  "What do you sell?", "Do you have a basin?", "أريد معرفة السعر.", "نعم.", "تمام.",
                  "مجھے قیمت جاننی ہے۔", "جی ہاں۔", "کیا آپ کے پاس بیسن ہے؟"],
 }, min_score=0.62)
+
+
+def _language_request_examples(label: str, also_called: list) -> list:
+    names = [label, *also_called]
+    return [phrase.format(name) for name in names for phrase in (
+        "Can you speak {}?", "Do you speak {}?", "Can we talk in {}?", "{} please.", "Please speak {}.",
+        "I want to talk in {}.", "Can you reply in {}?", "Is it possible to continue in {}?", "Speak {} with me.")]
+
+
+# LANGUAGE_REQUEST: the caller asks to talk in a language (custom stack: it switches speech recognition and the
+# voice to it). The kinds are the supported language codes; the examples are built from the language names, plus a
+# few ways callers ask in the language itself. "none": other turns, including ones that only mention a language.
+def _language_request_kinds() -> dict:
+    from voice_languages import SUPPORTED_LANGUAGES
+    native = {
+        "en": ["انگریزی میں بات کریں۔", "تكلم بالإنجليزية من فضلك."],
+        "ar": ["هل تتكلم العربية؟", "بالعربي من فضلك.", "ممكن نتكلم عربي؟"],
+        "ur": ["کیا آپ اردو بول سکتے ہیں؟", "اردو میں بات کریں۔", "مجھ سے اردو میں بات کریں۔"],
+    }
+    kinds = {code: _language_request_examples(item["label"], item.get("also_called") or []) + native.get(code, [])
+             for code, item in SUPPORTED_LANGUAGES.items()}
+    kinds["none"] = ["Is the manual in Arabic?", "Can you speak a bit slower?", "Can you speak up, please?",
+                     "Can I speak to someone about my order?", "Okay, speak soon.", "Hello, can you hear me?",
+                     "Do you deliver overseas?", "What's the price?", "Yes, please.", "Sorry, I didn't catch that.",
+                     "My English is not very good.", "Do you have the instructions in another language?",
+                     "I'm looking for a basin.", "Thank you, bye."]
+    return kinds
+
+
+LANGUAGE_REQUEST = Classifier("language request", _language_request_kinds(), min_score=0.72)
+LANGUAGE_REQUEST_LEAD = 0.05  # how far a language must lead "none" before the call switches to it

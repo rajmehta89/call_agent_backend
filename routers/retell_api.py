@@ -12,6 +12,7 @@ import contextlib
 import hmac
 import json
 import logging
+import memory_care
 import os
 import re
 from datetime import datetime, timezone
@@ -476,12 +477,16 @@ def _knowledge_at_end() -> bool:
     return os.getenv("VOICE_KNOWLEDGE_AT_END", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def voice_turn_reminder() -> str:
+def voice_turn_reminder(language: str = "", follow_caller: bool = True) -> str:
     """Last instruction sent after the conversation on every turn. With a business-written voice prompt this is that
-    prompt's own final-rules section (a heading containing "Final"); otherwise the built-in checklist."""
+    prompt's own final-rules section (a heading containing "Final"); otherwise the built-in checklist. Both end with
+    the language rule (voice_languages.language_rule): a written prompt that says "use English" otherwise kept
+    replies in English while the caller spoke Urdu (call of 2026-10-28)."""
+    from voice_languages import language_rule
+    rule = language_rule(language, follow_caller)
     custom = agent_config.get_voice_prompt()
     if not custom:
-        return VOICE_TURN_CHECKLIST
+        return f"{VOICE_TURN_CHECKLIST}\n\n{rule}".strip()
     final = _final_rules_section(custom)
     # Small fast models (gpt-oss-20b) drift from long prompts; these few concrete rules, tested on real calls,
     # keep them on track. VOICE_TURN_SAFETY=false sends only the business prompt's own final rules.
@@ -491,7 +496,7 @@ def voice_turn_reminder() -> str:
     # VOICE_TURN_CONVERSATION=false leaves them out.
     if os.getenv("VOICE_TURN_CONVERSATION", "true").strip().lower() not in {"0", "false", "no", "off"}:
         final = f"{final}\n\n{VOICE_CONVERSATION_RULES}".strip()
-    return final
+    return f"{final}\n\n{rule}".strip()
 
 
 VOICE_CONVERSATION_RULES = (
@@ -1046,6 +1051,92 @@ async def retell_config_status() -> Dict[str, Any]:
     }
 
 
+# Retell writes the call summary a little after the call ends and sends it in its call_analyzed webhook. When that
+# webhook does not reach us (it went to a server that was restarting, or was refused), the call kept our placeholder
+# "Retell inbound AI call completed." So after every call we also ask Retell for it: at these waits (seconds,
+# about four minutes in all), stopping as soon as the summary is stored by either path.
+RETELL_OUTCOME_WAITS = (20, 40, 60, 120)
+_OUTCOME_TASKS: set = set()  # keeps a reference to each running fetch (asyncio keeps only weak ones)
+
+
+def _retell_analysis_stored(call_id: str) -> bool:
+    from mongo_client import mongo_client
+    return bool(mongo_client.is_connected() and mongo_client.calls.find_one({"call_session_id": call_id, "analysis_status": "complete"}, {"_id": 1}))
+
+
+def _retell_call_record(call_id: str) -> Optional[Dict[str, Any]]:
+    """Retell's own record of a call (the same object its webhooks carry); None when it cannot be read."""
+    import httpx
+    key = os.getenv("RETELL_API_KEY", "").strip()
+    if not key or not call_id:
+        return None
+    try:
+        response = httpx.get(f"https://api.retellai.com/v2/get-call/{call_id}", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+        return response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as error:
+        _trace(f"retell_outcome_fetch_failed call={call_id} error={type(error).__name__}")
+        return None
+
+
+def _store_retell_outcome(call_id: str, final: bool = False) -> bool:
+    """Store Retell's record of a finished call if it has its summary (or, when final, whatever it has). True when
+    nothing more is to come."""
+    if _retell_analysis_stored(call_id):
+        return True
+    call = _retell_call_record(call_id)
+    if not call or str(call.get("call_status") or "").lower() in {"registered", "ongoing"}:
+        return False
+    if (call.get("call_analysis") or {}).get("call_summary"):
+        _upsert_retell_call(call, "call_analyzed")
+        _trace(f"retell_outcome_fetched call={call_id} summary=yes")
+        return True
+    if final:
+        _upsert_retell_call(call, "call_ended")
+        _trace(f"retell_outcome_fetched call={call_id} summary=no (Retell has none)")
+    return False
+
+
+async def _fetch_retell_outcome(call_id: str) -> None:
+    for index, wait in enumerate(RETELL_OUTCOME_WAITS):
+        await asyncio.sleep(wait)
+        try:
+            if await asyncio.to_thread(_store_retell_outcome, call_id, index == len(RETELL_OUTCOME_WAITS) - 1):
+                return
+        except Exception as error:
+            _trace(f"retell_outcome_store_failed call={call_id} error={type(error).__name__}: {error}", error=True)
+            return
+
+
+def fetch_retell_outcome_later(call_id: str) -> None:
+    """After a Retell call ends: fetch its summary in the background unless the webhook stores it first."""
+    if not call_id or not os.getenv("RETELL_API_KEY", "").strip():
+        return
+    task = asyncio.get_running_loop().create_task(_fetch_retell_outcome(call_id))
+    _OUTCOME_TASKS.add(task)
+    task.add_done_callback(_OUTCOME_TASKS.discard)
+
+
+def recover_retell_outcomes(hours: int = 24) -> int:
+    """At startup: Retell calls of the last day still without Retell's summary (the server restarted before it was
+    fetched, as during the call of 2026-10-28 10:05) get it now. Returns how many were completed."""
+    from mongo_client import mongo_client
+    from datetime import timedelta
+    if not os.getenv("RETELL_API_KEY", "").strip() or not mongo_client.is_connected():
+        return 0
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+    rows = mongo_client.calls.find({"provider": "retell", "call_date": {"$gte": since}, "analysis_status": {"$ne": "complete"}},
+                                   {"call_session_id": 1}).limit(50)
+    done = 0
+    for row in rows:
+        try:
+            done += bool(_store_retell_outcome(str(row.get("call_session_id") or ""), final=True))
+        except Exception as error:
+            _trace(f"retell_outcome_recovery_failed call={row.get('call_session_id')} error={type(error).__name__}", error=True)
+    if done:
+        _trace(f"retell_outcome_recovered calls={done}")
+    return done
+
+
 @router.post("/webhook", status_code=204)
 async def retell_webhook(request: Request) -> Response:
     """Persist Retell lifecycle, transcript, and post-call analysis events."""
@@ -1558,6 +1649,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                         if callback_requested
                         else "Retell inbound AI call completed."
                     ),
+                    "provisional": True,  # Retell's own record (summary, sentiment) replaces this one when it arrives
                     "sentiment": "neutral",
                     "transfer_requested": callback_requested,
                     "transfer_status": transfer_status,
@@ -1573,3 +1665,6 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             _trace(f"retell_ws_fallback_call_saved call={call_id} messages={len(user_messages) + len(agent_messages)} callback={callback_requested}")
         else:
             _trace(f"retell_ws_fallback_call_skipped call={call_id} caller_known={caller_number != 'unknown'} messages={len(user_messages) + len(agent_messages)}")
+        fetch_retell_outcome_later(call_id)  # Retell's summary, even when its webhook never reaches us
+        # The call's objects are garbage now: give their memory back before the next call (memory_care).
+        asyncio.get_running_loop().run_in_executor(None, memory_care.release_after_call)
