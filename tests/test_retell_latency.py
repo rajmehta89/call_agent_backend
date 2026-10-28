@@ -256,3 +256,15 @@ def test_filler_wait_is_timed_from_when_the_caller_stopped_speaking():
 ])
 def test_speech_end_clock_never_skips_or_delays_the_wait(transcript, now, expected):
     assert retell.speech_end_clock(transcript, 100.0, now) == pytest.approx(expected)
+
+
+def test_semantic_prefetch_waits_longer_on_a_slow_server():
+    # A round taking 1.5 s (Render's small CPU) must not start at every short pause: it would be stale before it ends.
+    warm = retell._SemanticPrefetch()
+    assert warm.pause_seconds() == retell._SemanticPrefetch.STABLE_SECONDS
+    warm.round_seconds = 0.05  # fast CPU: unchanged
+    assert warm.pause_seconds() == retell._SemanticPrefetch.STABLE_SECONDS
+    warm.round_seconds = 1.5
+    assert warm.pause_seconds() == 1.5
+    warm.round_seconds = 9.0
+    assert warm.pause_seconds() == retell._SemanticPrefetch.MAX_PAUSE_SECONDS

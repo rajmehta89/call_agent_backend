@@ -773,9 +773,17 @@ def unfinished_wait_seconds() -> float:
 
 
 class _SemanticPrefetch:
-    """Prepare stable caller words early, with one worker and no partial-text queue."""
+    """Prepare stable caller words early, with one worker and no partial-text queue.
+
+    The pause before a round adapts to how long a round takes on this server. On a fast CPU (a round ~50 ms) it
+    starts after STABLE_SECONDS of unchanged words. On Render's small CPU a round took ~1.5 s, so rounds started at
+    every short pause were stale before they finished: the CPU stayed busy with old partial sentences all through the
+    caller's speech, and the real turn check then waited behind them (1.6-1.8 s per turn on the call of 2026-10-28
+    08:22, growing as the call went on). Now a round starts only after the caller has been quiet about as long as a
+    round takes (at most MAX_PAUSE_SECONDS)."""
 
     STABLE_SECONDS = 0.25
+    MAX_PAUSE_SECONDS = 2.0
 
     def __init__(self, prepare=None):
         self.prepare = prepare or prepare_turn_meaning
@@ -783,6 +791,10 @@ class _SemanticPrefetch:
         self.last = None
         self.updated_at = 0.0
         self.task = None
+        self.round_seconds = 0.0  # how long the last round took
+
+    def pause_seconds(self) -> float:
+        return max(self.STABLE_SECONDS, min(self.MAX_PAUSE_SECONDS, self.round_seconds))
 
     def schedule(self, caller_text: str, agent_text: str, earlier: str = "") -> None:
         payload = (caller_text, agent_text, earlier) if earlier else (caller_text, agent_text)
@@ -798,15 +810,17 @@ class _SemanticPrefetch:
 
     async def _run(self) -> None:
         while self.pending is not None:
-            remaining = self.STABLE_SECONDS - (perf_counter() - self.updated_at)
+            remaining = self.pause_seconds() - (perf_counter() - self.updated_at)
             if remaining > 0:
                 await asyncio.sleep(remaining)
                 continue
             payload, self.pending = self.pending, None
+            started = perf_counter()
             try:
                 await asyncio.to_thread(self.prepare, *payload)
             except Exception as error:
                 logger.debug("semantic prefetch failed: %s", type(error).__name__)
+            self.round_seconds = perf_counter() - started
 
     async def close(self) -> None:
         self.discard_pending()
