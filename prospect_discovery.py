@@ -1,5 +1,6 @@
 """Google Places prospect discovery and website contact enrichment."""
 
+import hashlib
 import os
 import re
 import time
@@ -22,6 +23,22 @@ PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 IGNORED_EMAIL_HOSTS = {"example.com", "mysite.com", "yourdomain.com", "yourcompany.com", "domain.com", "sentry.io", "wixpress.com", "wordpress.com"}
 ASSET_EMAIL_EXTENSIONS = {"webp", "png", "jpg", "jpeg", "gif", "svg", "ico", "css", "js", "woff", "woff2"}
+# Trades and home services: they lose jobs to calls missed on site or after hours, which the AI receptionist fixes.
+HOME_SERVICE_TERMS = ("plumb", "electric", "roof", "hvac", "air condition", "heating", "cleaning", "pest", "locksmith",
+                      "landscap", "garden", "painter", "painting", "builder", "carpent", "concret", "fencing", "tiling",
+                      "gutter", "solar", "removal", "handyman", "contractor", "home service", "renovat")
+TRADE_TEMPLATES = ("missed-calls-on-the-job", "after-hours-calls")
+# Businesses that sell what we sell. The campaign query "AI automation for home services" also returned AI and
+# automation agencies (70 of the first 951 emails went to such names), so they are never pitched. A plain
+# "automation" stays allowed: smart-home and AV installers are trades and possible customers.
+COMPETITOR_TYPES = {"marketing_agency", "advertising_agency", "software_company", "website_designer", "internet_marketing_service"}
+COMPETITOR_NAME = re.compile(r"\b(a\.?i\.?|ai|marketing|seo|digital agency|web design|software|chatbot|saas)\b", re.IGNORECASE)
+
+
+def _is_competitor(place: Dict[str, Any]) -> bool:
+    """An agency or software business (by its Google category or name), not a prospect for our service."""
+    types = {str(value).lower() for value in [place.get("primaryType"), *(place.get("types") or [])] if value}
+    return bool(types & COMPETITOR_TYPES) or bool(COMPETITOR_NAME.search(_place_name(place)))
 
 
 def _google_places_key() -> str:
@@ -189,7 +206,10 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
     combined_context = f"{prospect.get('company_name', '')} {context}".lower()
     preferred_id = template_id.strip() or "practical-automation-intro"
     if not template_id.strip():
-        if any(term in combined_context for term in ("appointment", "roofing", "plumb", "hvac", "cleaning", "clinic", "dental", "contractor", "home service", "call")):
+        if any(term in combined_context for term in HOME_SERVICE_TERMS):
+            # Trades: the problem-first templates, half each (stable per business) so their replies can be compared.
+            preferred_id = TRADE_TEMPLATES[int(hashlib.sha256(company_key.encode()).hexdigest(), 16) % len(TRADE_TEMPLATES)]
+        elif any(term in combined_context for term in ("appointment", "clinic", "dental", "call")):
             preferred_id = "voice-ai-appointment-intro"
         elif any(term in combined_context for term in ("lead", "sales", "follow-up", "enquir", "crm")):
             preferred_id = "follow-up-automation-intro"
@@ -282,6 +302,8 @@ def discover_prospects(query: str, location: str = "United States", max_results:
             contacts = list(executor.map(_website_contact, websites))
         for place, (email, email_source_url) in zip(places, contacts):
             if place.get("businessStatus") == "CLOSED_PERMANENTLY":
+                continue
+            if _is_competitor(place):
                 continue
             company_name = _place_name(place)
             website = _clean_website(str(place.get("websiteUri") or "").strip())

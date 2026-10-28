@@ -33,17 +33,20 @@ DEFAULT_EMAIL_CAMPAIGN: Dict[str, Any] = {
 # The configured query is always tried first. These focused fallbacks let a
 # campaign keep filling its hourly queue when one Google Places search has
 # too few businesses with a public contact email.
+# Trades and home services first: they lose jobs to calls missed on site or after hours, the problem the AI
+# receptionist fixes, and they get the problem-first trade templates (prospect_discovery.TRADE_TEMPLATES).
 DISCOVERY_FALLBACK_QUERIES = (
+    "plumbers",
+    "electricians",
     "roofing contractors",
-    "plumbing contractors",
-    "HVAC contractors",
-    "home cleaning services",
+    "air conditioning and heating services",
+    "pest control",
+    "locksmiths",
+    "house cleaning services",
+    "landscaping and gardening services",
+    "painters",
+    "builders and renovators",
     "dental clinics",
-    "med spas",
-    "real estate agencies",
-    "property management companies",
-    "law firms",
-    "accounting firms",
     "auto repair shops",
 )
 WORKER_INTERVAL_SECONDS = 30
@@ -366,20 +369,15 @@ def refill_campaign_candidates() -> Dict[str, Any]:
     # Rotate to the least recently researched market instead of asking Places
     # to interpret the whole country list as a single geographic location.
     location = min(locations, key=last_discovered)
-    recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
-    query = next(
-        (
-            candidate
-            for candidate in _discovery_queries(configured_query)
-            if not mongo_client.discovery_runs.find_one(
-                {"query": candidate, "location": location, "created_at": {"$gte": recent_cutoff}},
-                sort=[("created_at", -1)],
-            )
-        ),
-        None,
-    )
-    if not query:
-        return {"status": "cooldown", "needed": needed, "queued": queued}
+
+    def last_searched(candidate):
+        last = mongo_client.discovery_runs.find_one({"query": candidate, "location": location}, sort=[("created_at", -1)])
+        return last.get("created_at", datetime.min) if last else datetime.min
+    # The trade least recently searched in this market, never searched ones first in list order. Picking "the first
+    # query not run in the last 10 minutes" chose the same one every time (each market comes round only every
+    # ~70 minutes): 22 runs of "plumbing contractors" on 2026-10-28 found the same, already emailed, businesses
+    # and made no drafts, while the other trades were never searched.
+    query = min(_discovery_queries(configured_query), key=last_searched)
 
     from prospect_discovery import discover_prospects
     result = discover_prospects(

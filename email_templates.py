@@ -29,6 +29,29 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
         "active": True,
         "variables": ["company_name", "company_context", "website"],
     },
+    # Trades and home services: open with the owner's problem (calls missed while on a job or after hours), not with
+    # who we are, under 90 words, no link in the body (better delivery), one easy yes. Drafts alternate between the two
+    # so their replies can be compared (template_name is stored on each email).
+    {
+        "id": "missed-calls-on-the-job",
+        "name": "Missed calls while on the job",
+        "description": "Trades and home services: calls that ring out while the team is on a job.",
+        "subject": "Missed calls at {{company_name}}?",
+        "body": "Hi {{company_name}} team,\n\nQuick question: when you're on a job and the phone rings, who picks up?\n\nCalls that go to voicemail often end up with the next business on Google. I've built an AI receptionist that answers every call, day or night, books the job or takes the caller's details, and passes them to your team straight away. It knows your services, so callers get real answers.\n\nWant me to send a 60-second recording of it handling a call?\n\nCheers,\nRaj Mehta\nbuildwithraj.com",
+        "built_in": True,
+        "active": True,
+        "variables": ["company_name"],
+    },
+    {
+        "id": "after-hours-calls",
+        "name": "After-hours calls",
+        "description": "Trades and home services: enquiries that come in after hours and on weekends.",
+        "subject": "After-hours calls at {{company_name}}",
+        "body": "Hi {{company_name}} team,\n\nWho answers your phone after 5pm and on weekends?\n\nI build an AI receptionist for trade and home-service businesses. It picks up every call, answers common questions, books jobs or takes the caller's details, and passes them to your team, so after-hours enquiries don't go to a competitor.\n\nWould a short recording of it answering a call be useful?\n\nCheers,\nRaj Mehta\nbuildwithraj.com",
+        "built_in": True,
+        "active": True,
+        "variables": ["company_name"],
+    },
     {
         "id": "follow-up-automation-intro",
         "name": "Lead follow-up automation",

@@ -38,3 +38,4 @@ phonenumbers>=9.0
 # Legacy compatibility only
 piopiy>=1.2.2
 cryptography>=44,<50  # encrypts saved integration secrets (secret_store.py: Shopify app keys)
+tzdata>=2024.1  # time zones for the email send window (Windows has no system zone data)

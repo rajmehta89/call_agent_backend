@@ -162,5 +162,24 @@ class CampaignControlsIntegrationTests(unittest.TestCase):
         discover.assert_not_called()
 
 
+    def test_discovery_rotates_through_the_trades_in_a_market(self):
+        # 22 runs on 2026-10-28 all searched "plumbing contractors": the same, already emailed, businesses.
+        runs = [{"query": "plumbing contractors", "location": "Sydney NSW", "created_at": datetime.utcnow() - timedelta(hours=3)},
+                {"query": "plumbers", "location": "Sydney NSW", "created_at": datetime.utcnow() - timedelta(hours=2)}]
+
+        class Runs:
+            def find_one(self, query, sort=None):
+                rows = [run for run in runs if all(run.get(key) == value for key, value in query.items())]
+                return max(rows, key=lambda run: run["created_at"]) if rows else None
+
+        fake = Mock(is_connected=lambda: True)
+        fake.discovery_runs = Runs()
+        campaign = {"status": "running", "discovery_enabled": True, "max_emails": 20, "daily_limit": 100,
+                    "discovery_query": "plumbing contractors", "discovery_location": "Sydney NSW"}
+        with patch.object(email_campaign, "mongo_client", fake),              patch.object(email_campaign, "get_email_campaign", return_value=campaign),              patch.object(email_campaign, "get_email_policy", return_value={}),              patch.object(email_campaign, "_daily_count", return_value=0),              patch.object(email_campaign, "_pending_campaign_candidates", return_value=0),              patch("campaign_registry.get_campaigns", return_value=[]),              patch.dict("os.environ", {"GOOGLE_PLACES_API_KEY": "test", "CAMPAIGN_DISCOVERY_COOLDOWN_MINUTES": "1"}),              patch("prospect_discovery.discover_prospects", return_value={}) as discover:
+            email_campaign.refill_campaign_candidates()
+        self.assertEqual(discover.call_args[0][0], "electricians")  # the first trade never searched in Sydney
+
+
 if __name__ == "__main__":
     unittest.main()
