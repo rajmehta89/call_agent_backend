@@ -15,7 +15,7 @@ def test_pending_handoff_does_not_start_another_reply_or_transfer(monkeypatch):
     services = SimpleNamespace(is_llm_configured=lambda: True)
     monkeypatch.setattr(retell, "AIServices", lambda: services)
     monkeypatch.setattr(retell, "configure_voice_services", lambda client, model: client)
-    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda text: "live")
+    monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda text, *rest: "live")
     monkeypatch.setattr(retell.call_forwarding, "forwarding_on", lambda: True)
     monkeypatch.setattr(retell.call_forwarding, "twilio_call_for_retell", lambda call_id: {"call_sid": "CA_TEST", "caller": "+61400000000"})
     monkeypatch.setattr(retell, "call_is_over", lambda *args: False)

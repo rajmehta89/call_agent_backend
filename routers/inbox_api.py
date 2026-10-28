@@ -21,6 +21,7 @@ Every write is logged as "inbox: <action> ..." so it can be followed with tail_l
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -586,14 +587,29 @@ def conversation_for_lead(lead_id: str, user: Dict[str, Any] = Depends(require_u
     return {"success": True, "data": {"key": key, "link": f"/inbox?open={quote(key, safe='')}"}}
 
 
+# Opening a conversation reads several collections. The database is in AWS Mumbai and production runs in Oregon,
+# so each read is a ~0.25 s round trip: one after another they held the right-hand pane for 1.5-2 s. They are
+# independent, so they run side by side (the profile waits only for the calls it is built from).
+_DETAIL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="inbox-detail")
+_PROFILE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inbox-profile")  # its own: _profile runs inside _DETAIL_POOL
+
+
 @router.get("/conversations/{key:path}")
 def get_conversation(key: str, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
-    calls = sorted(mongo_client.calls.find(_calls_query(key)), key=_when)
+    workspace = user.get("workspace_id", "default")
+    calls_read = _DETAIL_POOL.submit(lambda: sorted(mongo_client.calls.find(_calls_query(key)), key=_when))
+    threads_read = _DETAIL_POOL.submit(_threads)
+    discussion_read = _DETAIL_POOL.submit(lambda: list(mongo_client.team_messages.find(
+        {"workspace_id": workspace, "conversation_id": key, **_visible_query(user)}).sort("created_at", 1)))
+    read_marked = _DETAIL_POOL.submit(_read_notifications, user, key)
+    state_read = _DETAIL_POOL.submit(lambda: mongo_client.inbox_threads.find_one({"_id": key}, {"stage_history": 1, "events": 1}) or {})
+    calls = calls_read.result()
     if not calls:
         logger.warning("inbox: %s opened missing thread %s", user.get("email"), key)
         raise HTTPException(status_code=404, detail="Conversation not found")
-    thread = next((item for item in _threads() if item["key"] == key), None) or {"key": key, "name": key}
+    profile_read = _DETAIL_POOL.submit(_profile, calls)
+    thread = next((item for item in threads_read.result() if item["key"] == key), None) or {"key": key, "name": key}
     history = [{"id": str(call["_id"]), "at": _utc(_when(call)), "phone": caller_identity(call.get("phone_number") or ""), "status": call.get("status", "completed"), "live": _is_live(call),
                 "failed": str(call.get("status", "")).lower() in FAILED_STATUSES, "provider": call.get("provider") or "voice",
                 "channel_type": call.get("channel_type"), "duration": call.get("duration") or 0, "summary": _full_call_summary(call),
@@ -602,10 +618,10 @@ def get_conversation(key: str, user: Dict[str, Any] = Depends(require_user)):
                 "transfer_status": call.get("transfer_status"), "human_callback_requested": bool(call.get("human_callback_requested")),
                 "disconnection_reason": call.get("disconnection_reason"),
                 "messages": _call_messages(call)} for call in calls]
-    discussion = list(mongo_client.team_messages.find({"workspace_id": user.get("workspace_id", "default"), "conversation_id": key, **_visible_query(user)}).sort("created_at", 1))
-    read = _read_notifications(user, key)
+    discussion = discussion_read.result()
+    read = read_marked.result()  # before answering: the page refreshes its unread counts right after
     logger.info("inbox: %s opened thread %s (%d calls, live=%s, %d notifications read)", user.get("email"), key, len(history), thread.get("live"), read)
-    state = mongo_client.inbox_threads.find_one({"_id": key}, {"stage_history": 1, "events": 1}) or {}
+    state = state_read.result()
     events = (state.get("events") or [])[-100:] + [
         {"type": "stage", "text": f"{change.get('by_name') or 'Someone'} changed the status to {STAGE_LABELS.get(change.get('to'), change.get('to'))}"
                                  + (f": {change['reason']}" if change.get("reason") else ""),
@@ -613,15 +629,19 @@ def get_conversation(key: str, user: Dict[str, Any] = Depends(require_user)):
          "to": change.get("to"), "to_label": STAGE_LABELS.get(change.get("to"), change.get("to")), "reason": change.get("reason"),
          "by_name": change.get("by_name"), "at": change.get("at")} for change in (state.get("stage_history") or [])[-50:]]
     return {"success": True, "data": _serialize({**thread, "calls": history, "discussion": discussion, "stage_history": (state.get("stage_history") or [])[-50:],
-                                                 "events": sorted(events, key=lambda event: event.get("at") or datetime.min), "profile": _profile(calls)})}
+                                                 "events": sorted(events, key=lambda event: event.get("at") or datetime.min), "profile": profile_read.result()})}
 
 
 def _profile(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Contact details for the contact panel, from the caller's lead and customer records when there are any."""
     lead_id = next((str(call["lead_id"]) for call in calls if call.get("lead_id") and ObjectId.is_valid(str(call["lead_id"]))), None)
+    # The lead and the customer record are read together (one ~0.25 s round trip on production, not two), by the
+    # call's number; only when the lead holds a different number is the customer read again by that one.
+    call_phone = calls[-1].get("phone_number")
+    customer_read = _PROFILE_POOL.submit(lambda: (mongo_client.customers.find_one({"phone": call_phone}) if call_phone else None) or {})
     lead = (mongo_client.leads.find_one({"_id": ObjectId(lead_id)}) if lead_id else None) or {}
-    phone = lead.get("phone") or calls[-1].get("phone_number")
-    customer = (mongo_client.customers.find_one({"phone": phone}) if phone else None) or {}
+    phone = lead.get("phone") or call_phone
+    customer = customer_read.result() if phone == call_phone else (mongo_client.customers.find_one({"phone": phone}) if phone else None) or {}
     return {"name": lead.get("name") or customer.get("name"), "phone": phone, "email": lead.get("email") or customer.get("email"), "company": lead.get("company"), "preferred_language": lead.get("preferred_language") or "en",
             "address": customer.get("location"), "tags": customer.get("tags") or [],
             "source": lead.get("source") or ("Web call" if str(phone or "").startswith("client:") else "Phone"),
