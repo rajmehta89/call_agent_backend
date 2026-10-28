@@ -1388,7 +1388,11 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 result = direct, False
             else:
                 semantic_started = perf_counter()
-                await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript))
+                # The same texts the prefetch made while the caller spoke (with the earlier conversation), so they
+                # are cache hits. Without `earlier` this built one more combined text that no decision used: an
+                # extra embedding every turn, 0.3-0.5 s on Render's CPU.
+                await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript),
+                                        " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:]))
                 timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
                 result = await asyncio.gather(
                     asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if direct is None else asyncio.sleep(0, result=direct),

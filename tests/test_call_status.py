@@ -66,3 +66,24 @@ def test_may_move_rules():
     assert not call_status.may_move("outreach", "new_lead")
     assert not call_status.may_move("won", "new_lead")
     assert call_status.may_move("follow_up", "scheduling")
+
+
+def test_ai_summary_only_fills_a_placeholder_still_in_place(monkeypatch):
+    # Retell's summary can be stored while the AI is still classifying: the AI's write must not replace it.
+    call = {"_id": "6a0000000000000000000002", "status": "completed", "phone_number": "+61400000000", "provider": "retell",
+            "call_summary": "Retell inbound AI call completed."}
+    writes, published = [], []
+
+    def update_one(query, update):
+        writes.append(query)
+        return SimpleNamespace(modified_count=0)  # the summary changed meanwhile: nothing matched
+
+    fake = SimpleNamespace(is_connected=lambda: True, calls=SimpleNamespace(find_one=lambda q: call, update_one=update_one),
+                           inbox_threads=FakeCollection({}), users=SimpleNamespace(find_one=lambda q: None))
+    monkeypatch.setattr(call_status, "mongo_client", fake)
+    monkeypatch.setattr(call_status, "classify", lambda c, current: {"stage": "new_lead", "reason": "x", "confidence": 0.1, "summary": "AI summary"})
+    monkeypatch.setattr(call_status.realtime, "publish", lambda *a, **k: published.append(a))
+    from routers import inbox_api
+    monkeypatch.setattr(inbox_api, "_thread_key", lambda c: c["phone_number"])
+    call_status.apply_auto_status(call["_id"])
+    assert writes == [{"_id": call["_id"], "call_summary": "Retell inbound AI call completed."}] and not published

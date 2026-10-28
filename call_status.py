@@ -113,7 +113,10 @@ def may_move(current: str, stage: str) -> bool:
 def is_placeholder_summary(text: Any) -> bool:
     """Stand-in text written when a provider sent no summary; the AI summary replaces it."""
     text = str(text or "").strip()
-    return not text or text == "Retell call completed." or text.startswith("Custom Twilio voice call with ")
+    # Our own stand-ins: the Retell webhook's, the Retell end-of-call backup save's (it was missing, so Retell calls
+    # whose webhook never arrived kept "Retell inbound AI call completed."), and the custom stack's.
+    return (not text or text in {"Retell call completed.", "Retell inbound AI call completed.", "Human callback requested from the Retell AI call."}
+            or text.startswith("Custom Twilio voice call with "))
 
 
 def apply_auto_status(call_id: str) -> Optional[str]:
@@ -141,8 +144,12 @@ def apply_auto_status(call_id: str) -> Optional[str]:
     # Calls whose provider sent no summary ("Retell call completed.", "Custom Twilio voice call with ...")
     # get the AI's summary instead, so the inbox, dashboard and call history show what the caller wanted.
     if verdict and needs_summary and verdict.get("summary"):
-        mongo_client.calls.update_one({"_id": call["_id"]}, {"$set": {"call_summary": verdict["summary"], "summary": verdict["summary"], "summary_by": AI_ACTOR}})
-        realtime.publish("call", key=call.get("call_session_id") or str(call["_id"]))
+        # Only if the summary is still the one read above: classifying takes seconds, and Retell's own summary
+        # (webhook or fetch) may have been stored meanwhile; it must not be replaced by ours.
+        written = mongo_client.calls.update_one({"_id": call["_id"], "call_summary": call.get("call_summary")},
+                                                {"$set": {"call_summary": verdict["summary"], "summary": verdict["summary"], "summary_by": AI_ACTOR}})
+        if written.modified_count:
+            realtime.publish("call", key=call.get("call_session_id") or str(call["_id"]))
     if person_set:
         return None
     try:

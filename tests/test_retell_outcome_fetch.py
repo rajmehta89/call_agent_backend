@@ -74,3 +74,11 @@ def test_our_placeholder_never_replaces_retells_summary(monkeypatch):
     calls_api.log_call("+61400000000", call_data={"call_session_id": "call_1", "summary": "Retell inbound AI call completed.",
                                                   "sentiment": "neutral", "status": "completed", "provisional": True})
     assert calls.updates and "call_summary" not in calls.updates[0] and "sentiment" not in calls.updates[0]
+
+
+def test_our_retell_stand_ins_get_the_ai_summary():
+    from call_status import is_placeholder_summary
+    assert is_placeholder_summary("Retell inbound AI call completed.") and is_placeholder_summary("Retell call completed.")
+    assert is_placeholder_summary("Human callback requested from the Retell AI call.")
+    assert is_placeholder_summary("Custom Twilio voice call with 3 caller turns and 4 AI responses.")
+    assert not is_placeholder_summary("The caller asked for the lowest-priced basin.")
