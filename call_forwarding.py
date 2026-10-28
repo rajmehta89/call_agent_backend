@@ -16,7 +16,9 @@ import html
 import logging
 import os
 import re
+import threading
 import time
+from collections import OrderedDict
 from functools import lru_cache
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -362,8 +364,10 @@ def ambiguous_team_call(caller_text: str) -> bool:
     return handoff_intent(caller_text) == "unclear"
 
 
-def handoff_intent(caller_text: str, earlier: str = "") -> str:
-    """Classify the full turn, optionally with the preceding team request: live, callback, unclear or other."""
+def handoff_intent(caller_text: str, earlier: str = "", agent_text: str = "") -> str:
+    """Classify the full turn, optionally with the preceding team request: live, callback, unclear or other.
+    agent_text: our last reply, which the language-model check reads with the turn ("I just talk with you" after
+    "Would you like details on those handles?" is about talking to us)."""
     from turn_meaning import HANDOFF_ACTION
     ranked = HANDOFF_ACTION.rank(caller_text, earlier)
     if not ranked:
@@ -381,7 +385,7 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
         if (replies and replies[0][0] in {"live", "callback"} and replies[0][1] >= 0.85
                 and replies[0][1] - replies[1][1] >= 0.07):
             return replies[0][0]
-        decided = _adjudicate_handoff(caller_text, earlier)
+        decided = _adjudicate_handoff(caller_text, earlier, agent_text=agent_text)
         if decided:
             return decided
         return "unclear"  # ask now-or-later instead of guessing after a provider error
@@ -396,8 +400,57 @@ def handoff_intent(caller_text: str, earlier: str = "") -> str:
         result = "unclear"
     else:
         result = ""
+    # Callers can put a request for a person in any words, and a sentence about talking to *us* can sound like one:
+    # "...whichever there are two, I just talk with you." scored live 0.78 against other 0.68 and rang the team
+    # (production call 2026-10-28 09:24). Example sentences cannot cover every wording, so a possible transfer that
+    # is not clearly one is read by a language model, in full and with the earlier request, before anything happens.
+    # Clear requests ("I want to speak to a person": live 0.95, other 0.76) still go at once, and turns that are
+    # clearly not about a person never wait for it. The caller is never asked.
+    clear_live = result == "live" and live >= other + HANDOFF_CLEAR_MARGIN
+    # Right after we offered the team ("now, or should they call you back?"), any reply may be the answer, in any
+    # words: "Later is fine." matched no example and booked nothing. Then the model reads the reply with our offer.
+    answers_offer = not result and bool(agent_text) and _offered_team(agent_text)
+    if (result in {"live", "unclear"} and not clear_live or answers_offer) and _llm_handoff_check_enabled():
+        decided = _adjudicate_handoff_cached(caller_text, earlier, agent_text)
+        if decided:
+            result = "" if decided == "other" else decided
+        elif result == "live":
+            result = "unclear"  # the check failed: ask now-or-later rather than ring the team on a borderline score
     logger.debug("handoff intent %r -> %s (%s)", caller_text[:80], result or "other", ", ".join(f"{k} {v:.2f}" for k, v in ranked))
     return result
+
+
+# How far "live" must lead "other" to transfer without the language-model check (see handoff_intent).
+HANDOFF_CLEAR_MARGIN = 0.15
+_HANDOFF_VERDICTS: "OrderedDict[tuple, str]" = OrderedDict()
+_HANDOFF_VERDICTS_LOCK = threading.Lock()
+
+
+def _offered_team(agent_text: str) -> bool:
+    """Our reply offered a live transfer or a callback, by meaning (turn_meaning.HANDOFF_OFFER)."""
+    from turn_meaning import HANDOFF_OFFER
+    offers = HANDOFF_OFFER.close(agent_text)
+    return bool(offers) and "other" not in offers
+
+
+def _llm_handoff_check_enabled() -> bool:
+    """HANDOFF_LLM_CHECK=false decides by the embedding scores alone (no model call, as before)."""
+    return os.getenv("HANDOFF_LLM_CHECK", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _adjudicate_handoff_cached(caller_text: str, earlier: str = "", agent_text: str = "") -> str:
+    """One model call per turn: the same turn is checked by several helpers (wants a person? a callback? unclear?)."""
+    key = (" ".join(caller_text.split()), " ".join((earlier or "").split()), " ".join((agent_text or "").split()))
+    with _HANDOFF_VERDICTS_LOCK:
+        if key in _HANDOFF_VERDICTS:
+            return _HANDOFF_VERDICTS[key]
+    decided = _adjudicate_handoff(caller_text, earlier, agent_text=agent_text)
+    if decided:  # a failed check is not remembered: the next helper may try again
+        with _HANDOFF_VERDICTS_LOCK:
+            _HANDOFF_VERDICTS[key] = decided
+            while len(_HANDOFF_VERDICTS) > 256:
+                _HANDOFF_VERDICTS.popitem(last=False)
+    return decided
 
 
 def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_requested: bool = False) -> Optional[str]:
@@ -438,21 +491,28 @@ def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_r
 
 
 @lru_cache(maxsize=256)
-def _adjudicate_handoff(caller_text: str, earlier: str = "") -> str:
+def _adjudicate_handoff(caller_text: str, earlier: str = "", agent_text: str = "") -> str:
     """Resolve an embedding tie using the actual caller wording and context."""
     try:
         from ai_services import AIServices
         services = AIServices()
-        model = os.getenv("HANDOFF_CLASSIFIER_MODEL") or os.getenv("VOICE_FAST_MODEL") or ("openai/gpt-4.1-mini" if services.provider == "openrouter" else "gpt-4.1-mini")
-        message = f"Earlier caller request: {earlier}\nCurrent caller turn: {caller_text}" if earlier else caller_text
+        # The main voice model, not the fast one: llama-3.1-8b read "Put me through to sales please." and "Can somebody
+        # phone me this arvo?" as no request for a person. Ringing the team is consequential enough for the better reader.
+        model = (os.getenv("HANDOFF_CLASSIFIER_MODEL") or os.getenv("RETELL_OPENROUTER_MODEL")
+                 or ("openai/gpt-4.1-mini" if services.provider == "openrouter" else "gpt-4.1-mini"))
+        message = "\n".join(part for part in (f"Assistant just said: {agent_text}" if agent_text else "",
+                                               f"Earlier caller request: {earlier}" if earlier else "",
+                                               f"Current caller turn: {caller_text}") if part)
         response = services.openai_client.with_options(timeout=2, max_retries=0).chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "Classify whether the caller wants to speak with a human team member. "
-                 "Reply with exactly one word: LIVE, CALLBACK, UNCLEAR, or OTHER. "
+                {"role": "system", "content": "The caller is on the phone with an AI assistant. Classify whether the caller "
+                 "wants to speak with a human team member. Reply with exactly one word: LIVE, CALLBACK, UNCLEAR, or OTHER. "
                  "LIVE means connect during this ongoing phone call. CALLBACK means the team should contact them later. "
                  "UNCLEAR means a human is requested but timing is not clear. OTHER means no human is requested. "
-                 "Read the caller's meaning and timing, even when the wording is indirect."},
+                 "Read the caller's meaning and timing, even when the wording is indirect or the transcript is garbled. "
+                 "Wanting to keep talking with the assistant itself (\"you\") is OTHER, and so are questions about "
+                 "products, services or staff that do not ask for a person to join the call or call back."},
                 {"role": "user", "content": message},
             ], max_tokens=8, temperature=0)
         answer = (response.choices[0].message.content or "").strip().lower()
@@ -462,8 +522,8 @@ def _adjudicate_handoff(caller_text: str, earlier: str = "") -> str:
         return ""
 
 
-def wants_person(caller_text: str, earlier: str = "") -> bool:
-    return handoff_intent(caller_text, earlier) == "live"
+def wants_person(caller_text: str, earlier: str = "", agent_text: str = "") -> bool:
+    return handoff_intent(caller_text, earlier, agent_text) == "live"
 
 
 def asks_for_team(caller_text: str) -> str:

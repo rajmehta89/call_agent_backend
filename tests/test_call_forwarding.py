@@ -288,7 +288,7 @@ def test_live_request_wins_a_close_callback_embedding_tie(monkeypatch):
 
     monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
         ("callback", 0.597), ("live", 0.593), ("unclear", 0.554), ("other", 0.357)])
-    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="": "live")
+    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="", **kw: "live")
     assert call_forwarding.handoff_intent("Can you arrange a call to the teammate now?") == "live"
 
 
@@ -315,7 +315,7 @@ def test_close_tie_can_still_be_a_later_callback(monkeypatch):
 
     monkeypatch.setattr(HANDOFF_ACTION, "rank", lambda text, earlier="": [
         ("live", 0.766), ("callback", 0.765), ("unclear", 0.74), ("other", 0.458)])
-    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="": "callback")
+    monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", lambda text, earlier="", **kw: "callback")
     assert call_forwarding.handoff_intent("Can you arrange a call tomorrow so I can talk with him?") == "callback"
 
 

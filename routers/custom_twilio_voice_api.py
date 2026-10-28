@@ -1085,8 +1085,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
             turn_timing["handoff_source"] = "semantic_context" if intent is not None else "semantic"
             if intent is None:
-                await asyncio.to_thread(prepare_turn_meaning, text, agent_text)
-                intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text)
+                # Same texts as the reply's checks (with the earlier conversation), so they are cache hits.
+                await asyncio.to_thread(prepare_turn_meaning, text, agent_text,
+                                        " ".join(" ".join(earlier_caller_texts(memory.history(), text)[-8:]).split()[-25:]))
+                intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text, agent_text)
             yield intent
 
         async def routing_notice():
@@ -1527,7 +1529,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 early_handoff_checked = heard_text
                 # A network-backed classifier must not pause speculative preparation or the turn watchdog.
                 early_handoff_task = asyncio.create_task(asyncio.to_thread(
-                    call_forwarding.wants_person, heard_text, earlier_handoff_text))
+                    call_forwarding.wants_person, heard_text, earlier_handoff_text, last_agent_text(memory.history())))
             if flux and heard_text and stuck_after and quiet_for >= stuck_after and not bot_busy() and forced_turn == heard_text and forced_at and perf_counter() - forced_at >= 0.75:
                 # Some Flux sessions acknowledge neither the request nor the turn. Do not leave the caller waiting.
                 forced_fallback_text = heard_text

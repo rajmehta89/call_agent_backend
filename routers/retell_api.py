@@ -1409,7 +1409,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                                         " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:]))
                 timing["semantic_ms"] = round((perf_counter() - semantic_started) * 1000)
                 result = await asyncio.gather(
-                    asyncio.to_thread(call_forwarding.handoff_intent, caller_text) if direct is None else asyncio.sleep(0, result=direct),
+                    asyncio.to_thread(call_forwarding.handoff_intent, caller_text, "", last_agent_text(transcript)) if direct is None else asyncio.sleep(0, result=direct),
                     asyncio.to_thread(call_is_over, caller_text, last_agent_text(transcript)),
                 )
             yield tuple(result)
