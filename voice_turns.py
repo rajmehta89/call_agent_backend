@@ -68,6 +68,11 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
     fast = fast_voice_model()
     if not fast:
         return None
+    # The fast model (llama-3.1-8b) writes Urdu half in Hindi script ("آپ ने नया घर لیا ہے", 2026-10-29) and ignores the
+    # Urdu-script rule: Urdu, Hindi and Arabic callers always get the main model.
+    from meaning import is_foreign
+    if is_foreign(caller_text):
+        return None
     # The whole turn, judged by meaning, clearly asks about the store's products or an order: the careful model, which
     # gets the live store data. The checks below read only the last sentence: "Okay. So I just bought a new house and
     # I was thinking about the handle and the basin. So is it possible?" was judged by "So is it possible?" and a

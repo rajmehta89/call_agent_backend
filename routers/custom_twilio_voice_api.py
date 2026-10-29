@@ -640,6 +640,9 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
             while (match := _next_chunk(pending, first=not yielded)):
                 sentence, pending = pending[:match.end()].strip(), pending[match.end():]
                 if sentence:
+                    if not yielded and timings is not None:
+                        # When the reply had its first sentence, before the voice took it (first_sentence_ms is that).
+                        timings["first_sentence_ready_ms"] = round((perf_counter() - started) * 1000)
                     yielded = True
                     yield sentence
             if guard.done:
@@ -928,6 +931,20 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     semantic_prefetch = _SemanticPrefetch(prepare_turn_meaning)
     voice_turn_timings: List[Dict[str, Any]] = []
     call_started = perf_counter()
+    # How long this call's event loop was held up: a held-up loop delays every bridge, sentence and audio frame
+    # (a Hindi call on 2026-10-29 had its first sentence ready ~4 s after the model's first words on the server,
+    # 0.1 s here). Saved with the call (provider_metadata.loop_lag_*).
+    loop_lag = {"max_ms": 0, "over_250ms": 0}
+
+    async def watch_loop_lag() -> None:
+        while True:
+            before = perf_counter()
+            await asyncio.sleep(0.1)
+            lag_ms = (perf_counter() - before - 0.1) * 1000
+            loop_lag["max_ms"] = max(loop_lag["max_ms"], round(lag_ms))
+            loop_lag["over_250ms"] += lag_ms > 250
+
+    loop_watch_task = asyncio.create_task(watch_loop_lag())
     heard_text = ""             # the caller's words so far in this turn (final parts + the latest partial)
     heard_changed_at = 0.0      # when those words last changed
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
@@ -2130,6 +2147,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         stream_failure = f"{type(error).__name__}: {error}"
         logger.error("custom Twilio voice websocket error: %s", error)
     finally:
+        loop_watch_task.cancel()
         await semantic_prefetch.close()
         if contact_tasks:
             try:
@@ -2149,6 +2167,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                                      "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
                                       # Why this call listened with Nova or Flux (no secrets): the settings that decide it.
                                       "stt_selection": {"custom_stt": os.getenv("CUSTOM_STT", "flux (default)"),
                                                         "auto_language": _auto_language_enabled(),
