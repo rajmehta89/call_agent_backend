@@ -30,27 +30,27 @@ DEFAULT_EMAIL_TEMPLATES: List[Dict[str, Any]] = [
         "variables": ["company_name", "company_context", "website"],
     },
     # Trades and home services: open with the owner's problem (calls missed while on a job or after hours), not with
-    # who we are, under 90 words, no link in the body (better delivery), one easy yes. Drafts alternate between the two
+    # who we are, under 90 words, one link (our own domain, the same as the sender), one easy yes. Drafts alternate between the two
     # so their replies can be compared (template_name is stored on each email).
     {
         "id": "missed-calls-on-the-job",
         "name": "Missed calls while on the job",
         "description": "Trades and home services: calls that ring out while the team is on a job.",
         "subject": "Missed calls at {{company_name}}?",
-        "body": "Hi {{company_name}} team,\n\nQuick question: when you're on a job and the phone rings, who picks up?\n\nCalls that go to voicemail often end up with the next business on Google. I've built an AI receptionist that answers every call, day or night, books the job or takes the caller's details, and passes them to your team straight away. It knows your services, so callers get real answers.\n\nWant me to send a 60-second recording of it handling a call?\n\nCheers,\nRaj Mehta\nbuildwithraj.com",
+        "body": "Hi {{company_name}} team,\n\nQuick question: when you're on a job and the phone rings, who picks up?\n\nCalls that go to voicemail often end up with the next business on Google{{in_city}}. I've built an AI receptionist that answers every call, day or night, books the job or takes the caller's details, and passes them to your team straight away. It knows your services, so callers get real answers.\n\nWant to hear it? Just reply \"yes\" and I'll send a 60-second recording of it handling a call.\n\nCheers,\nRaj Mehta\nhttps://buildwithraj.com",
         "built_in": True,
         "active": True,
-        "variables": ["company_name"],
+        "variables": ["company_name", "in_city"],
     },
     {
         "id": "after-hours-calls",
         "name": "After-hours calls",
         "description": "Trades and home services: enquiries that come in after hours and on weekends.",
         "subject": "After-hours calls at {{company_name}}",
-        "body": "Hi {{company_name}} team,\n\nWho answers your phone after 5pm and on weekends?\n\nI build an AI receptionist for trade and home-service businesses. It picks up every call, answers common questions, books jobs or takes the caller's details, and passes them to your team, so after-hours enquiries don't go to a competitor.\n\nWould a short recording of it answering a call be useful?\n\nCheers,\nRaj Mehta\nbuildwithraj.com",
+        "body": "Hi {{company_name}} team,\n\nWho answers your phone after 5pm and on weekends?\n\nI build an AI receptionist for trade and home-service businesses. It picks up every call, answers common questions, books jobs or takes the caller's details, and passes them to your team, so after-hours enquiries don't go to another business{{in_city}}.\n\nWant to hear it? Just reply \"yes\" and I'll send a short recording of it answering a call.\n\nCheers,\nRaj Mehta\nhttps://buildwithraj.com",
         "built_in": True,
         "active": True,
-        "variables": ["company_name"],
+        "variables": ["company_name", "in_city"],
     },
     {
         "id": "follow-up-automation-intro",
@@ -151,12 +151,21 @@ def add_email_template(value: Dict[str, Any]) -> Dict[str, Any]:
     return template
 
 
+def _city(location: Any) -> str:
+    words = str(location or "").split(",")[0].split()
+    if len(words) > 1 and re.fullmatch(r"[A-Z]{2,3}", words[-1]):
+        words = words[:-1]
+    return " ".join(words)
+
+
 def render_email_template(template: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, str]:
     """Render a template with campaign or automation context."""
     replacements = {
         "company_name": context.get("company_name") or context.get("company") or context.get("customer_name") or "the business",
         "company_context": context.get("company_context") or context.get("message") or "I noticed there may be an opportunity to make this process faster and easier for your team.",
         "website": context.get("website") or "",
+        # " in Canberra" from a market such as "Canberra ACT" (the state code dropped); empty when unknown.
+        "in_city": f" in {_city(context.get('location'))}" if _city(context.get("location")) else "",
         "recipient_email": context.get("recipient_email") or context.get("email") or "",
         "name": context.get("name") or context.get("customer_name") or "there",
         "customer_name": context.get("customer_name") or context.get("name") or "there",
@@ -209,7 +218,7 @@ def normalize_draft_copy(draft: Dict[str, Any]) -> Dict[str, str]:
 def unsupported_template_variables(template: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
     """Return placeholders that cannot be resolved for this draft context."""
     available = {
-        "company_name", "company_context", "website", "recipient_email", "name",
+        "company_name", "company_context", "website", "in_city", "recipient_email", "name",
         "customer_name", "message", "status", "campaign_goal", "shared_context",
         *[str(key) for key in context.keys()],
     }

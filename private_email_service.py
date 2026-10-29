@@ -1,6 +1,9 @@
 """Namecheap Private Email SMTP sender for individually approved messages."""
 
+import html
+import mimetypes
 import os
+import re
 import smtplib
 import imaplib
 import logging
@@ -18,6 +21,12 @@ class PrivateEmailService:
     @staticmethod
     def _header(value: str) -> str:
         return str(make_header(decode_header(value or "")))
+
+    @staticmethod
+    def _html_body(text: str) -> str:
+        escaped = html.escape(text, quote=True)
+        linked = re.sub(r"https?://[^\s<]+[^\s<.,;:!?)]", lambda match: f'<a href="{match.group(0)}">{match.group(0)}</a>', escaped)
+        return f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">{linked.replace(chr(10), "<br>")}</div>'
 
     @property
     def address(self) -> str:
@@ -72,7 +81,7 @@ class PrivateEmailService:
                 })
             return result
 
-    def send(self, recipients: Iterable[str], subject: str, body: str) -> dict:
+    def send(self, recipients: Iterable[str], subject: str, body: str, attachments: Iterable[str] = ()) -> dict:
         to = GmailService._clean_recipients(recipients)
         if not to:
             return {"status": "skipped", "reason": "No valid recipient email"}
@@ -84,6 +93,12 @@ class PrivateEmailService:
         message["To"] = ", ".join(to)
         message["Subject"] = (str(subject or "").strip() or "Follow-up from Raj's team")[:180]
         message.set_content(str(body or "").strip())
+        # Some mail apps leave a web address in plain text unclickable; the HTML alternative links it.
+        message.add_alternative(self._html_body(str(body or "").strip()), subtype="html")
+        for path in attachments:
+            maintype, _, subtype = (mimetypes.guess_type(path)[0] or "application/octet-stream").partition("/")
+            with open(path, "rb") as handle:
+                message.add_attachment(handle.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
 
         with smtplib.SMTP_SSL("mail.privateemail.com", 465, timeout=15) as server:
             server.login(self.address, os.environ["PRIVATE_EMAIL_PASSWORD"])

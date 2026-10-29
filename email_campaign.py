@@ -154,6 +154,25 @@ def campaign_status() -> Dict[str, Any]:
     }
 
 
+ATTACHMENT_NOTE = "P.S. I've attached a 2-page overview with pricing."
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def campaign_attachments() -> List[str]:
+    """Files every outreach email carries (the campaign's "attachment_paths", relative to the backend folder).
+
+    A missing file is skipped with a warning rather than failing the send.
+    """
+    paths = []
+    for value in get_email_campaign().get("attachment_paths") or []:
+        path = value if os.path.isabs(str(value)) else os.path.join(BACKEND_DIR, str(value))
+        if os.path.isfile(path):
+            paths.append(path)
+        else:
+            logger.warning("Campaign attachment not found, sending without it: %s", os.path.basename(str(value)))
+    return paths
+
+
 def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     from brain_service import brain_service
     from email_templates import normalize_draft_copy
@@ -192,13 +211,24 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     )
     if not claimed:
         return {"status": "skipped", "reason": "Draft is already being processed"}
+    body = draft.get("body", "")
+    attachments = campaign_attachments() if use_private_email else []
+    if attachments:
+        body = f"{body.rstrip()}\n\n{ATTACHMENT_NOTE}"
     try:
-        result = sender.send([draft.get("recipient_email", "")], draft.get("subject", ""), draft.get("body", ""))
+        if attachments:
+            result = sender.send([draft.get("recipient_email", "")], draft.get("subject", ""), body, attachments=attachments)
+        else:
+            result = sender.send([draft.get("recipient_email", "")], draft.get("subject", ""), body)
         if result.get("status") != "sent":
             mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": result.get("reason", "Email was not sent"), "updated_at": datetime.utcnow()}})
             return {"status": "error", "reason": result.get("reason", "Email was not sent")}
         now = datetime.utcnow()
-        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "sent", "sent_at": now, "updated_at": now, "delivery": result}})
+        sent = {"status": "sent", "sent_at": now, "updated_at": now, "delivery": result}
+        if attachments:
+            # Keep the outbox showing exactly what the recipient got.
+            sent.update({"body": body, "attachments": [os.path.basename(path) for path in attachments]})
+        mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": sent})
         return {"status": "sent", "id": str(draft["_id"])}
     except smtplib.SMTPResponseException as exc:
         if "too many messages from sender in last" in str(exc).lower():
@@ -363,21 +393,17 @@ def refill_campaign_candidates() -> Dict[str, Any]:
         configured_query = str(scrape.get("query") or configured_query)
         location = str(scrape.get("location") or location)
     locations = _discovery_locations(location)
-    def last_discovered(value):
-        last = mongo_client.discovery_runs.find_one({"location": value}, sort=[("created_at", -1)])
-        return last.get("created_at", datetime.min) if last else datetime.min
-    # Rotate to the least recently researched market instead of asking Places
-    # to interpret the whole country list as a single geographic location.
-    location = min(locations, key=last_discovered)
 
-    def last_searched(candidate):
-        last = mongo_client.discovery_runs.find_one({"query": candidate, "location": location}, sort=[("created_at", -1)])
+    def last_run(filters):
+        last = mongo_client.discovery_runs.find_one(filters, sort=[("created_at", -1)])
         return last.get("created_at", datetime.min) if last else datetime.min
-    # The trade least recently searched in this market, never searched ones first in list order. Picking "the first
-    # query not run in the last 10 minutes" chose the same one every time (each market comes round only every
-    # ~70 minutes): 22 runs of "plumbing contractors" on 2026-10-28 found the same, already emailed, businesses
-    # and made no drafts, while the other trades were never searched.
-    query = min(_discovery_queries(configured_query), key=last_searched)
+    # The trade least recently searched anywhere (never searched ones first, in list order), then the market least
+    # recently searched for it; Places is asked about one market at a time, never the whole country list. Picking
+    # "the first query not run in the last 10 minutes" chose the same one every time: 22 runs of "plumbing
+    # contractors" on 2026-10-28 found the same, already emailed, businesses and made no drafts. Choosing the market
+    # first then searched one trade in every city before the next trade, so new trades came round only every ~9 runs.
+    query = min(_discovery_queries(configured_query), key=lambda candidate: last_run({"query": candidate}))
+    location = min(locations, key=lambda market: last_run({"query": query, "location": market}))
 
     from prospect_discovery import discover_prospects
     result = discover_prospects(

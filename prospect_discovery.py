@@ -219,7 +219,7 @@ def _create_draft(prospect: Dict[str, Any], context: str, campaign_name: str = "
     template = template or next((item for item in templates if item.get("active", True)), None)
     if not template:
         return ""
-    rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "email": email, "campaign_goal": campaign_goal, "shared_context": shared_context})
+    rendered = render_email_template(template, {"company_name": prospect["company_name"], "company_context": context, "website": prospect.get("website", ""), "location": prospect.get("discovery_location", ""), "email": email, "campaign_goal": campaign_goal, "shared_context": shared_context})
     policy = get_email_policy()
     owner_review_campaign = campaign_name == "Dubai voice WhatsApp CRM outreach"
     approval_needed = owner_review_campaign or (bool(policy.get("approval_required")) and approval_window_open(policy))
