@@ -30,6 +30,8 @@ _ALIASES = {
     "english": "en", "en-us": "en", "en-in": "en", "en-gb": "en", "en": "en",
     "arabic": "ar", "العربية": "ar", "ar-sa": "ar", "ar-ae": "ar", "ar": "ar",
     "urdu": "ur", "اردو": "ur", "ur-pk": "ur", "ur-in": "ur", "ur": "ur",
+    # Spoken Hindi and Urdu are the same for callers: speech recognition reporting Hindi ("hi") answers in Urdu.
+    "hindi": "ur", "हिन्दी": "ur", "हिंदी": "ur", "hi": "ur", "hi-in": "ur",
 }
 
 
@@ -37,6 +39,11 @@ def normalize_language(value: Any) -> str:
     """Return one of the stable CRM language codes, defaulting safely to English."""
     key = str(value or "").strip().lower()
     return _ALIASES.get(key, DEFAULT_LANGUAGE)
+
+
+def spoken_language(value: Any) -> str:
+    """The CRM language for a language code from speech recognition, or "" for one we don't serve."""
+    return _ALIASES.get(str(value or "").strip().lower(), "")
 
 
 def language_config(value: Any) -> Dict[str, str]:
@@ -123,6 +130,11 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
     labels = [language_label(code) for code in enabled]
     script = [language_label(code) for code in enabled if code != "en"]
     script_note = f" Write {_spoken_list(script, 'and')} in {'its' if len(script) == 1 else 'their'} own script, never in Latin letters." if script else ""
+    if "ur" in enabled:
+        # Speech recognition writes spoken Urdu in Hindi (Devanagari) script; the Urdu voice reads only Urdu script,
+        # and a copied Hindi-script word came out wrong (2026-10-29).
+        script_note += (" A caller speaking Hindi or Urdu may come through written in Hindi (Devanagari) script: "
+                        "understand it, and write every word of your Urdu reply in Urdu script, none in Devanagari.")
     unclear = ("If the caller's words make no sense, they may be speaking another language: say briefly that you did "
                "not catch that and ask which language they prefer, naming {options}.")
     if follow_caller:

@@ -44,7 +44,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
-from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language
+from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,10 @@ def _to_ws_url(http_url: str) -> str:
 
 def _deepgram_url(language: str = "en") -> str:
     code = normalize_language(language)
-    auto_language = _auto_language_enabled() and code != "ur"  # Urdu is supported by the dedicated Nova model, not Nova-3 multi.
+    # Nova-3 "multi" hears English, Arabic and Hindi; spoken Urdu comes back as Hindi (normalize_language maps it to
+    # Urdu). Tested on 8 kHz phone audio 2026-10-29. Arabic calls listen with it, and so does the language watch
+    # beside Flux, so a caller can change language any time.
+    auto_language = _auto_language_enabled()
     model = os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
     # Words callers say that speech recognition could get wrong (business, brand and product names), taken from the
     # knowledge automatically (voice_keyterms.py) plus any extras in .env. Nova-3 listens for them ("keyterm").
@@ -98,8 +101,10 @@ def _auto_language_enabled() -> bool:
 
 
 def _use_flux_for_language(language: str) -> bool:
-    """Use Flux for the common English path; keep Nova for explicit non-English and auto-switch calls."""
-    return _use_flux() and not _auto_language_enabled() and normalize_language(language) == "en"
+    """Flux decides turn ends from what the caller says (better than a fixed silence). With CUSTOM_AUTO_LANGUAGE it
+    is Flux Multilingual, which hears English and Hindi/Urdu; Arabic is not in it, so Arabic calls use Nova-3."""
+    code = normalize_language(language)
+    return _use_flux() and (code == "en" or (_auto_language_enabled() and code == "ur"))
 
 
 def _env_number(name: str, default: float, low: float, high: float) -> float:
@@ -119,7 +124,8 @@ def _flux_url(language: str = "en") -> str:
     # pause briefly between clauses. Override for callers who need longer pauses.
     timeout_ms = int(_env_number("CUSTOM_FLUX_EOT_TIMEOUT_MS", 1800, 500, 60000))
     code = normalize_language(language)
-    model = os.getenv(f"CUSTOM_FLUX_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_FLUX_MODEL", "flux-general-en").strip() or "flux-general-en"
+    default = "flux-general-multi" if _auto_language_enabled() else "flux-general-en"
+    model = os.getenv(f"CUSTOM_FLUX_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_FLUX_MODEL", default).strip() or default
     return (
         "wss://api.deepgram.com/v2/listen?"
         f"model={model}&encoding=mulaw&sample_rate=8000"
@@ -229,7 +235,9 @@ async def _deepgram_tts_stream(text: str, language: str = "en") -> AsyncIterator
                     continue
                 payload = json.loads(message)
                 kind = payload.get("type")
-                if kind in {"SpeechMetadata", "Flushed"}:
+                # The turn's audio ends at SpeechMetadata. "Flushed" now arrives first, before any audio (voice
+                # version 2026-10-20): stopping there made every Urdu reply silent.
+                if kind == "SpeechMetadata":
                     break
                 if kind in {"Error", "Warning"}:
                     raise RuntimeError(f"Deepgram Flux TTS {kind}: {str(payload)[:300]}")
@@ -273,6 +281,7 @@ class _DeepgramSpeaker:
     def __init__(self, language: str = "en") -> None:
         self.language = normalize_language(language)
         self.ws: Any = None
+        self.end_of_audio = "Flushed"
         self.lock = asyncio.Lock()
         self.closed = False
 
@@ -280,6 +289,9 @@ class _DeepgramSpeaker:
         if self.ws is None:
             model = deepgram_voice(self.language)
             version = "v2" if model.lower().startswith("flux-") else "v1"
+            # Where a sentence's audio ends: Aura (v1) sends "Flushed" after it; Flux (v2) sends "Flushed" before the
+            # audio and "SpeechMetadata" after it (since voice version 2026-10-20; ending at "Flushed" silenced Urdu).
+            self.end_of_audio = "SpeechMetadata" if version == "v2" else "Flushed"
             url = f"wss://api.deepgram.com/{version}/speak?model={model}&encoding=mulaw&sample_rate=8000"
             self.ws = await websockets.connect(url, additional_headers={"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY', '').strip()}"},
                                                open_timeout=10, ping_interval=20)
@@ -330,7 +342,7 @@ class _DeepgramSpeaker:
                         yield adjust_ulaw_gain(bytes(message), gain_db)
                     else:
                         kind = json.loads(message).get("type")
-                        if kind in {"Flushed", "SpeechMetadata"}:
+                        if kind == self.end_of_audio:
                             finished = True
                             return
                         if kind in {"Warning", "Error"}:
@@ -903,6 +915,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
     auto_language = _auto_language_enabled()
     flux = _use_flux_for_language(preferred_language)
+    language_watch: Any = None  # Nova-3 multi beside Flux, listening only for Arabic (see open_language_watch)
+    language_watch_task: Optional[asyncio.Task[Any]] = None
     forced_turn = ""            # the words of a Flux turn we already asked Flux to end (asked once per turn)
     forced_at = 0.0             # ForceEndTurn can go unanswered; then finish from the partial transcript.
     forced_fallback_text = ""
@@ -1699,7 +1713,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             switch_language(wanted_language)
         # All calls use the same semantic routing, even with live forwarding off.
         # Classification stays in the reply task, never in the STT event loop.
-        if call_sid:
+        # A turn that asks for another language is answered in it, not routed: "I don't need information, can you
+        # speak Arabic?" also read as wanting a person (2026-10-29) and the call was put through to the team.
+        if call_sid and not wanted_language:
             reply_task = asyncio.create_task(answer_or_forward(text, turn_ended_at, prepared, turn_timing))
             reply_task.add_done_callback(log_reply_failure)
             return
@@ -1741,6 +1757,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         stt_flux_end_of_turn_events += 1
                     record_words(payload.get("words"))
                     words = str(payload.get("transcript") or "").split()
+                    # Flux Multilingual says which language each turn was in (English or Hindi = Urdu): reply in it.
+                    # Not from 1-2 words ("okay", "haan"), and Arabic is the language watch's call (Flux hears it as Hindi).
+                    flux_languages = payload.get("languages") or []
+                    if auto_language and payload.get("event") == "EndOfTurn" and flux_languages and len(words) >= 3:
+                        spoken = spoken_language(flux_languages[0])
+                        if spoken in {"en", "ur"} and spoken != preferred_language and language_enabled(spoken):
+                            logger.info("custom voice: caller is speaking %s; replying in it call=%s", spoken, call_sid)
+                            preferred_language = spoken
+                            languages_used.add(spoken)
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
                     if bot_busy() and payload.get("event") in {"Update", "StartOfTurn"}:
                         spoke_over_agent = spoke_over_agent or bool(words)
@@ -1773,9 +1798,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 alternative = ((payload.get("channel") or {}).get("alternatives") or [{}])[0]
                 record_words(alternative.get("words"))
                 detected_languages = alternative.get("languages") or []
-                if auto_language and detected_languages:
-                    detected = normalize_language(detected_languages[0])
-                    if detected in {"en", "ar", "ur"} and language_enabled(detected):
+                # Follow the language the caller speaks, from finished phrases of 3+ words: a short "okay" or "haan"
+                # is too little to tell. A language we don't serve (e.g. Hinglish misread as Spanish) changes nothing.
+                if (auto_language and detected_languages and payload.get("is_final")
+                        and len(str(alternative.get("transcript") or "").split()) >= 3):
+                    detected = spoken_language(detected_languages[0])
+                    if detected and detected != preferred_language and language_enabled(detected):
+                        logger.info("custom voice: caller is speaking %s; replying in it call=%s", detected, call_sid)
                         preferred_language = detected
                         languages_used.add(detected)
                 text = str(alternative.get("transcript") or "").strip()
@@ -1863,6 +1892,73 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         deepgram = connection
         transcript_task = asyncio.create_task(receive_transcripts(connection))
         speculation_task = asyncio.create_task(speculate())
+        # The Arabic watch runs only beside Flux; Nova-3 multi (Arabic calls) hears every language itself.
+        if flux:
+            asyncio.create_task(open_language_watch())
+        else:
+            asyncio.create_task(close_language_watch())
+
+    async def open_language_watch() -> None:
+        """Flux Multilingual hears English and Hindi/Urdu but not Arabic (it writes Arabic down as Hindi-sounding
+        words). While Flux listens, Nova-3 multi hears the same audio, only to notice a caller speaking Arabic; then
+        the call moves to Arabic (follow_spoken_language). It never changes the call otherwise and a failure here
+        only loses the watch, never the call."""
+        nonlocal language_watch, language_watch_task
+        if language_watch is not None or not (auto_language and flux and language_enabled("ar")):
+            return
+        try:
+            language_watch = await websockets.connect(_deepgram_url("ar"), additional_headers={"Authorization": f"Token {deepgram_key}"},
+                                                      open_timeout=12, ping_interval=20)
+        except Exception as error:
+            logger.warning("custom voice: language watch unavailable call=%s: %s", call_sid, error)
+            return
+        language_watch_task = asyncio.create_task(watch_languages(language_watch))
+
+    async def close_language_watch() -> None:
+        nonlocal language_watch, language_watch_task
+        connection, task, language_watch, language_watch_task = language_watch, language_watch_task, None, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                await connection.close()
+
+    async def watch_languages(connection: Any) -> None:
+        try:
+            async for raw in connection:
+                payload = json.loads(raw)
+                if payload.get("type") != "Results":  # e.g. UtteranceEnd, whose "channel" is a list
+                    continue
+                alternative = ((payload.get("channel") or {}).get("alternatives") or [{}])[0]
+                text = str(alternative.get("transcript") or "").strip()
+                detected = alternative.get("languages") or []
+                # A finished phrase of 3+ words in Arabic (short ones are too little to tell).
+                if payload.get("is_final") and detected and len(text.split()) >= 3 and spoken_language(detected[0]) == "ar":
+                    asyncio.create_task(follow_spoken_language("ar", text)).add_done_callback(log_reply_failure)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("custom voice: language watch stopped call=%s: %s", call_sid, error)
+
+    async def follow_spoken_language(code: str, text: str) -> None:
+        """The caller is speaking a language the main recognition cannot hear: what it wrote for this turn was not
+        their words. Stop any reply to that, switch the call to the language and answer what they actually said."""
+        nonlocal unanswered_text, heard_text, early_reply
+        async with finish_lock:
+            if code == preferred_language or transfer_pending:
+                return
+            misheard = unanswered_text
+            drop_reply(early_reply)
+            early_reply = None
+            await interrupt(force=True)
+            if misheard and transcript and transcript[-1].get("content") == misheard:
+                transcript.pop()
+            logger.info("custom voice: caller is speaking %s; switching call=%s", code, call_sid)
+            switch_language(code)
+            utterance.clear()
+            heard_text = text
+            await finish_utterance_locked("language")
 
     def switch_language(code: str) -> None:
         """The caller asked to talk in another language: the reply that follows is written and spoken in it at once
@@ -1954,6 +2050,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                                 audio_backlog.append(audio)
                             else:
                                 await deepgram.send(audio)
+                            if language_watch is not None:
+                                try:
+                                    await language_watch.send(audio)
+                                except Exception:
+                                    asyncio.create_task(close_language_watch())  # the watch is optional
                     elif event == "mark":
                         if (message.get("mark") or {}).get("name") == pending_mark:
                             pending_mark = ""
@@ -1978,6 +2079,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 await asyncio.gather(*closing_tasks, return_exceptions=True)
                 if deepgram is not None:
                     await deepgram.close()
+                await close_language_watch()
     except WebSocketDisconnect:
         active = False
     except Exception as error:

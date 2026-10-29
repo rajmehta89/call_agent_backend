@@ -17,7 +17,8 @@ def test_nova_auto_detection_does_not_send_an_unsupported_language_hint(monkeypa
     urdu = parse_qs(urlsplit(custom._deepgram_url("ur")).query)
     assert english["language"] == ["multi"]
     assert "language_hint" not in english
-    assert urdu["language"] == ["ur"]
+    # Urdu calls stay on "multi" too: it hears spoken Urdu (as Hindi) and lets the caller change language again.
+    assert urdu["language"] == ["multi"]
 
 
 def test_flux_selects_language_by_model_and_has_no_language_parameter(monkeypatch):
@@ -35,8 +36,10 @@ def test_english_calls_use_flux_by_default_and_preserve_multilingual_nova(monkey
     assert not custom._use_flux_for_language("ar")
     assert not custom._use_flux_for_language("ur")
 
+    # Automatic languages keep Flux (Flux Multilingual) for English and Urdu; only Arabic needs Nova-3.
     monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "true")
-    assert not custom._use_flux_for_language("en")
+    assert custom._use_flux_for_language("en") and custom._use_flux_for_language("ur")
+    assert not custom._use_flux_for_language("ar")
     monkeypatch.setenv("CUSTOM_STT", "nova")
     monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "false")
     assert not custom._use_flux_for_language("en")

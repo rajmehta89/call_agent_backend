@@ -74,3 +74,30 @@ def test_the_language_switches_are_read_once_and_cached(monkeypatch):
 def test_examples_cover_every_supported_language():
     assert set(turn_meaning.LANGUAGE_REQUEST.examples) == {*voice_languages.SUPPORTED_LANGUAGES, "none"}
     assert any("Hindi" in example for example in turn_meaning.LANGUAGE_REQUEST.examples["ur"])
+
+
+def test_hindi_is_answered_in_urdu():
+    # Spoken Hindi and Urdu are the same for callers; speech recognition reports Hindi as "hi".
+    for value in ("hi", "hi-IN", "Hindi", "हिन्दी"):
+        assert voice_languages.normalize_language(value) == "ur"
+    assert voice_languages.normalize_language("hello") == "en"
+
+
+def test_recognised_languages_map_to_the_ones_we_serve():
+    assert [voice_languages.spoken_language(code) for code in ("en", "ar", "hi", "ur")] == ["en", "ar", "ur", "ur"]
+    assert voice_languages.spoken_language("es") == ""  # Hinglish misread as Spanish: not a reason to switch
+
+
+def test_auto_language_keeps_flux_for_english_and_urdu_and_nova_for_arabic(monkeypatch):
+    # Flux Multilingual hears English and Hindi/Urdu (and decides turn ends from speech); it has no Arabic, so
+    # Arabic calls, and the language watch beside Flux, use Nova-3 multi.
+    import routers.custom_twilio_voice_api as voice
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "true")
+    monkeypatch.delenv("CUSTOM_FLUX_MODEL", raising=False)
+    monkeypatch.setenv("CUSTOM_STT", "flux")
+    monkeypatch.setattr(voice, "current_keyterms", lambda: [])
+    assert [voice._use_flux_for_language(code) for code in ("en", "ur", "ar")] == [True, True, False]
+    assert "model=flux-general-multi" in voice._flux_url("en")
+    assert "language=multi" in voice._deepgram_url("ar")
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "false")
+    assert "model=flux-general-en" in voice._flux_url("en") and not voice._use_flux_for_language("ur")
