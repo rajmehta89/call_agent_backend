@@ -1346,7 +1346,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     yield sentence
 
         sentences = stream().__aiter__()
-        return {"text": text, "bridge_ready": bridge_ready, "bridge_diagnostics": diagnostics,
+        return {"text": text, "language": preferred_language, "bridge_ready": bridge_ready, "bridge_diagnostics": diagnostics,
                 "reply_timings": reply_timings, "sentences": sentences,
                 "first": asyncio.ensure_future(sentences.__anext__()), "started": perf_counter()}
 
@@ -1729,7 +1729,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             return
         # "Can you speak Urdu?": decided by meaning, with the vector the checks above already made for these words.
         wanted_language = await asyncio.to_thread(requested_language, text, preferred_language)
-        if prepared and not _same_words(prepared["text"], text):
+        # Prepared before the turn ended and the call learned its language: every call starts in English, so a
+        # Hindi caller's first reply was written in English and used (2026-10-29). Not reused in another language.
+        if prepared and (not _same_words(prepared["text"], text) or prepared.get("language") != preferred_language):
             drop_reply(prepared)
             prepared = None
         if unanswered_text and (interrupted_pending_turn or (reply_task and not reply_task.done())):
@@ -1806,7 +1808,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     # Flux Multilingual says which language each turn was in (English or Hindi = Urdu): reply in it.
                     # Not from 1-2 words ("okay", "haan"), and Arabic is the language watch's call (Flux hears it as Hindi).
                     flux_languages = payload.get("languages") or []
-                    if auto_language and payload.get("event") == "EndOfTurn" and flux_languages and len(words) >= 3:
+                    if (auto_language and payload.get("event") in {"EagerEndOfTurn", "EndOfTurn"} and flux_languages
+                            and len(words) >= 3):
                         spoken = spoken_language(flux_languages[0])
                         # A Hinglish turn starting "Yes. So what..." can be labelled English: with Hindi words in it the
                         # caller is still speaking Hindi/Urdu, so only a turn without them switches to English.
