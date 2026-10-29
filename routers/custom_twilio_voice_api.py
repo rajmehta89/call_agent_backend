@@ -31,7 +31,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
-from meaning import is_foreign as meaning_foreign
+from meaning import english_text, is_foreign as meaning_foreign
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import with_wait_bridge, wait_message
@@ -473,8 +473,10 @@ def _voice_services() -> AIServices:
     return services
 
 
-_SENTENCE_BREAK = re.compile(r"[.!?](?=\s)")
-_CLAUSE_BREAK = re.compile(r"[,;:—–](?=\s)")
+# Urdu and Arabic end sentences with ۔ and ؟ and pause at ، and ؛: without them an Urdu reply went to the voice
+# only once the model had written all of it (first audio 5-6 s, 2026-10-29).
+_SENTENCE_BREAK = re.compile(r"[.!?۔؟](?=\s)")
+_CLAUSE_BREAK = re.compile(r"[,;:—–،؛](?=\s)")
 
 
 def _speculate_after_seconds() -> float:
@@ -995,8 +997,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 await asyncio.sleep(trigger_ms / 1000)
                 if not active or bot_busy():
                     return
-                line = ("Is there anything else I can help you with?" if transcript
-                        else "I'm here whenever you're ready. What can I help you with?")
+                line = call_forwarding.caller_line(call_forwarding.ANYTHING_ELSE_LINE if transcript
+                                                   else call_forwarding.READY_WHEN_YOU_ARE_LINE, preferred_language)
                 await speak(line)
                 memory.add_assistant(line)
                 responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
@@ -1774,6 +1776,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         stt_flux_end_of_turn_events += 1
                     record_words(payload.get("words"))
                     words = str(payload.get("transcript") or "").split()
+                    # Urdu, Hindi or Arabic words are read in English through a translation (meaning.english_text, about
+                    # 1 s): start it when Flux expects the turn to end, so it is usually ready when the turn does.
+                    if payload.get("event") == "EagerEndOfTurn" and words and meaning_foreign(" ".join(words)):
+                        asyncio.create_task(asyncio.to_thread(english_text, " ".join(words)))
                     # Flux Multilingual says which language each turn was in (English or Hindi = Urdu): reply in it.
                     # Not from 1-2 words ("okay", "haan"), and Arabic is the language watch's call (Flux hears it as Hindi).
                     flux_languages = payload.get("languages") or []

@@ -654,7 +654,8 @@ _FILLER_OPENER = re.compile(r"^\s*(?:(?:(?:that's a |that is a )?(?:good|great) 
 _ECHO_WORDS = {"okay", "ok", "sure", "yeah", "yes", "yep", "right", "alright", "got", "it", "no", "problem", "so", "great",
                "of", "course", "absolutely", "certainly", "i", "can", "do", "that", "for", "you"}
 ACKNOWLEDGEMENT_OPENER = re.compile(r"^\s*(?:yeah|yep|sure|okay|ok|alright|right|got it|no problem|mm-?hmm)[,.!—–-]+\s*", re.I)
-_SENTENCE_END = re.compile(r"[.!](?=\s|[A-Z])|\?")
+# Urdu and Arabic: ۔ ends a sentence and ؟ a question (the guard ends a reply at its first question).
+_SENTENCE_END = re.compile(r"[.!۔](?=\s|[A-Z])|[?؟]")
 _GLUED_SENTENCE = re.compile(r"[.!](?=[A-Z][a-z])")
 
 

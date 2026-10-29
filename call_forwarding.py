@@ -50,6 +50,7 @@ NO_LIVE_TRANSFER_PREFIX = "A live transfer isn't available right now. "
 NOW_OR_LATER_LINE = "Would you like me to connect you with the team now, or have someone call you back later?"
 NAMED_REQUEST_LINE = "I have noted your request for {destination}. They or the team will contact you using this number."
 ANYTHING_ELSE_LINE = "Is there anything else I can help you with?"
+READY_WHEN_YOU_ARE_LINE = "I'm here whenever you're ready. What can I help you with?"
 WELCOME_LINE, OF_COURSE_LINE = "You're welcome.", "Of course."
 CALLER_LINES = {
     "ur": {
@@ -61,6 +62,7 @@ CALLER_LINES = {
         NOW_OR_LATER_LINE: "کیا آپ ابھی ٹیم سے بات کرنا چاہیں گے، یا بعد میں کوئی آپ کو کال کرے؟",
         NAMED_REQUEST_LINE: "{destination} کے لیے آپ کی درخواست نوٹ کر لی گئی ہے۔ وہ یا ٹیم اسی نمبر پر آپ سے رابطہ کریں گے۔",
         ANYTHING_ELSE_LINE: "کیا کسی اور چیز میں مدد چاہیے؟",
+        READY_WHEN_YOU_ARE_LINE: "جب آپ تیار ہوں، بتائیں۔ آپ کو کس چیز میں مدد چاہیے؟",
         WELCOME_LINE: "کوئی بات نہیں۔",
         OF_COURSE_LINE: "جی ضرور۔",
     },
@@ -73,6 +75,7 @@ CALLER_LINES = {
         NOW_OR_LATER_LINE: "هل تريد أن أحوّلك إلى الفريق الآن، أم يتصل بك أحد لاحقًا؟",
         NAMED_REQUEST_LINE: "سجّلت طلبك للتحدث مع {destination}. سيتواصل معك هو أو الفريق على هذا الرقم.",
         ANYTHING_ELSE_LINE: "هل هناك شيء آخر يمكنني مساعدتك فيه؟",
+        READY_WHEN_YOU_ARE_LINE: "أنا هنا متى كنت مستعدًا. كيف يمكنني مساعدتك؟",
         WELCOME_LINE: "على الرحب والسعة.",
         OF_COURSE_LINE: "بالتأكيد.",
     },

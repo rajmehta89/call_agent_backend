@@ -161,7 +161,12 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
         # Speech recognition writes spoken Urdu in Hindi (Devanagari) script; the Urdu voice reads only Urdu script,
         # and a copied Hindi-script word came out wrong (2026-10-29).
         script_note += (" A caller speaking Hindi or Urdu may come through written in Hindi (Devanagari) script: "
-                        "understand it, and write every word of your Urdu reply in Urdu script, none in Devanagari.")
+                        "understand it, and write every word of your Urdu reply in Urdu script, none in Devanagari."
+                        # "bathroom and kitchen products" came out as "بچھڑے اور کھانے کے پیداوار" (calves and food
+                        # produce, 2026-10-29): Urdu speakers say these words in English.
+                        " Say shop and product words the way Urdu speakers say them, as the English word written in "
+                        "Urdu script (باتھ روم، کچن، ٹائلز، شاور، ڈیلیوری), and product and brand names unchanged; "
+                        "never translate them into literary Urdu.")
     unclear = ("If the caller's words make no sense, they may be speaking another language: say briefly that you did "
                "not catch that and ask which language they prefer, naming {options}.")
     if follow_caller:

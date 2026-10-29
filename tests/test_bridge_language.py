@@ -46,3 +46,20 @@ def test_transfer_and_callback_lines_are_said_in_the_callers_language():
     lines = (cf.CONNECTING_LINE, cf.TRANSFER_FAILED_LINE, cf.CALLBACK_NOTED_LINE, cf.CALLBACK_NUMBER_LINE, cf.NO_LIVE_TRANSFER_PREFIX,
              cf.NOW_OR_LATER_LINE, cf.NAMED_REQUEST_LINE, cf.ANYTHING_ELSE_LINE, cf.WELCOME_LINE, cf.OF_COURSE_LINE)
     assert all(line in cf.CALLER_LINES[code] for code in ("ur", "ar") for line in lines)
+
+
+def test_urdu_and_arabic_replies_are_spoken_sentence_by_sentence():
+    # Without ۔ ؟ ، an Urdu reply went to the voice only when the model had written all of it (first audio 5-6 s).
+    import routers.custom_twilio_voice_api as custom
+    import routers.retell_api as retell
+    reply = "ہم باتھ روم اور کچن کے پروڈکٹس بیچتے ہیں۔ آپ کو کیا چاہیے؟ "
+    end = custom._next_chunk(reply, first=False)
+    assert end and reply[:end.end()] == "ہم باتھ روم اور کچن کے پروڈکٹس بیچتے ہیں۔"
+    assert custom._next_chunk("مرحبا، لدينا حنفيات المطبخ بأسعار مختلفة ", first=False) is None  # no sentence end yet
+    assert retell._SENTENCE_END.search("آپ کو کیا چاہیے؟") and retell._SENTENCE_END.search("نعم ۔ ")
+
+
+def test_silence_reminders_are_said_in_the_callers_language():
+    import call_forwarding as cf
+    assert cf.caller_line(cf.READY_WHEN_YOU_ARE_LINE, "ar") == "أنا هنا متى كنت مستعدًا. كيف يمكنني مساعدتك؟"
+    assert cf.caller_line(cf.ANYTHING_ELSE_LINE, "ur") == "کیا کسی اور چیز میں مدد چاہیے؟"
