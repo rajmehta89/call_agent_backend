@@ -41,8 +41,62 @@ CONNECTING_LINE = "Connecting you to the team now."
 TEAM_BUSY_LINE = ("Sorry, no one on the team could answer right now. I've passed on your request. "
                   "If we have a phone number for you, the team can call you back. Otherwise, please contact us again with a number to reach you.")
 AGENT_WHISPER = "A customer is waiting to speak with you. Press 1 now to accept and connect the call."
+# Said by the AI voice around a transfer or callback (routers/*_voice_api.py), in the caller's language (caller_line).
+TRANSFER_FAILED_LINE = ("Sorry, I couldn't put you through just now. I've noted that you'd like to talk to someone, "
+                        "and our team will call you back.")
+CALLBACK_NOTED_LINE = "I've noted your callback request. The team will call you on this number."
+CALLBACK_NUMBER_LINE = "I've passed on your callback request. What phone number should the team use?"
+NO_LIVE_TRANSFER_PREFIX = "A live transfer isn't available right now. "
+NOW_OR_LATER_LINE = "Would you like me to connect you with the team now, or have someone call you back later?"
+NAMED_REQUEST_LINE = "I have noted your request for {destination}. They or the team will contact you using this number."
+ANYTHING_ELSE_LINE = "Is there anything else I can help you with?"
+WELCOME_LINE, OF_COURSE_LINE = "You're welcome.", "Of course."
+CALLER_LINES = {
+    "ur": {
+        CONNECTING_LINE: "آپ کو ابھی ٹیم سے ملا رہے ہیں۔",
+        TRANSFER_FAILED_LINE: "معذرت، ابھی آپ کو ملایا نہیں جا سکا۔ آپ کی بات کرنے کی درخواست نوٹ کر لی گئی ہے، ہماری ٹیم آپ کو واپس کال کرے گی۔",
+        CALLBACK_NOTED_LINE: "آپ کی کال بیک کی درخواست نوٹ کر لی گئی ہے۔ ٹیم آپ کو اسی نمبر پر کال کرے گی۔",
+        CALLBACK_NUMBER_LINE: "آپ کی کال بیک کی درخواست آگے بھیج دی گئی ہے۔ ٹیم آپ کو کس نمبر پر کال کرے؟",
+        NO_LIVE_TRANSFER_PREFIX: "ابھی براہِ راست ٹیم سے ملانا ممکن نہیں۔ ",
+        NOW_OR_LATER_LINE: "کیا آپ ابھی ٹیم سے بات کرنا چاہیں گے، یا بعد میں کوئی آپ کو کال کرے؟",
+        NAMED_REQUEST_LINE: "{destination} کے لیے آپ کی درخواست نوٹ کر لی گئی ہے۔ وہ یا ٹیم اسی نمبر پر آپ سے رابطہ کریں گے۔",
+        ANYTHING_ELSE_LINE: "کیا کسی اور چیز میں مدد چاہیے؟",
+        WELCOME_LINE: "کوئی بات نہیں۔",
+        OF_COURSE_LINE: "جی ضرور۔",
+    },
+    "ar": {
+        CONNECTING_LINE: "أحوّلك إلى الفريق الآن.",
+        TRANSFER_FAILED_LINE: "عذرًا، لم أتمكن من تحويلك الآن. سجّلت أنك تريد التحدث مع أحد، وسيتصل بك فريقنا.",
+        CALLBACK_NOTED_LINE: "سجّلت طلب معاودة الاتصال. سيتصل بك الفريق على هذا الرقم.",
+        CALLBACK_NUMBER_LINE: "أرسلت طلب معاودة الاتصال. ما رقم الهاتف الذي يتصل عليه الفريق؟",
+        NO_LIVE_TRANSFER_PREFIX: "التحويل المباشر غير متاح الآن. ",
+        NOW_OR_LATER_LINE: "هل تريد أن أحوّلك إلى الفريق الآن، أم يتصل بك أحد لاحقًا؟",
+        NAMED_REQUEST_LINE: "سجّلت طلبك للتحدث مع {destination}. سيتواصل معك هو أو الفريق على هذا الرقم.",
+        ANYTHING_ELSE_LINE: "هل هناك شيء آخر يمكنني مساعدتك فيه؟",
+        WELCOME_LINE: "على الرحب والسعة.",
+        OF_COURSE_LINE: "بالتأكيد.",
+    },
+}
+
+
+def caller_line(line: str, language: str = "en", **values: Any) -> str:
+    """One of the lines above in the caller's language (English when it has no translation); {destination} etc.
+    are filled in after."""
+    from voice_languages import normalize_language
+    code = normalize_language(language)
+    template = CALLER_LINES.get(code, {}).get(line, line) if code != "en" else line
+    return template.format(**values) if values else template
 # Twilio <Say> voice for the lines spoken outside the AI voice (on hold, and to the agent). Change with FORWARDING_SAY_VOICE.
 SAY_VOICE = os.getenv("FORWARDING_SAY_VOICE", "Polly.Joanna-Neural")
+# TEAM_BUSY_LINE is said by Twilio, not the AI voice, after the team's phones stop ringing: in the caller's language.
+# Twilio has no Urdu voice, so Urdu callers hear it in Hindi (spoken the same; Polly.Aditi reads Devanagari).
+TEAM_BUSY_SAY = {
+    "ar": (os.getenv("FORWARDING_SAY_VOICE_AR", "Polly.Zeina"),
+           "عذرًا، لم يتمكن أحد من الفريق من الرد الآن. أوصلت طلبك. إذا كان لدينا رقم هاتفك فسيتصل بك الفريق، وإلا فيرجى التواصل معنا مجددًا مع رقم للتواصل."),
+    "ur": (os.getenv("FORWARDING_SAY_VOICE_UR", "Polly.Aditi"),
+           "माफ़ कीजिए, अभी टीम में कोई जवाब नहीं दे सका। आपकी बात आगे पहुँचा दी गई है। अगर हमारे पास आपका नंबर है तो टीम आपको "
+           "वापस कॉल करेगी, नहीं तो कृपया अपने नंबर के साथ दोबारा संपर्क करें।"),
+}
 
 
 def _region() -> str:
@@ -574,7 +628,8 @@ def transfer_twiml(caller: str, settings: Optional[Dict[str, Any]] = None, reque
     numbers = "".join(f'<Number>{html.escape(agent["phone"])}</Number>' for agent in targets)
     caller_id = _caller_id(caller)
     caller_attr = f' callerId="{html.escape(caller_id, quote=True)}"' if caller_id else ""
-    result = html.escape(f"{base}/api/call-forwarding/dial-result", quote=True)
+    # The caller's language rides on the action URL, for TEAM_BUSY_LINE in it (dial_result_twiml).
+    result = html.escape(f"{base}/api/call-forwarding/dial-result?language={effective_language(preferred_language or 'en')}", quote=True)
     recording_result = html.escape(f"{base}/api/call-forwarding/recording-result", quote=True)
     return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
             f'<Dial{caller_attr} answerOnBridge="true" '
@@ -642,12 +697,13 @@ def screen_result_twiml(digits: str) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
 
 
-def dial_result_twiml(accepted: bool) -> str:
+def dial_result_twiml(accepted: bool, language: str = "en") -> str:
     """After the agents' phones: hang up when an agent took the call (they talked and it is over), otherwise tell the
-    caller the team will call back."""
+    caller, in their language, that the team will call back."""
     if accepted:
         return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-    return (f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="{SAY_VOICE}">{html.escape(TEAM_BUSY_LINE)}</Say>'
+    voice, line = TEAM_BUSY_SAY.get(normalize_language(language), (SAY_VOICE, TEAM_BUSY_LINE))
+    return (f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="{html.escape(voice, quote=True)}">{html.escape(line)}</Say>'
             "<Hangup/></Response>")
 
 

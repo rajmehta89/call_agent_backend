@@ -78,7 +78,7 @@ async def dial_result(request: Request) -> PlainTextResponse:
     status = str(form.get("DialCallStatus") or "")
     accepted = call_forwarding.dial_finished(str(form.get("CallSid") or ""), status, str(form.get("From") or ""),
                                               str(form.get("DialCallSid") or ""), str(form.get("DialCallDuration") or ""))
-    return _xml(call_forwarding.dial_result_twiml(accepted))
+    return _xml(call_forwarding.dial_result_twiml(accepted, str(request.query_params.get("language") or "en")))
 
 
 @router.post("/recording-result", dependencies=[Depends(verify_twilio_request)])

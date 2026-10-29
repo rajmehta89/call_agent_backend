@@ -34,3 +34,15 @@ def test_the_callers_language_is_read_from_their_alphabet(monkeypatch):
     assert voice_languages.text_language("...") == ""
     monkeypatch.setattr(voice_languages, "enabled_language_codes", lambda: ["en"])
     assert voice_languages.text_language("مرحبا، أريد أن أسأل") == "en"  # Arabic switched off
+
+
+def test_transfer_and_callback_lines_are_said_in_the_callers_language():
+    import call_forwarding as cf
+    assert cf.caller_line(cf.CONNECTING_LINE, "ur") == "آپ کو ابھی ٹیم سے ملا رہے ہیں۔"
+    assert cf.caller_line(cf.CONNECTING_LINE, "ar") == "أحوّلك إلى الفريق الآن."
+    assert cf.caller_line(cf.CONNECTING_LINE, "en") == cf.CONNECTING_LINE
+    assert cf.caller_line(cf.NAMED_REQUEST_LINE, "ur", destination="Sara").startswith("Sara کے لیے")
+    assert cf.caller_line(cf.NAMED_REQUEST_LINE, "en", destination="Sara").startswith("I have noted your request for Sara.")
+    lines = (cf.CONNECTING_LINE, cf.TRANSFER_FAILED_LINE, cf.CALLBACK_NOTED_LINE, cf.CALLBACK_NUMBER_LINE, cf.NO_LIVE_TRANSFER_PREFIX,
+             cf.NOW_OR_LATER_LINE, cf.NAMED_REQUEST_LINE, cf.ANYTHING_ELSE_LINE, cf.WELCOME_LINE, cf.OF_COURSE_LINE)
+    assert all(line in cf.CALLER_LINES[code] for code in ("ur", "ar") for line in lines)

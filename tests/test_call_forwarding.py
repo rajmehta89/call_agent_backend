@@ -78,7 +78,7 @@ def test_rings_every_active_agent_and_connects_on_answer(db):
     assert "/screen" not in twiml and 'answerOnBridge="true"' in twiml
     assert 'record="record-from-answer-dual"' in twiml
     assert 'recordingStatusCallback="https://example.test/api/call-forwarding/recording-result"' in twiml
-    assert 'timeout="25"' in twiml and 'action="https://example.test/api/call-forwarding/dial-result"' in twiml
+    assert 'timeout="25"' in twiml and 'action="https://example.test/api/call-forwarding/dial-result?language=en"' in twiml
     assert 'callerId="+18178092336"' in twiml
     assert 'callerId="+61400000000"' not in twiml
 
@@ -121,7 +121,7 @@ def test_render_transfer_callbacks_stay_on_production(db, monkeypatch):
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://production.onrender.com")
     call_forwarding.save_settings({"enabled": True, "agents": [{"name": "Sam", "phone": "0412345678"}]}, ADMIN)
     twiml = call_forwarding.transfer_twiml("+61400000000")
-    assert 'action="https://production.onrender.com/api/call-forwarding/dial-result"' in twiml
+    assert 'action="https://production.onrender.com/api/call-forwarding/dial-result?language=en"' in twiml
     assert 'recordingStatusCallback="https://production.onrender.com/api/call-forwarding/recording-result"' in twiml
 
 
@@ -378,3 +378,14 @@ def test_non_handoff_wins_even_when_live_and_callback_scores_tie(monkeypatch):
         raise AssertionError("A non-handoff turn must not invoke timing adjudication")
     monkeypatch.setattr(call_forwarding, "_adjudicate_handoff", unexpected)
     assert call_forwarding.handoff_intent("Kitchen.") == ""
+
+
+def test_team_busy_line_is_said_in_the_callers_language():
+    # Said by Twilio (not the AI voice) when nobody on the team answered; Twilio has no Urdu voice, so Hindi.
+    english = call_forwarding.dial_result_twiml(False)
+    assert "Polly.Joanna-Neural" in english and "no one on the team could answer" in english
+    arabic = call_forwarding.dial_result_twiml(False, "ar")
+    assert 'voice="Polly.Zeina"' in arabic and "عذرًا" in arabic
+    urdu = call_forwarding.dial_result_twiml(False, "ur")
+    assert 'voice="Polly.Aditi"' in urdu and "माफ़ कीजिए" in urdu
+    assert call_forwarding.dial_result_twiml(True, "ur").endswith("<Hangup/></Response>")

@@ -1070,7 +1070,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         nonlocal unanswered_text, transfer_pending, callback_requested
         bind_call(call_sid)
         unanswered_text = ""
-        line = call_forwarding.CONNECTING_LINE
+        line = call_forwarding.caller_line(call_forwarding.CONNECTING_LINE, preferred_language)
         await control_reply(text, line, heard_at, turn_timing, "live_transfer")
         for _ in range(80):  # the line has finished playing (its mark came back); at most ~8 s
             if not pending_mark:
@@ -1081,7 +1081,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             return
         transfer_pending = False
         callback_requested = True
-        fallback = "Sorry, I couldn't put you through just now. I've noted that you'd like to talk to someone, and our team will call you back."
+        fallback = call_forwarding.caller_line(call_forwarding.TRANSFER_FAILED_LINE, preferred_language)
         await speak(fallback)
         memory.add(text, fallback)
         responses.append({"content": fallback, "timestamp": utc_iso(), "language": preferred_language})
@@ -1166,10 +1166,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             )
             callback_requested = True
             known_phone = bool(re.fullmatch(r"\+?[0-9 ()-]{8,}", callback_number))
-            line = ("I've noted your callback request. The team will call you on this number." if known_phone
-                    else "I've passed on your callback request. What phone number should the team use?")
+            line = call_forwarding.caller_line(call_forwarding.CALLBACK_NOTED_LINE if known_phone
+                                               else call_forwarding.CALLBACK_NUMBER_LINE, preferred_language)
             if intent == "live":
-                line = "A live transfer isn't available right now. " + line
+                line = call_forwarding.caller_line(call_forwarding.NO_LIVE_TRANSFER_PREFIX, preferred_language) + line
             await control_reply(text, line, heard_at, turn_timing, "callback_requested")
         elif intent in {"callback", "unclear"} and await asyncio.to_thread(call_forwarding.requested_agent, text):
             # A named request should never disappear into a generic callback queue, even when a live transfer
@@ -1186,14 +1186,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 contact_email=contact_email_from_messages(memory.history()),
             )
             callback_requested = True
-            line = f"I have noted your request for {destination}. They or the team will contact you using this number."
+            line = call_forwarding.caller_line(call_forwarding.NAMED_REQUEST_LINE, preferred_language, destination=destination)
             await control_reply(text, line, heard_at, turn_timing, "callback_requested")
         elif intent == "unclear":
             if len(text.split()) > 2:
                 earlier_handoff_text = text
             unanswered_text = ""
             drop_reply(prepared)
-            line = "Would you like me to connect you with the team now, or have someone call you back later?"
+            line = call_forwarding.caller_line(call_forwarding.NOW_OR_LATER_LINE, preferred_language)
             await control_reply(text, line, heard_at, turn_timing, "handoff_clarification")
         else:
             earlier_handoff_text = ""

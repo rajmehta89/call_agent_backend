@@ -1404,7 +1404,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         async def routing_notice():
             line = await asyncio.shield(bridge_ready)
             # A live lookup has not started until routing completes.
-            return "I'm working through the details now." if line in LOOKUP_BRIDGES else line
+            return spoken_bridge("I'm working through the details now.", bridge_language) if bridge_said(line) in LOOKUP_BRIDGES else line
 
         async def resolve():
             direct = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, caller_text, last_agent_text(transcript), callback_requested)
@@ -1447,13 +1447,16 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                               "content_complete": True, "end_call": True})
             return
         if event.get("interaction_type") == "reminder_required" and not caller_text:
-            reply = "Is there anything else I can help you with?"
+            # Nothing new was said: ask in the language of the caller's last words.
+            last_words = next((str(item.get("content") or "") for item in reversed(transcript) if item.get("role") == "user"), "")
+            reply = call_forwarding.caller_line(call_forwarding.ANYTHING_ELSE_LINE, text_language(last_words) or "en")
         elif event.get("interaction_type") == "response_required" and transfer_intent in {"callback_ack", "declined"}:
-            reply = "You're welcome." if transfer_intent == "callback_ack" else "Of course."
+            reply = call_forwarding.caller_line(call_forwarding.WELCOME_LINE if transfer_intent == "callback_ack"
+                                                else call_forwarding.OF_COURSE_LINE, bridge_language)
             timing["action"] = transfer_intent
         elif event.get("interaction_type") == "response_required" and caller_text and call_forwarding.forwarding_on()                 and call_forwarding.twilio_call_for_retell(call_id) and transfer_intent == "live":
             # Call forwarding is on and the caller asked for a person: say so, then ring the team once it has been said.
-            reply = call_forwarding.CONNECTING_LINE
+            reply = call_forwarding.caller_line(call_forwarding.CONNECTING_LINE, bridge_language)
             twilio_call = call_forwarding.twilio_call_for_retell(call_id) or {}
             handoff_pending = True
             callback_requested = False
