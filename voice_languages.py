@@ -169,9 +169,12 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
                         "never translate them into literary Urdu.")
     # "Can you tell me in English what you're looking for?" was the reply to a Hindi caller on an Urdu call: the
     # check for unclear words read as leave to switch (2026-10-29). Unclear words are answered in the reply language.
-    unclear = ("If the caller's words make no sense, they may be speaking another language: say briefly, {said_in}, that "
-               "you did not catch that and ask which language they prefer, naming {options}. Never ask them to speak "
-               "English, and never switch language for this.")
+    # "room dear पर मुझे क्या सहायता करता है?" (Home DFO misheard) got "I didn't quite catch that. Which language do you
+    # prefer?" in English: a misheard word is not a reason to ask about language.
+    unclear = ("If a word or two is unclear (speech recognition often mishears names, such as the business name), answer "
+               "what the rest means. Only if none of it makes sense, say briefly, {said_in}, that you did not catch that, "
+               "and ask which language they prefer, naming {options}. Never ask them to speak English, and never switch "
+               "language for this.")
     # Hindi or Urdu speakers often use English words ("Home DFO kya help karta hai?"): that is still Hindi/Urdu.
     mixing = (" English words inside Hindi or Urdu speech (product names, \"help\", \"price\") are still Hindi or Urdu: "
               "reply in Urdu then." if "ur" in enabled else "")

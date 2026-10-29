@@ -951,7 +951,7 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
         timings.update(preparation_ms=round(retrieval_ms), model=turn_model or services.config.OPENROUTER_MODEL,
                        requested_model=turn_model or services.config.OPENROUTER_MODEL)
     reminder_text = voice_turn_reminder()
-    messages = [{"role": "system", "content": system_prompt}, *transcript] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
+    messages = [{"role": "system", "content": system_prompt}, *transcript]
     if details_note:
         messages.append({"role": "system", "content": details_note})
     email_note = contact_email_followup_note(transcript, caller_text)
@@ -983,6 +983,10 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
     iterator = None
     pieces = None
     model_started = perf_counter()
+    # The reminder (with the language rule) is the last thing the model reads: after it, the English notes above
+    # made it answer an Urdu call in English (2026-10-29).
+    if reminder_text:
+        messages.append({"role": "system", "content": reminder_text})
     try:
         iterator = services.stream_chat_completion(
             messages,

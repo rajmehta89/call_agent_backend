@@ -591,7 +591,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     first_token_ms = 0.0
     reminder_text = voice_turn_reminder(language, follow_caller=False)  # recognition and voice are in one language at a time
     conversation = [*history, {"role": "user", "content": text}]
-    messages = [{"role": "system", "content": system}, *conversation] + ([{"role": "system", "content": reminder_text}] if reminder_text else [])
+    messages = [{"role": "system", "content": system}, *conversation]
     if details_note:
         messages.append({"role": "system", "content": details_note})
     email_note = contact_email_followup_note([*history, {"role": "user", "content": text}], text)
@@ -618,6 +618,10 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     if bridges_enabled():
         messages.append({"role": "system", "content": "The call system handles any short wait acknowledgement. "
                          "Start directly with the actual answer; do not add or repeat a wait/checking phrase."})
+    # The reminder (with the language rule) is the last thing the model reads: after it, the English notes above
+    # made it answer an Urdu call in English (2026-10-29).
+    if reminder_text:
+        messages.append({"role": "system", "content": reminder_text})
     guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
     caller_digits = caller_number_digits(conversation)
     numbers = NumberSpeaker(caller_digits, reply_known_numbers(brain_service.knowledge_text(), system, caller_digits))
