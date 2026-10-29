@@ -34,7 +34,7 @@ from voice_turns import prepare_turn_meaning, needs_facts
 from meaning import english_text, is_foreign as meaning_foreign
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_wait import with_wait_bridge, wait_message
+from voice_wait import stream_in_background, with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds, bridge_lines, bridge_said, spoken_bridge
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -624,12 +624,11 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     pending = ""
     yielded = False  # the first chunk may end at a comma (see _next_chunk)
     iterator = None
+    pieces = None
     try:
         iterator = services.stream_chat_completion(messages, _max_response_tokens(turn_model or services.config.OPENROUTER_MODEL), voice_temperature(), 1.0, model=turn_model)
-        while True:
-            chunk = await asyncio.to_thread(next, iterator, None)
-            if chunk is None:
-                break
+        pieces = stream_in_background(iterator)
+        async for chunk in pieces:
             if not first_token_ms:
                 first_token_ms = (perf_counter() - started) * 1000
                 logger.info("custom voice timing: model=%s prompt=%.0fms model_first_words=%.0fms (after prompt %.0fms)",
@@ -653,12 +652,15 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         if not pending.strip():
             pending = "Sorry, I'm having trouble answering right now. Could you say that again?"
     finally:
-        close = getattr(iterator, "close", None)
-        if close:
-            try:
-                close()
-            except Exception:
-                pass
+        if pieces is not None:
+            await pieces.aclose()  # stops the model request (stream_in_background closes it in its own thread)
+        else:
+            close = getattr(iterator, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
     if pending.strip():
         yield pending.strip()
 
@@ -1785,6 +1787,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     flux_languages = payload.get("languages") or []
                     if auto_language and payload.get("event") == "EndOfTurn" and flux_languages and len(words) >= 3:
                         spoken = spoken_language(flux_languages[0])
+                        # A Hinglish turn starting "Yes. So what..." can be labelled English: with Hindi words in it the
+                        # caller is still speaking Hindi/Urdu, so only a turn without them switches to English.
+                        if spoken == "en" and meaning_foreign(" ".join(words)):
+                            spoken = ""
                         if spoken in {"en", "ur"} and spoken != preferred_language and language_enabled(spoken):
                             logger.info("custom voice: caller is speaking %s; replying in it call=%s", spoken, call_sid)
                             preferred_language = spoken
@@ -1826,6 +1832,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if (auto_language and detected_languages and payload.get("is_final")
                         and len(str(alternative.get("transcript") or "").split()) >= 3):
                     detected = spoken_language(detected_languages[0])
+                    if detected == "en" and meaning_foreign(str(alternative.get("transcript") or "")):
+                        detected = ""  # English words inside Hindi, Urdu or Arabic speech: not a switch to English
                     if detected and detected != preferred_language and language_enabled(detected):
                         logger.info("custom voice: caller is speaking %s; replying in it call=%s", detected, call_sid)
                         preferred_language = detected

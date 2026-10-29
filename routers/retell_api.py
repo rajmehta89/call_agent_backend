@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
-from voice_wait import with_wait_bridge, wait_message
+from voice_wait import stream_in_background, with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, late_filler, late_filler_seconds
 from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
 
@@ -43,7 +43,6 @@ from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
 from voice_languages import language_for_phone, text_language
-from meaning import is_foreign as meaning_foreign
 
 logger = logging.getLogger(__name__)
 
@@ -800,9 +799,10 @@ class _SemanticPrefetch:
 
     def schedule(self, caller_text: str, agent_text: str, earlier: str = "") -> None:
         payload = (caller_text, agent_text, earlier) if earlier else (caller_text, agent_text)
-        # Words in Urdu, Hindi or Arabic are read in English through a translation (meaning.english_text): not for
-        # every partial transcript, only for the finished turn.
-        if not caller_text or payload == self.last or meaning_foreign(caller_text):
+        # Words in Urdu, Hindi or Arabic are read in English through a translation (meaning.english_text, ~1 s). The
+        # prefetch runs only once the words have paused (pause_seconds), so it translates them before the turn ends,
+        # as custom does at Flux's EagerEndOfTurn, and the finished turn finds the translation ready.
+        if not caller_text or payload == self.last:
             return
         self.last = self.pending = payload
         self.updated_at = perf_counter()
@@ -981,6 +981,7 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
     )
 
     iterator = None
+    pieces = None
     model_started = perf_counter()
     try:
         iterator = services.stream_chat_completion(
@@ -994,10 +995,8 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
         guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
         caller_digits = caller_number_digits(transcript)
         numbers = NumberSpeaker(caller_digits, reply_known_numbers(brain_service.knowledge_text(), system_prompt, caller_digits))
-        while True:
-            chunk = await asyncio.to_thread(next, iterator, None)
-            if chunk is None:
-                break
+        pieces = stream_in_background(iterator)
+        async for chunk in pieces:
             spoken = numbers.feed(guard.feed(chunk))
             if spoken and not first_token_logged:
                 first_token_logged = True
@@ -1026,12 +1025,15 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
         yield "I’m sorry, I’m having trouble responding right now. Please try again in a moment."
     finally:
         # Also when this reply was superseded and cancelled: stop the model request instead of letting it run on.
-        close = getattr(iterator, "close", None)
-        if close:
-            try:
-                close()
-            except Exception:
-                pass
+        if pieces is not None:
+            await pieces.aclose()
+        else:
+            close = getattr(iterator, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, fallback: str, call_id: str, response_id: int,

@@ -6,6 +6,53 @@ import os
 from time import perf_counter
 
 
+async def stream_in_background(iterator):
+    """The pieces of a model's streamed reply as they arrive, read by one worker thread for the whole reply.
+
+    Fetching each piece with its own asyncio.to_thread waited for a free worker every time: an Urdu reply comes in
+    2-3x as many pieces as the same reply in English, and on a busy server its first sentence reached the voice ~4 s
+    after the model's first words (2026-10-29). Closing this generator stops the worker and closes the stream."""
+    import threading
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    stop = threading.Event()
+    done = object()
+
+    def pump() -> None:
+        try:
+            for piece in iterator:
+                if stop.is_set():
+                    break
+                loop.call_soon_threadsafe(queue.put_nowait, piece)
+        except BaseException as error:  # handed to the reader, which raises it
+            loop.call_soon_threadsafe(queue.put_nowait, error)
+        finally:
+            if stop.is_set():
+                close = getattr(iterator, "close", None)
+                if close:
+                    try:
+                        close()  # drops the model request; safe here, in the thread that ran the stream
+                    except Exception:
+                        pass
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, done)
+            except RuntimeError:
+                pass  # the loop has closed (the call ended)
+
+    worker = loop.run_in_executor(None, pump)
+    try:
+        while True:
+            piece = await queue.get()
+            if piece is done:
+                return
+            if isinstance(piece, BaseException):
+                raise piece
+            yield piece
+    finally:
+        stop.set()
+        worker.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
+
+
 async def wait_message(services, fallback, caller_text, agent_text="", recent=(), diagnostics=None):
     """Ask the small model to choose a safe bridge while the real answer runs; always keep the approved fallback."""
     if not fallback:

@@ -167,19 +167,25 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
                         " Say shop and product words the way Urdu speakers say them, as the English word written in "
                         "Urdu script (باتھ روم، کچن، ٹائلز، شاور، ڈیلیوری), and product and brand names unchanged; "
                         "never translate them into literary Urdu.")
-    unclear = ("If the caller's words make no sense, they may be speaking another language: say briefly that you did "
-               "not catch that and ask which language they prefer, naming {options}.")
+    # "Can you tell me in English what you're looking for?" was the reply to a Hindi caller on an Urdu call: the
+    # check for unclear words read as leave to switch (2026-10-29). Unclear words are answered in the reply language.
+    unclear = ("If the caller's words make no sense, they may be speaking another language: say briefly, {said_in}, that "
+               "you did not catch that and ask which language they prefer, naming {options}. Never ask them to speak "
+               "English, and never switch language for this.")
+    # Hindi or Urdu speakers often use English words ("Home DFO kya help karta hai?"): that is still Hindi/Urdu.
+    mixing = (" English words inside Hindi or Urdu speech (product names, \"help\", \"price\") are still Hindi or Urdu: "
+              "reply in Urdu then." if "ur" in enabled else "")
     if follow_caller:
         return (f"Language: callers may speak {_spoken_list(labels)}. Reply in the language of the caller's latest turn, "
                 "even where the instructions above say English: those describe how to speak English, not a limit. "
-                f"If they mix languages, reply in the one they used most in that turn.{script_note} "
-                + unclear.format(options=_spoken_list(labels)))
+                f"If they mix languages, reply in the one they used most in that turn.{mixing}{script_note} "
+                + unclear.format(said_in="in the language of their latest turn", options=_spoken_list(labels)))
     code = effective_language(current)
     others = [language_label(other) for other in enabled if other != code]
     return (f"Language: this call is in {language_label(code)} right now. Reply only in {language_label(code)}, even where "
             "the instructions above say English: those describe how to speak English, not a limit."
             f"{script_note if code != 'en' else ''} "
-            + unclear.format(options=_spoken_list([language_label(code), *others]))
+            + unclear.format(said_in=f"in {language_label(code)}", options=_spoken_list([language_label(code), *others]))
             + " When the caller names a language, the call system switches to it; never say you cannot speak it.")
 
 
