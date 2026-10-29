@@ -15,7 +15,10 @@ import re
 from datetime import datetime
 from urllib.parse import quote
 from timeutil import utc_iso
+import time
 from time import perf_counter
+
+import loop_watch
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -605,7 +608,8 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         messages.append({"role": "system", "content": "The caller did not catch your last reply and asked you to say it again. "
                          "Say its main point again, shorter and in plain words, and ask again any question it asked. "
                          "Do not add new information or move the conversation on."})
-    offered = yes_to_offer_note(text, last_agent_text(history))
+    # A meaning check (and for Urdu/Arabic possibly a translation): never directly on the event loop.
+    offered = await asyncio.to_thread(yes_to_offer_note, text, last_agent_text(history))
     if offered:
         messages.append({"role": "system", "content": offered})
     misheard = name_note(text, business_name())
@@ -935,6 +939,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     semantic_prefetch = _SemanticPrefetch(prepare_turn_meaning)
     voice_turn_timings: List[Dict[str, Any]] = []
     call_started = perf_counter()
+    call_started_wall = time.time()  # for loop_watch.stalls_since: what held the loop up during this call
     # How long this call's event loop was held up: a held-up loop delays every bridge, sentence and audio frame
     # (a Hindi call on 2026-10-29 had its first sentence ready ~4 s after the model's first words on the server,
     # 0.1 s here). Saved with the call (provider_metadata.loop_lag_*).
@@ -2175,6 +2180,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
                                       "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
+                                      "loop_stalls": loop_watch.stalls_since(call_started_wall),
                                       # Why this call listened with Nova or Flux (no secrets): the settings that decide it.
                                       "stt_selection": {"custom_stt": os.getenv("CUSTOM_STT", "flux (default)"),
                                                         "auto_language": _auto_language_enabled(),

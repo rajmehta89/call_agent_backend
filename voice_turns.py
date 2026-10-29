@@ -204,7 +204,7 @@ def yes_to_offer_note(caller_text: str, agent_text: str) -> str:
     "Yeah."). From real calls: the model answered such a "Yeah" by repeating its previous answer almost word for word."""
     question = agent_question(agent_text)
     from turn_meaning import HANDOFF_REPLY
-    if not question.endswith("?") or HANDOFF_REPLY.best(caller_text) != "accept":
+    if not question.endswith(("?", "؟")) or HANDOFF_REPLY.best(caller_text) != "accept":
         return ""
     if detail_asked(agent_text) not in ("", "order"):
         return ""  # "Can I take your name?" "Yes." is handled by the details rules
@@ -641,8 +641,9 @@ def provided_contact_phone(caller_text: str, agent_text: str = "", earlier: List
 def agent_question(agent_text: str) -> str:
     """What our last reply asked: its last question, or the whole reply when it asked none. "You can pick up your order
     from our store. Would you like details on collection?" asked about collection, not for an order number."""
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", agent_text or "") if part.strip()]
-    questions = [sentence for sentence in sentences if sentence.endswith("?")]
+    # Urdu and Arabic end sentences with ۔ and ask with ؟.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?۔؟])\s+", agent_text or "") if part.strip()]
+    questions = [sentence for sentence in sentences if sentence.endswith(("?", "؟"))]
     return questions[-1] if questions else (agent_text or "").strip()
 
 

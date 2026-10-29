@@ -155,6 +155,13 @@ app.include_router(realtime.router)
 
 
 @app.on_event("startup")
+async def watch_event_loop() -> None:
+    """Log and keep what holds up the event loop during calls (loop_watch.py)."""
+    import loop_watch
+    loop_watch.start()
+
+
+@app.on_event("startup")
 async def attach_realtime() -> None:
     """Live dashboard updates publish from worker threads onto this loop."""
     import asyncio

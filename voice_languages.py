@@ -83,14 +83,31 @@ def language_label(value: Any) -> str:
 
 
 def enabled_language_codes() -> List[str]:
-    """The workspace language switches (cached for a few seconds), defaulting to all built-in languages."""
+    """The workspace language switches, defaulting to all built-in languages. Read on every voice turn, on the event
+    loop: once read, the copy in memory is served and a stale one is refreshed in the background, as agent_config does
+    (a database round trip to Mumbai from the Oregon server held calls up every 30 s). Only the first read waits."""
     with _enabled_lock:
-        if _enabled_cache["codes"] is not None and time.monotonic() - _enabled_cache["at"] < _ENABLED_CACHE_SECONDS:
-            return list(_enabled_cache["codes"])
+        codes = _enabled_cache["codes"]
+        stale = codes is not None and time.monotonic() - _enabled_cache["at"] >= _ENABLED_CACHE_SECONDS
+        if stale and not _enabled_cache.get("refreshing"):
+            _enabled_cache["refreshing"] = True
+            threading.Thread(target=_refresh_enabled_language_codes, name="language-switches", daemon=True).start()
+    if codes is not None:
+        return list(codes)
     codes = _read_enabled_language_codes()
     with _enabled_lock:
         _enabled_cache.update(codes=list(codes), at=time.monotonic())
     return codes
+
+
+def _refresh_enabled_language_codes() -> None:
+    try:
+        codes = _read_enabled_language_codes()
+        with _enabled_lock:
+            _enabled_cache.update(codes=list(codes), at=time.monotonic())
+    finally:
+        with _enabled_lock:
+            _enabled_cache["refreshing"] = False
 
 
 def _read_enabled_language_codes() -> List[str]:

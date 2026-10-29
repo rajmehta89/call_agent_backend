@@ -101,3 +101,23 @@ def test_auto_language_keeps_flux_for_english_and_urdu_and_nova_for_arabic(monke
     assert "language=multi" in voice._deepgram_url("ar")
     monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "false")
     assert "model=flux-general-en" in voice._flux_url("en") and not voice._use_flux_for_language("ur")
+
+
+def test_a_stale_language_list_is_refreshed_in_the_background(monkeypatch):
+    # Read on the event loop every turn: a stale copy is served at once, never a database wait mid-call.
+    import threading
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_read():
+        started.set()
+        release.wait(2)
+        return ["en"]
+
+    monkeypatch.setattr(voice_languages, "_read_enabled_language_codes", slow_read)
+    monkeypatch.setitem(voice_languages._enabled_cache, "codes", ["en", "ur"])
+    monkeypatch.setitem(voice_languages._enabled_cache, "at", 0.0)  # long stale
+    monkeypatch.setitem(voice_languages._enabled_cache, "refreshing", False)
+    assert voice_languages.enabled_language_codes() == ["en", "ur"]  # served now, while the refresh runs
+    assert started.wait(1)
+    release.set()

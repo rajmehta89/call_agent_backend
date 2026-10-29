@@ -959,7 +959,8 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
         messages.append({"role": "system", "content": email_note})
     if places:
         messages.append({"role": "system", "content": places})
-    offered = "" if reminder else yes_to_offer_note(caller_text, last_agent_text(transcript))
+    # A meaning check (and for Urdu/Arabic possibly a translation): never directly on the event loop.
+    offered = "" if reminder else await asyncio.to_thread(yes_to_offer_note, caller_text, last_agent_text(transcript))
     if offered:
         messages.append({"role": "system", "content": offered})
     misheard = "" if reminder else name_note(caller_text, business_name())
