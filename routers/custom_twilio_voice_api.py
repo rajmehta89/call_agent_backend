@@ -31,6 +31,7 @@ from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
 from routers.retell_api import _SemanticPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
+from meaning import is_foreign as meaning_foreign
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import with_wait_bridge, wait_message
@@ -1541,7 +1542,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     await finish_utterance("flux_live_handoff")
                     continue
             if (flux and early_handoff_task is None and call_forwarding.forwarding_on() and heard_text
-                    and quiet_for >= 0.6 and not bot_busy() and early_handoff_checked != heard_text):
+                    and quiet_for >= 0.6 and not bot_busy() and early_handoff_checked != heard_text
+                    and not meaning_foreign(heard_text)):  # Urdu/Arabic partials: checked once the turn ends
                 early_handoff_checked = heard_text
                 # A network-backed classifier must not pause speculative preparation or the turn watchdog.
                 early_handoff_task = asyncio.create_task(asyncio.to_thread(

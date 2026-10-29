@@ -43,6 +43,7 @@ from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
 from voice_languages import language_for_phone, text_language
+from meaning import is_foreign as meaning_foreign
 
 logger = logging.getLogger(__name__)
 
@@ -798,7 +799,9 @@ class _SemanticPrefetch:
 
     def schedule(self, caller_text: str, agent_text: str, earlier: str = "") -> None:
         payload = (caller_text, agent_text, earlier) if earlier else (caller_text, agent_text)
-        if not caller_text or payload == self.last:
+        # Words in Urdu, Hindi or Arabic are read in English through a translation (meaning.english_text): not for
+        # every partial transcript, only for the finished turn.
+        if not caller_text or payload == self.last or meaning_foreign(caller_text):
             return
         self.last = self.pending = payload
         self.updated_at = perf_counter()

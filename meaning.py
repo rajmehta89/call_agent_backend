@@ -8,6 +8,8 @@ None of the examples hold facts about the business: they describe kinds of thing
 """
 
 import logging
+import os
+import re
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future
@@ -21,11 +23,92 @@ _CACHE_LOCK = threading.Lock()
 _INFLIGHT: Dict[str, Future] = {}
 
 
+# Callers who speak Urdu, Hindi or Arabic. The meaning model is English-only: "I want to talk to a person" in Urdu
+# scored as nothing and was never put through (2026-10-29). A multilingual model needs ~516 MB more than the 512 MB
+# server has, so their words are read in English instead: each new turn is translated once by the voice language
+# model and cached, and a context made of earlier turns reuses their translations (so one call per new turn).
+_FOREIGN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ]")
+_FOREIGN_RUN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ][^A-Za-z]*")
+_TRANSLATIONS: "OrderedDict[str, str]" = OrderedDict()
+_TRANSLATIONS_SIZE = 256
+_TRANSLATING: Dict[str, Future] = {}
+_TRANSLATE_LOCK = threading.Lock()
+_translator = None
+
+
+def _translate(text: str) -> str:
+    """English for a caller's words, from the voice language model ("" when it cannot be had in time)."""
+    global _translator
+    try:
+        from ai_services import AIServices
+        if _translator is None:
+            _translator = AIServices()
+        model = (os.getenv("TRANSLATION_MODEL") or os.getenv("RETELL_OPENROUTER_MODEL")
+                 or ("openai/gpt-4.1-mini" if _translator.provider == "openrouter" else "gpt-4.1-mini"))
+        timeout = float(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "2.5") or 2.5)
+        response = _translator.openai_client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
+            model=model, max_tokens=160, temperature=0,
+            messages=[{"role": "system", "content": "Translate what a phone caller said into plain English, keeping its "
+                       "meaning and tone. The words come from speech recognition and may be in Urdu, Hindi, Arabic or "
+                       "a mix with English. Reply with the English only."},
+                      {"role": "user", "content": text}])
+        return " ".join((response.choices[0].message.content or "").split())
+    except Exception as error:
+        logger.warning("meaning: could not translate a caller turn (%s); reading it as said", type(error).__name__)
+        return ""
+
+
+def english_text(text: str) -> str:
+    """The caller's words in English for the meaning checks and the knowledge search (as they are when English)."""
+    key = " ".join((text or "").split())
+    if not _FOREIGN.search(key) or os.getenv("MEANING_TRANSLATION", "true").strip().lower() in {"0", "false", "no", "off"}:
+        return key
+    with _TRANSLATE_LOCK:
+        if key in _TRANSLATIONS:
+            _TRANSLATIONS.move_to_end(key)
+            return _TRANSLATIONS[key]
+        known = list(_TRANSLATIONS.items())
+    # Earlier turns in a context: put their English in place, longest first (one may contain another).
+    rest = key
+    for original, english in sorted(known, key=lambda item: -len(item[0])):
+        if original in rest:
+            rest = rest.replace(original, english)
+    if _FOREIGN.search(rest):
+        # A context cut to its last words can start mid-way through an earlier turn: leave that piece out.
+        pieces = [piece.strip() for piece in _FOREIGN_RUN.findall(rest)]
+        if all(any(piece in original for original, _ in known) for piece in pieces if piece):
+            for piece in pieces:
+                rest = rest.replace(piece, " ")
+            return " ".join(rest.split())
+    else:
+        return rest
+    with _TRANSLATE_LOCK:
+        waiting = _TRANSLATING.get(key)
+        owner = waiting is None
+        if owner:
+            waiting = _TRANSLATING[key] = Future()
+    if not owner:
+        return waiting.result() or key  # the same words are being translated for another check right now
+    english = ""
+    try:
+        english = _translate(rest)
+    finally:
+        with _TRANSLATE_LOCK:
+            if english:
+                _TRANSLATIONS[key] = english
+                while len(_TRANSLATIONS) > _TRANSLATIONS_SIZE:
+                    _TRANSLATIONS.popitem(last=False)
+            _TRANSLATING.pop(key, None)
+        waiting.set_result(english)
+    return english or key  # no translation: the words as said (the checks then work as before)
+
+
 def vectors(texts: Sequence[str]):
-    """Unit meaning vectors for texts, from the local model or the network embedding provider."""
+    """Unit meaning vectors for texts, from the local model or the network embedding provider. Words in Urdu, Hindi or
+    Arabic are compared in English (english_text)."""
     import numpy as np
     from brain_service import brain_service, local_embeddings
-    keys = [" ".join((text or "").split()) for text in texts]
+    keys = [english_text(text) for text in texts]
     pending, owned = {}, []
     with _CACHE_LOCK:
         for key in dict.fromkeys(keys):
@@ -144,3 +227,8 @@ def most_similar(text: str, candidates: Sequence[str]) -> List[Tuple[int, float]
         return []
     similarities = matrix[1:] @ matrix[0]
     return sorted(((index, float(score)) for index, score in enumerate(similarities)), key=lambda item: item[1], reverse=True)
+
+
+def is_foreign(text: str) -> bool:
+    """Words in a script the meaning model cannot read (Urdu, Hindi or Arabic): they go through english_text."""
+    return bool(_FOREIGN.search(text or ""))

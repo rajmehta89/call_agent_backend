@@ -211,11 +211,12 @@ def search_text(caller_text: str, messages: List[Dict[str, str]]) -> str:
     """The words the knowledge and store search use for this turn. A yes to our offer ("Yeah." to "Would you like the
     colours or prices for those?") is searched as the offer plus the caller's earlier question, so the facts offered
     are found: searching "Yeah." found nothing, and the agent said to check the website for prices the store has."""
+    from meaning import english_text  # the knowledge is written in English: an Urdu or Arabic question is searched in it
     agent_text = last_agent_text(messages)
     if not yes_to_offer_note(caller_text, agent_text):
-        return caller_text
+        return english_text(caller_text)
     earlier = earlier_caller_texts(messages, caller_text)
-    return " ".join(part for part in (earlier[-1] if earlier else "", agent_question(agent_text)) if part)
+    return english_text(" ".join(part for part in (earlier[-1] if earlier else "", agent_question(agent_text)) if part))
 
 
 def agent_said_goodbye(agent_text: str) -> bool:
@@ -1206,6 +1207,9 @@ def complete_nova_turn(caller_text: str) -> Optional[bool]:
     callers can fall back to Deepgram's end-of-speech signal. No phrase rules decide completion.
     """
     from turn_meaning import TURN_COMPLETION, CONTACT
+    from meaning import is_foreign
+    if is_foreign(caller_text):
+        return None  # read in English only once the turn is finished (a translation per partial would be too slow)
     if pause_request(caller_text):
         return True
     contact = CONTACT.best(caller_text)

@@ -17,6 +17,7 @@ os.environ.update({
     "RETELL_AGENT_ID": "agent_test",
     "LOG_LEVEL": "WARNING",
     "HANDOFF_LLM_CHECK": "false",  # no model calls; tests/test_handoff_llm_check.py covers that path with a stand-in
+    "MEANING_TRANSLATION": "false",  # no model calls; tests/test_meaning_translation.py covers it with a stand-in
     "LOG_DIR": tempfile.mkdtemp(prefix="relaydesk-test-logs-"),  # never write into the real logs/app.log
 })
 
