@@ -63,12 +63,30 @@ def test_retell_selected_dials_retell_over_sip(client, monkeypatch):
     assert "sip:call_x@sip.retellai.com" in route(client, monkeypatch, retell=True)
 
 
-def test_retell_failure_still_answers_the_call(client, monkeypatch):
+def test_retell_failure_is_answered_by_the_custom_stack(client, monkeypatch):
+    # The default agent it went to before had no transfers and switched languages turn by turn (2026-10-29 08:54).
     async def failing(form):
         raise RuntimeError("Retell down")
 
     monkeypatch.setattr(custom, "_retell_sip_twiml", failing)
-    assert "<ConversationRelay" in route(client, monkeypatch, retell=True)
+    twiml = route(client, monkeypatch, retell=True)
+    assert "wss://voice.example/api/custom-voice/media" in twiml and 'name="fallback_engine" value="elevenlabs"' in twiml
+    monkeypatch.setattr(custom, "provider_snapshot", lambda: {**snapshot(retell=True),
+                                                             "custom_deepgram": {"enabled": False, "ready": True, "missing_configuration": []}})
+    twiml = client.post("/api/custom-voice/inbound", data={"CallSid": "CA1", "From": "+15550001111"}).text
+    assert 'name="fallback_engine" value="deepgram"' in twiml  # the Deepgram voice when it is set up
+
+
+def test_retell_failure_without_a_ready_custom_stack_uses_the_default_agent(client, monkeypatch):
+    async def failing(form):
+        raise RuntimeError("Retell down")
+
+    monkeypatch.setattr(custom, "_retell_sip_twiml", failing)
+    monkeypatch.setattr(custom, "provider_snapshot", lambda: {
+        "retell": {"enabled": True, "ready": True, "missing_configuration": []},
+        "custom": {"enabled": False, "ready": False, "missing_configuration": ["DEEPGRAM_API_KEY"]}})
+    twiml = client.post("/api/custom-voice/inbound", data={"CallSid": "CA1", "From": "+15550001111"}).text
+    assert "<ConversationRelay" in twiml and "fallback_engine" not in twiml
 
 
 @pytest.mark.parametrize("raw, expected", [

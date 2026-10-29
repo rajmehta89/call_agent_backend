@@ -43,7 +43,7 @@ import live_transcript
 from logging_setup import bind_call, timed
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from routers.calls_api import log_call
-from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_snapshot
+from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
 from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language
 
@@ -818,15 +818,24 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
     call_language = language_for_call(form)
     bind_call(form.get("CallSid"))
     call_forwarding.forwarding_on()  # refresh the cached switch before the first caller turn
+    retell_failed = False
     if providers["retell"]["enabled"] and providers["retell"]["ready"]:
         try:
             return PlainTextResponse(_with_full_call_recording(await _retell_sip_twiml(form), _public_base(request)), media_type="text/xml")
         except Exception as error:
-            logger.error("retell routing failed, using default Twilio agent: %s", error)
-            return PlainTextResponse(_with_full_call_recording(_build_conversation_twiml(_get_request_base_url(request), call_language, _browser_caller_phone(form.get("caller_phone"))), _public_base(request)), media_type="text/xml")
+            retell_failed = True
+            logger.error("retell routing failed, answering with the custom stack: %s", error)
 
     custom = _active_custom(providers)
-    if not custom["enabled"] or not custom["ready"]:
+    fallback_engine = ""
+    if retell_failed:
+        # The custom stack takes the call, with the same knowledge, languages, bridges and transfers. The default
+        # Twilio agent it went to before has none of them: a browser call at 2026-10-29 08:54 switched languages turn
+        # by turn and could not put the caller through.
+        deepgram = providers.get("custom_deepgram") or {}
+        custom = deepgram if deepgram.get("ready") else providers["custom"]
+        fallback_engine = "deepgram" if custom is deepgram else "elevenlabs"
+    if not (custom["enabled"] or fallback_engine) or not custom["ready"]:
         # Default provider: never reject a caller, hand the call to the standard Twilio AI agent.
         logger.info(
             "custom voice unavailable (enabled=%s, missing=%s); using default Twilio ConversationRelay",
@@ -854,7 +863,8 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
         f'<Parameter name="caller" value="{caller}" /><Parameter name="call_sid" value="{call_sid}" />'
         f'<Parameter name="preferred_language" value="{html.escape(call_language, quote=True)}" />'
         f'<Parameter name="stream_token" value="{stream_token(str(form.get("CallSid") or ""))}" />'
-        "</Stream></Connect></Response>", base),
+        + (f'<Parameter name="fallback_engine" value="{fallback_engine}" />' if fallback_engine else "")
+        + "</Stream></Connect></Response>", base),
         media_type="text/xml",
     )
 
@@ -862,7 +872,10 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
 @router.websocket("/media")
 async def custom_media_stream(websocket: WebSocket) -> None:
     """Bridge Twilio mulaw/8k audio to Deepgram and ElevenLabs."""
-    if not await asyncio.to_thread(custom_stack_enabled):
+    stack_enabled = await asyncio.to_thread(custom_stack_enabled)
+    # With Retell on, the stream also takes calls Retell could not (fallback_engine, checked with the stream token
+    # in the start message); any other stream is closed there.
+    if not stack_enabled and not await asyncio.to_thread(provider_enabled, "retell"):
         await websocket.close(code=1008, reason="Custom Twilio voice is disabled")
         return
     custom = _active_custom(await asyncio.to_thread(provider_snapshot))
@@ -2026,6 +2039,19 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         bind_call(call_sid)
                         if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
+                            await websocket.close(code=1008)
+                            return
+                        fallback_engine = str(params.get("fallback_engine") or "")
+                        if fallback_engine in {"deepgram", "elevenlabs"}:
+                            # A call Retell could not take: speak with the voice the router picked for it.
+                            logger.info("custom voice: answering call=%s that Retell could not take (%s voice)", call_sid, fallback_engine)
+                            if fallback_engine != engine:
+                                engine = fallback_engine
+                                if speaker is not None:
+                                    await speaker.close()
+                                speaker = _DeepgramSpeaker(preferred_language) if _tts_engine_for_language(engine, preferred_language) == "deepgram" else None
+                        elif not stack_enabled:
+                            logger.warning("closing media stream: the custom stack is off and call %s is not a fallback", call_sid)
                             await websocket.close(code=1008)
                             return
                         # Use the authenticated Start parameters before opening STT.
