@@ -520,7 +520,17 @@ async def receive_inbound_sms(request: Request):
         from_number = _lead_sms_number(raw_from)
     except HTTPException:
         from_number = raw_from
-    lead = mongo_client.leads.find_one({"phone": {"$in": [from_number, raw_from]}})
+    # A reply belongs to whoever sent the message it answers: the latest SMS from our number to this person gives
+    # the workspace and the lead. Looking the lead up by phone alone picked any lead with that number, and saving
+    # the reply under the lead's workspace ("default" for leads created by a call) hid it from the sender's thread.
+    our_number = str(form.get("To") or "").strip()
+    answered = mongo_client.sms_messages.find_one(
+        {"direction": "outbound", "to": {"$in": [from_number, raw_from]}, **({"from": our_number} if our_number else {})},
+        {"workspace_id": 1, "lead_id": 1}, sort=[("created_at", -1)])
+    lead = None
+    if answered and ObjectId.is_valid(str(answered.get("lead_id"))):
+        lead = mongo_client.leads.find_one({"_id": ObjectId(str(answered["lead_id"]))})
+    lead = lead or mongo_client.leads.find_one({"phone": {"$in": [from_number, raw_from]}})
     now = utc_now()
     if not lead:
         lead = {
@@ -538,11 +548,12 @@ async def receive_inbound_sms(request: Request):
         }
         lead["_id"] = mongo_client.leads.insert_one(lead).inserted_id
     lead_id = str(lead["_id"])
+    workspace_id = (answered or {}).get("workspace_id") or lead.get("workspace_id") or "default"
     media_urls = [str(form.get(f"MediaUrl{index}") or "").strip() for index in range(4)]
     media_urls = [url for url in media_urls if url]
     media_names = [str(form.get(f"MediaContentType{index}") or "Attachment").split("/")[-1].upper() + " attachment" for index in range(len(media_urls))]
     mongo_client.sms_messages.insert_one({
-        "workspace_id": lead.get("workspace_id", "default"),
+        "workspace_id": workspace_id,
         "lead_id": lead_id,
         "to": str(form.get("To") or ""),
         "from": from_number,
