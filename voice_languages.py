@@ -46,6 +46,33 @@ def spoken_language(value: Any) -> str:
     return _ALIASES.get(str(value or "").strip().lower(), "")
 
 
+# Letters Urdu writes and Arabic does not (ٹ ڈ ڑ ں ے ہ ھ ک گ پ چ ژ ی): Arabic writes ك ي ه, Urdu ک ی ہ.
+_URDU_LETTERS = frozenset("ٹڈڑںےہھکگپچژی")
+
+
+def text_language(text: Any) -> str:
+    """Which enabled language a caller's words are written in, from their alphabet (Retell gives no language per
+    turn): Hindi (Devanagari) script = Urdu; Arabic script with Urdu's own letters = Urdu, without = Arabic; Latin =
+    English. The script only, never the words' meaning. "" when there are no letters."""
+    devanagari = arabic = latin = 0
+    urdu = False
+    for character in str(text or ""):
+        if "ऀ" <= character <= "ॿ":
+            devanagari += 1
+        elif "؀" <= character <= "ۿ":
+            arabic += 1
+            urdu = urdu or character in _URDU_LETTERS
+        elif character.isascii() and character.isalpha():
+            latin += 1
+    if not (devanagari or arabic or latin):
+        return ""
+    if latin >= devanagari + arabic:
+        code = "en"
+    else:
+        code = "ur" if devanagari >= arabic or urdu else "ar"
+    return code if code in enabled_language_codes() else DEFAULT_LANGUAGE
+
+
 def language_config(value: Any) -> Dict[str, str]:
     code = normalize_language(value)
     return {"code": code, **SUPPORTED_LANGUAGES[code]}

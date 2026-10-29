@@ -27,7 +27,7 @@ from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, late_filler, late_filler_seconds
-from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text
+from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
@@ -42,7 +42,7 @@ import live_transcript
 from routers.calls_api import log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
-from voice_languages import language_for_phone
+from voice_languages import language_for_phone, text_language
 
 logger = logging.getLogger(__name__)
 
@@ -918,13 +918,20 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
     if inline_bridge and not reminder and bridges_enabled() and turn_model is None:
         # A short acknowledgement while the model works; the prompt keeps building while this phrase is selected.
         said = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"][-3:]
-        recent = [phrase for text in said for phrase in ALL_BRIDGES if text.startswith(phrase)]
+        recent = [phrase for text in said if (phrase := bridge_said(text))]
+        language = text_language(caller_text) or "en"
         bridge = await asyncio.to_thread(bridge_phrase, caller_text, recent, " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
-        if bridge:
+        if bridge and language != "en":
+            # In the caller's language; the lookup line is not model-written (its checks read English).
+            if bridge in LOOKUP_BRIDGES:
+                await asyncio.sleep(bridge_delay_seconds())
+            bridge = spoken_bridge(bridge, language)
+        elif bridge:
             if bridge in LOOKUP_BRIDGES:
                 bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), bridge, call_id, response_id)
             else:
                 await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
+        if bridge:
             yield bridge + " "
     if places:
         turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
@@ -1353,7 +1360,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         streamed = False
         bridge_prelude = ""
         recent = [phrase for item in transcript if item.get("role") == "assistant"
-                  for phrase in ALL_BRIDGES if str(item.get("content", "")).startswith(phrase)][-3:]
+                  if (phrase := bridge_said(item.get("content", "")))][-3:]
+        bridge_language = text_language(caller_text) or "en"  # bridges are said in the caller's language
 
         async def prepare_notice():
             if not caller_text or not bridges_enabled():
@@ -1367,7 +1375,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 timing.update(bridge_candidate=True, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000))
                 selected = await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent, timing)
                 timing["bridge_ready_ms"] = round((perf_counter() - bridge_started) * 1000)
-                return selected
+                return spoken_bridge(selected, bridge_language)
             else:
                 timing.update(bridge_candidate=False, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000),
                               bridge_ready_ms=round((perf_counter() - bridge_started) * 1000),
@@ -1500,7 +1508,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             stream = with_wait_bridge(source, make_bridge, fallback,
                                       status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, speech_ended,
                                       on_bridge=record_bridge,
-                                      late_line="" if reminder or bridge_prelude or not bridges_enabled() else late_filler(recent),
+                                      late_line="" if reminder or bridge_prelude or not bridges_enabled() else spoken_bridge(late_filler(recent), bridge_language),
                                       late_after=late_filler_seconds())
             async with contextlib.aclosing(stream):
                 async for chunk in stream:

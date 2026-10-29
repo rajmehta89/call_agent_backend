@@ -34,7 +34,7 @@ from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import with_wait_bridge, wait_message
-from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds
+from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds, bridge_lines, bridge_said, spoken_bridge
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
@@ -1107,7 +1107,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
         async def routing_notice():
             line = await asyncio.shield(bridge_ready)
-            return STATUS_PHRASES[0] if line in LOOKUP_BRIDGES else line
+            return spoken_bridge(STATUS_PHRASES[0], preferred_language) if bridge_said(line) in LOOKUP_BRIDGES else line
 
         bridge_pending = False
         def record_notice(line):
@@ -1206,7 +1206,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         logger.warning("ElevenLabs voice failed (%s: %s); this call continues with the Deepgram voice", type(error).__name__, detail)
         engine, speaker = "deepgram", _DeepgramSpeaker(preferred_language)
         # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
-        asyncio.create_task(_warm_audio_cache(ALL_BRIDGES if bridges_enabled() else (), engine, preferred_language))
+        asyncio.create_task(_warm_audio_cache(bridge_lines(preferred_language) if bridges_enabled() else (), engine, preferred_language))
 
     async def speak(text: str, cache_key: str = "", forced_engine: Optional[str] = None) -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
@@ -1278,7 +1278,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         eligibility_started = perf_counter()
         earlier_text = " ".join(" ".join(earlier_caller_texts(history, text)[-8:]).split()[-25:])
         await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history), earlier_text)
-        candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent_bridges[-3:],
+        recent = [bridge_said(line) or line for line in recent_bridges[-3:]]  # in English, whatever language was said
+        candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent,
                                            " ".join(earlier_caller_texts(history, text)[-8:]))
         diagnostics.update(bridge_candidate=bool(candidate),
                            bridge_eligibility_ms=round((perf_counter() - eligibility_started) * 1000))
@@ -1286,9 +1287,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             diagnostics.update(bridge_selector="none", bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
         bridge_services = services or await asyncio.to_thread(_voice_services)
-        selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent_bridges[-3:], diagnostics)
+        selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent, diagnostics)
         diagnostics["bridge_ready_ms"] = round((perf_counter() - started) * 1000)
-        return selected
+        return spoken_bridge(selected, preferred_language)  # in the call's language (only neutral ones there)
 
     def start_reply(text: str, bridge_ready=None, bridge_diagnostics=None) -> Dict[str, Any]:
         """Prepare the real answer independently of semantic bridge selection."""
@@ -1381,7 +1382,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
             deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
             stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge,
-                                      late_line="" if prefix or not bridges_enabled() else late_filler(recent_bridges),
+                                      late_line="" if prefix or not bridges_enabled() else spoken_bridge(
+                                          late_filler([bridge_said(line) or line for line in recent_bridges]), preferred_language),
                                       late_after=late_filler_seconds())
             try:
                 sentence = ""
@@ -1973,7 +1975,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             language_switch_task.cancel()
         language_switch_task = asyncio.create_task(reconnect_recognition(code, previous))
         if bridges_enabled():
-            asyncio.create_task(_warm_audio_cache(tuple(dict.fromkeys((*STATUS_PHRASES, *LOOKUP_BRIDGES, *ALL_BRIDGES))), engine, code))
+            asyncio.create_task(_warm_audio_cache(bridge_lines(code), engine, code))
 
     async def reconnect_recognition(code: str, previous: str) -> None:
         nonlocal deepgram, transcript_task, speculation_task, flux, stt_time_offset, preferred_language
@@ -2038,7 +2040,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         reply_task.add_done_callback(log_reply_failure)
                         # Record the bridge phrases and fillers in this call's voice while the greeting plays, so
                         # they can be said instantly.
-                        phrases = tuple(dict.fromkeys((*STATUS_PHRASES, *LOOKUP_BRIDGES, *ALL_BRIDGES))) if bridges_enabled() else ()
+                        phrases = bridge_lines(preferred_language) if bridges_enabled() else ()
                         if phrases:
                             asyncio.create_task(_warm_audio_cache(phrases, engine, preferred_language))
                     elif event == "media":

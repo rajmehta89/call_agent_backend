@@ -873,6 +873,54 @@ LOOKUP_BRIDGES = ("Let me check that for you.", "One sec, I'll have a look.", "L
 LATE_FILLERS = ("Mm, one moment.", "Okay, just a moment.")
 ALL_BRIDGES = (*LATE_FILLERS, *SEARCH_BRIDGES, *PROBLEM_BRIDGES, *DETAIL_BRIDGES, *STATEMENT_BRIDGES, *REQUEST_BRIDGES, *CLARIFY_BRIDGES,
                *STATUS_PHRASES, *LOOKUP_BRIDGES)
+# Bridges said to a caller in another language. Only the neutral ones (a moment / working on it / let me check): which
+# acknowledgement fits a turn is decided by meaning in English, so the others are kept to English turns.
+NEUTRAL_BRIDGES = frozenset((*LATE_FILLERS, *STATUS_PHRASES, *LOOKUP_BRIDGES))
+BRIDGE_TRANSLATIONS = {
+    "ur": {
+        "Mm, one moment.": "جی، ایک لمحہ۔",
+        "Okay, just a moment.": "ٹھیک ہے، بس ایک لمحہ۔",
+        "I'm working through the details now.": "تفصیلات دیکھی جا رہی ہیں۔",
+        "Just putting that together for you.": "بس آپ کے لیے تیار کر رہے ہیں۔",
+        "Let me check that for you.": "آپ کے لیے چیک کرتے ہیں۔",
+        "One sec, I'll have a look.": "ایک سیکنڈ، دیکھتے ہیں۔",
+        "Let me just look that up.": "ذرا دیکھ لیتے ہیں۔",
+        "Bear with me, I'll check.": "تھوڑا انتظار کریں، چیک کرتے ہیں۔",
+    },
+    "ar": {
+        "Mm, one moment.": "لحظة من فضلك.",
+        "Okay, just a moment.": "حسنًا، لحظة واحدة.",
+        "I'm working through the details now.": "أراجع التفاصيل الآن.",
+        "Just putting that together for you.": "أجهّز ذلك لك الآن.",
+        "Let me check that for you.": "دعني أتحقق من ذلك لك.",
+        "One sec, I'll have a look.": "لحظة، سألقي نظرة.",
+        "Let me just look that up.": "دعني أبحث عن ذلك.",
+        "Bear with me, I'll check.": "انتظر قليلًا، سأتحقق.",
+    },
+}
+_SAID_BRIDGES = {translated: english for lines in BRIDGE_TRANSLATIONS.values() for english, translated in lines.items()}
+
+
+def spoken_bridge(line: str, language: str = "en") -> str:
+    """The bridge to say in the caller's language: English as is; in another language its translation, or ""
+    for an acknowledgement that has none (see NEUTRAL_BRIDGES)."""
+    from voice_languages import normalize_language
+    code = normalize_language(language)
+    if not line or code == "en":
+        return line
+    return BRIDGE_TRANSLATIONS.get(code, {}).get(line, "")
+
+
+def bridge_lines(language: str = "en") -> tuple:
+    """Every bridge a call in this language can say, to record them in its voice before they are needed."""
+    return tuple(dict.fromkeys(line for line in (spoken_bridge(phrase, language) for phrase in ALL_BRIDGES) if line))
+
+
+def bridge_said(text: str) -> str:
+    """The English bridge a said line starts with (in any language), or "": keeps "not the same one twice" working."""
+    text = str(text or "")
+    return next((english for said, english in (*((p, p) for p in ALL_BRIDGES), *_SAID_BRIDGES.items())
+                 if text.startswith(said)), "")
 
 _bridge_turn = 0
 
