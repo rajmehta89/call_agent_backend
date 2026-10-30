@@ -22,6 +22,8 @@ def warm_semantic_decisions():
     for classifier in vars(turn_meaning).values():
         if isinstance(classifier, Classifier):
             classifier.rank("hello")
+    from voice_presence import CONNECTION_CHECK
+    CONNECTION_CHECK.rank("hello")
 
 
 class FakeDeepgram:
