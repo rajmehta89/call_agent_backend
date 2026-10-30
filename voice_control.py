@@ -5,6 +5,24 @@ from typing import Optional
 from turn_meaning import PAUSE_TURN
 
 
+HUMAN_REQUEST = Classifier("human request versus help getting started", {
+    "person": ["Can I speak to someone in your team?", "Please connect me to a human.",
+               "Can you arrange a call with your teammate?", "Could someone from sales help me on the phone?",
+               "I want an agent to join this call.", "Please have someone call me back.",
+               "Can you link me with your team?", "I need to talk with your staff about my order."],
+    "business": ["I just bought a new home and need help getting started.",
+                 "I bought a house and need a starting point for the bathroom.",
+                 "I have just purchased a home, so I need a startup.",
+                 "What do I need first for my new house?", "Can you help me choose products?",
+                 "I need advice on where to start.", "How can your company help me?",
+                 "I want to keep talking with you about these products.", "What do your staff do?"],
+}, min_score=0.62, close_call=0.05)
+
+
+def clearly_requests_person(text: str, earlier: str = "") -> bool:
+    return HUMAN_REQUEST.close(text, earlier) == ["person"]
+
+
 CALLER_PAUSE = Classifier("caller pause versus refusal", {
     **PAUSE_TURN.examples,
     "other": [*PAUSE_TURN.examples["other"],

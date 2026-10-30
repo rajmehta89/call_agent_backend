@@ -59,7 +59,12 @@ def _configure_retell_logger() -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(log_dir / "retell-debug.log", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
+    from logging_setup import _start_sink_worker
+    import atexit
+    queued, listener = _start_sink_worker([handler])
+    logger.addHandler(queued)
+    logger._relaydesk_listener = listener
+    atexit.register(listener.stop)
     logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
     logger.propagate = False
     return logger
@@ -853,6 +858,30 @@ class _SemanticPrefetch:
             await asyncio.gather(self.task, return_exceptions=True)
 
 
+class _TranslationPrefetch(_SemanticPrefetch):
+    """Warm a stable whole-turn translation without waiting for a slow CPU round.
+
+    Network translation time must not lengthen the CPU prefetch debounce. Keep
+    one running worker and only the latest pending words, just like the parent.
+    """
+
+    def __init__(self):
+        super().__init__(self._translate)
+
+    @staticmethod
+    def _translate(text, *unused):
+        from meaning import english_text
+        english_text(text)
+
+    def pause_seconds(self) -> float:
+        return self.STABLE_SECONDS
+
+    def schedule(self, caller_text: str, agent_text: str = "", earlier: str = "") -> None:
+        from meaning import is_foreign
+        if is_foreign(caller_text):
+            super().schedule(caller_text, "")
+
+
 def voice_temperature() -> float:
     """VOICE_TEMPERATURE: how freely the model words a spoken reply (0 = most literal, sticks closest to the knowledge)."""
     try:
@@ -1289,6 +1318,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
     prefetched_text, prefetched_at = "", 0.0  # last caller words sent for an early knowledge-search embedding
     semantic_prefetch = _SemanticPrefetch()
+    translation_prefetch = _TranslationPrefetch()
     voice_turn_timings: List[Dict[str, Any]] = []
     live_saves: set[asyncio.Task[None]] = set()
     services = configure_voice_services(AIServices(), os.getenv("RETELL_OPENROUTER_MODEL", "openai/gpt-oss-20b"))
@@ -1363,10 +1393,15 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         live_saves.add(task)
         task.add_done_callback(live_saves.discard)
 
-    async def handle_response(event: Dict[str, Any], response_id: int) -> None:
+    async def handle_response(event: Dict[str, Any], response_id: int, received_at: Optional[float] = None) -> None:
         nonlocal callback_requested, user_messages, handoff_pending
         turn_started = perf_counter()
         timing: Dict[str, Any] = {"response_id": response_id, "pipeline": "retell"}
+        from voice_endpoint import retell_endpoint_timing
+        received_at = turn_started if received_at is None else received_at
+        timing.update(retell_endpoint_timing(event.get("transcript"), started_clock, received_at))
+        timing["stt_event_handling_ms"] = round(max(0.0, turn_started - received_at) * 1000)
+        timing["stt_event_received_at"] = event.get("_received_at_utc") or utc_iso()
         # Waits (the filler) are timed from when the caller stopped speaking, not from when Retell sent the turn.
         speech_ended = speech_end_clock(event.get("transcript"), started_clock, turn_started)
         timing["speech_end_lag_ms"] = round((turn_started - speech_ended) * 1000)
@@ -1605,6 +1640,8 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     try:
         while True:
             event = json.loads(await websocket.receive_text())
+            received_at = perf_counter()
+            event["_received_at_utc"] = utc_iso()
             interaction_type = event.get("interaction_type")
             transcript = event.get("transcript") or []
             _trace(
@@ -1664,6 +1701,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 # far, so it is usually ready (cached) when Retell asks for the reply.
                 spoken = _last_user_message(_transcript_as_messages(transcript))
                 if not handoff_pending:
+                    translation_prefetch.schedule(spoken)
                     messages = _transcript_as_messages(transcript)
                     semantic_prefetch.schedule(spoken, last_agent_text(messages),
                         " ".join(" ".join(earlier_caller_texts(messages, spoken)[-8:]).split()[-25:]))
@@ -1685,7 +1723,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             for older in list(response_tasks):
                 # Retell only plays the newest response; finishing older ones would waste a model call each.
                 older.cancel()
-            response_task = asyncio.create_task(handle_response(event, response_id))
+            response_task = asyncio.create_task(handle_response(event, response_id, received_at))
             response_tasks.add(response_task)
             response_task.add_done_callback(consume_response_task)
             continue
@@ -1695,6 +1733,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         _trace(f"retell_ws_error call={call_id} error={type(exc).__name__}: {exc}", error=True)
     finally:
         await semantic_prefetch.close()
+        await translation_prefetch.close()
         for response_task in response_tasks:
             response_task.cancel()
         if response_tasks:
@@ -1704,7 +1743,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         if caller_number != "unknown" and (user_messages or agent_messages):
             duration = max((perf_counter() - started_clock), 0)
             transfer_status = handoff.get("transfer_status") or ("requested" if callback_requested else None)
-            log_call(
+            await asyncio.to_thread(log_call,
                 caller_number,
                 call_data={
                     "direction": "inbound",

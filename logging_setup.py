@@ -10,12 +10,14 @@ Logs go to the console and to logs/app.log (UTF-8, rotated at 10 MB, 5 files kep
 from __future__ import annotations
 
 import contextvars
+import atexit
 import logging
 import os
+import queue
 import sys
 import time
 from contextlib import contextmanager
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -49,13 +51,21 @@ def timed(logger: logging.Logger, what: str, warn_after_ms: float = 3000) -> Ite
     logger.log(logging.WARNING if elapsed > warn_after_ms else logging.INFO, "%s took %.0fms", what, elapsed)
 
 
+def _start_sink_worker(handlers):
+    """File rotation and stdout flushes must never hold the live audio loop."""
+    queued = QueueHandler(queue.SimpleQueue())
+    queued.addFilter(_CallIdFilter())  # capture request/call context before crossing threads
+    listener = QueueListener(queued.queue, *handlers, respect_handler_level=True)
+    listener.start()
+    return queued, listener
+
+
 def setup_logging() -> None:
     root = logging.getLogger()
     if getattr(root, "_relaydesk_configured", False):
         return
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     formatter = logging.Formatter(FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
-    call_filter = _CallIdFilter()
 
     log_dir = Path(os.getenv("LOG_DIR") or Path(__file__).resolve().parent / "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -64,9 +74,11 @@ def setup_logging() -> None:
     handlers = [console, file_handler]
     for handler in handlers:
         handler.setFormatter(formatter)
-        handler.addFilter(call_filter)
 
-    root.handlers = handlers
+    queued, listener = _start_sink_worker(handlers)
+    root.handlers = [queued]
+    root._relaydesk_listener = listener  # type: ignore[attr-defined]
+    atexit.register(listener.stop)  # drain accepted records before the process exits
     root.setLevel(level)
     for name in NOISY_LIBRARIES:
         logging.getLogger(name).setLevel(logging.WARNING)

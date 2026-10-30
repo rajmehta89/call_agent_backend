@@ -32,7 +32,7 @@ from brain_service import brain_service
 from auth_service import require_user
 from mongo_client import mongo_client
 from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_response_tokens, _max_spoken_words, _system_prompt, configure_voice_services, sounds_unfinished, unfinished_wait_seconds, voice_temperature, ACKNOWLEDGEMENT_OPENER
-from routers.retell_api import _SemanticPrefetch
+from routers.retell_api import _SemanticPrefetch, _TranslationPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
 from meaning import english_text, is_foreign as meaning_foreign
 from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
@@ -948,6 +948,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
     prefetched_at = 0.0
     semantic_prefetch = _SemanticPrefetch(prepare_turn_meaning)
+    translation_prefetch = _TranslationPrefetch()
     voice_turn_timings: List[Dict[str, Any]] = []
     call_started = perf_counter()
     call_started_wall = time.time()  # for loop_watch.stalls_since: what held the loop up during this call
@@ -968,6 +969,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     heard_text = ""             # the caller's words so far in this turn (final parts + the latest partial)
     heard_changed_at = 0.0      # when those words last changed
     early_reply: Optional[Dict[str, Any]] = None  # reply started before the end of the turn (see speculate)
+    early_start_task: Optional[asyncio.Task[Any]] = None
     auto_language = _auto_language_enabled()
     flux = _use_flux_for_language(preferred_language)
     language_watch: Any = None  # Nova-3 multi beside Flux, listening only for Arabic (see open_language_watch)
@@ -1347,7 +1349,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         """While the greeting plays: open the model and voice connections and pre-build the prompt, so the
         caller's first question is answered as fast as later ones (a cold first turn could take several seconds)."""
         nonlocal services
-        from voice_control import has_followup_request, CALLER_PAUSE
+        from voice_control import has_followup_request, CALLER_PAUSE, HUMAN_REQUEST
         try:
             if services is None:
                 services = await asyncio.to_thread(_voice_services)
@@ -1358,6 +1360,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 asyncio.to_thread(is_connection_check, "Hello, can you hear me?"),
                 asyncio.to_thread(has_followup_request, "No callback. What time do you open?"),
                 asyncio.to_thread(CALLER_PAUSE.rank, "hello"),
+                asyncio.to_thread(HUMAN_REQUEST.rank, "hello"),
                 asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
@@ -1568,6 +1571,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 nova_speech_final_text = ""
             heard_text, heard_changed_at = text, perf_counter()
             if not transfer_pending:
+                translation_prefetch.schedule(text)
                 semantic_history = memory.history()
                 semantic_prefetch.schedule(text, last_agent_text(semantic_history),
                     " ".join(" ".join(earlier_caller_texts(semantic_history, text)[-8:]).split()[-25:]))
@@ -1575,13 +1579,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 drop_reply(early_reply)
                 early_reply = None
 
-    async def start_early() -> None:
+    async def start_early(candidate: str) -> None:
         """Start preparing the reply to the caller's words so far (nothing is spoken until their turn ends)."""
         nonlocal early_reply
         idle = (reply_task is None or reply_task.done()) and not bot_busy()
-        if early_reply or not heard_text or services is None or not idle:
+        if early_reply or not candidate or candidate != heard_text or services is None or not idle:
             return
-        candidate = heard_text
         if await asyncio.to_thread(is_connection_check, candidate):
             return  # no speculative business lookup for a connection check
         if candidate != heard_text or early_reply or bot_busy():
@@ -1590,6 +1593,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             early_reply = start_reply(heard_text)
         except Exception as error:
             logger.debug("early reply start failed: %s", error)
+
+    def schedule_early_start() -> None:
+        nonlocal early_start_task
+        # Capture only the words whose quiet/eager condition was checked. A task
+        # queued during silence must not start for new words that arrive later.
+        if heard_text and (early_start_task is None or early_start_task.done()):
+            early_start_task = asyncio.create_task(start_early(heard_text))
+            early_start_task.add_done_callback(log_reply_failure)
 
     async def speculate() -> None:
         """Start the reply when the caller's words stop changing for a moment, before Deepgram confirms the end of the
@@ -1685,9 +1696,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 await finish_utterance(trigger)
                 continue
             if wait and quiet_for >= wait:
-                await start_early()
+                schedule_early_start()
 
-    async def on_flux_turn(payload: Dict[str, Any]) -> None:
+    async def on_flux_turn(payload: Dict[str, Any], received_at: Optional[float] = None) -> None:
         """Deepgram Flux turn events. The transcript is the whole turn so far."""
         nonlocal early_reply
         nonlocal flux_turn_started, flux_turn_logged, forced_fallback_text, heard_changed_at
@@ -1711,8 +1722,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if event == "EndOfTurn":
             flux_turn_started = 0.0
         if event == "EagerEndOfTurn":
-            await start_early()  # probably finished: prepare the reply now
+            # The presence check may need a network translation. Do not hold
+            # the STT reader here while its final EndOfTurn waits in the socket.
+            schedule_early_start()
         elif event == "TurnResumed":
+            if early_start_task is not None and not early_start_task.done():
+                early_start_task.cancel()
             if early_reply:
                 drop_reply(early_reply)  # they went on after all
                 early_reply = None
@@ -1721,13 +1736,17 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if payload.get("trigger") == "timeout":
                 logger.info("custom voice: Flux ended the turn after silence: %s", text[:120])
             utterance[:] = [text] if text else []
-            await finish_utterance(f"flux_{payload.get('trigger') or 'model'}")
+            from voice_endpoint import flux_endpoint_timing
+            endpoint = flux_endpoint_timing(payload, audio_received_seconds, stt_time_offset)
+            endpoint["stt_event_received_at"] = utc_iso()
+            endpoint["_received_clock"] = received_at if received_at is not None else perf_counter()
+            await finish_utterance(f"flux_{payload.get('trigger') or 'model'}", endpoint)
 
-    async def finish_utterance(trigger: str = "local") -> None:
+    async def finish_utterance(trigger: str = "local", endpoint=None) -> None:
         async with finish_lock:
-            await finish_utterance_locked(trigger)
+            await finish_utterance_locked(trigger, endpoint)
 
-    async def finish_utterance_locked(trigger: str = "local") -> None:
+    async def finish_utterance_locked(trigger: str = "local", endpoint=None) -> None:
         nonlocal reply_task, unanswered_text, early_reply, heard_text
         nonlocal interrupted_pending_turn
         nonlocal presence_task, presence_noted, unanswered_turn
@@ -1746,6 +1765,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             "turn_end_trigger": trigger,
             "text_stable_ms": round(max(0.0, turn_ended_at - heard_changed_at) * 1000),
         }
+        if endpoint:
+            turn_timing.update({key: value for key, value in endpoint.items() if not key.startswith("_")})
+            turn_timing["stt_event_handling_ms"] = round(max(0.0, turn_ended_at - endpoint["_received_clock"]) * 1000)
         if turn_word_end and audio_received_seconds >= turn_word_end:
             turn_timing["turn_detection_ms"] = round((audio_received_seconds - turn_word_end) * 1000)
         turn_word_end = 0.0
@@ -1875,6 +1897,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 heard_changed_at = perf_counter()
 
         async for raw in connection:
+            received_at = perf_counter()
             try:
                 payload = json.loads(raw)
                 kind = payload.get("type")
@@ -1891,8 +1914,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     words = str(payload.get("transcript") or "").split()
                     # Urdu, Hindi or Arabic words are read in English through a translation (meaning.english_text, about
                     # 1 s): start it when Flux expects the turn to end, so it is usually ready when the turn does.
-                    if payload.get("event") == "EagerEndOfTurn" and words and meaning_foreign(" ".join(words)):
-                        asyncio.create_task(asyncio.to_thread(english_text, " ".join(words)))
+                    if payload.get("event") == "EagerEndOfTurn" and words:
+                        translation_prefetch.schedule(" ".join(words))
                     # Flux Multilingual says which language each turn was in (English or Hindi = Urdu): reply in it.
                     # Not from 1-2 words ("okay", "haan"), and Arabic is the language watch's call (Flux hears it as Hindi).
                     flux_languages = payload.get("languages") or []
@@ -1921,7 +1944,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                                 await interrupt(force=True)
                             elif len(words) >= 2 and not early_reply:
                                 await interrupt(preserve_unanswered=True)
-                    await on_flux_turn(payload)
+                    await on_flux_turn(payload, received_at)
                     continue
                 if kind in {"Error", "Warning"}:
                     logger.warning("custom voice: Deepgram %s %s: %s", kind.lower(), payload.get("code"), payload.get("description"))
@@ -2232,7 +2255,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if transcript_task:
                     transcript_task.cancel()
                     await asyncio.gather(transcript_task, return_exceptions=True)
-                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task,
+                closing_tasks = [task for task in (reply_task, speculation_task, early_handoff_task, completion_task, early_start_task,
                                                    deepgram_ready, language_switch_task, presence_task)
                                  if task is not None]
                 for task in closing_tasks:
@@ -2252,6 +2275,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     finally:
         loop_watch_task.cancel()
         await semantic_prefetch.close()
+        await translation_prefetch.close()
         if contact_tasks:
             try:
                 await asyncio.wait_for(asyncio.gather(*contact_tasks, return_exceptions=True), timeout=5)

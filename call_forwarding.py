@@ -421,6 +421,11 @@ def ambiguous_team_call(caller_text: str) -> bool:
     return handoff_intent(caller_text) == "unclear"
 
 
+def _handoff_timing_relevant(caller_text: str, earlier: str, agent_text: str) -> bool:
+    from voice_control import clearly_requests_person
+    return clearly_requests_person(caller_text, earlier) or bool(agent_text and _offered_team(agent_text))
+
+
 def handoff_intent(caller_text: str, earlier: str = "", agent_text: str = "") -> str:
     """Classify the full turn, optionally with the preceding team request: live, callback, unclear or other.
     agent_text: our last reply, which the language-model check reads with the turn ("I just talk with you" after
@@ -432,6 +437,9 @@ def handoff_intent(caller_text: str, earlier: str = "", agent_text: str = "") ->
     scores = dict(ranked)
     live, callback = scores["live"], scores["callback"]
     unclear, other = scores["unclear"], scores["other"]
+    if unclear >= HANDOFF_ACTION.min_score and unclear >= max(live, callback) and unclear >= other + 0.02:
+        if not _handoff_timing_relevant(caller_text, earlier, agent_text):
+            return ""  # business guidance is not a request to choose a transfer time
     # Embeddings sometimes put "arrange a call now" and "arrange a call tomorrow"
     # almost on top of each other. Ask a small language model to resolve only
     # that close live/callback tie, preserving the rest of the fast classifier.
@@ -445,7 +453,7 @@ def handoff_intent(caller_text: str, earlier: str = "", agent_text: str = "") ->
         decided = _adjudicate_handoff(caller_text, earlier, agent_text=agent_text)
         if decided:
             return decided
-        return "unclear"  # ask now-or-later instead of guessing after a provider error
+        return "unclear" if _handoff_timing_relevant(caller_text, earlier, agent_text) else ""
     # Live transfers are consequential. A barely-leading live score over `other`
     # can turn ordinary questions into an unwanted transfer, so require a clear
     # semantic margin over non-handoff intent while preserving explicit requests.
@@ -474,6 +482,9 @@ def handoff_intent(caller_text: str, earlier: str = "", agent_text: str = "") ->
         elif result == "live":
             result = "unclear"  # the check failed: ask now-or-later rather than ring the team on a borderline score
     logger.debug("handoff intent %r -> %s (%s)", caller_text[:80], result or "other", ", ".join(f"{k} {v:.2f}" for k, v in ranked))
+    if result == "unclear":
+        if not _handoff_timing_relevant(caller_text, earlier, agent_text):
+            return ""
     return result
 
 

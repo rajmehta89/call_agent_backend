@@ -143,7 +143,11 @@ def kind_of_turn_text(caller_text: str) -> str:
     thing they said: the store's own product words become "a product" ("Can someone call me back about a vanity?" is a
     callback request, not a product search) and the business's name becomes "your company". Both lists come from the
     business's data (the Shopify catalogue, the knowledge key terms), nothing is written here."""
-    text = main_sentence(caller_text)
+    from meaning import english_text
+    # Translate the complete turn once before making generic semantic probes.
+    # Rewriting a foreign business/product name first creates another foreign
+    # sentence and used to require another translation of the same request.
+    text = main_sentence(english_text(caller_text))
     try:
         from voice_keyterms import business_name
         name = business_name()
