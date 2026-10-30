@@ -12,6 +12,9 @@ CONNECTION_CHECK = Classifier("caller connection check", {
         "Have I lost you?", "Are we still connected?", "Is this line working?",
         "Hello, hello, hello. Is anybody there?", "Please let me know you can hear me.",
         "I'm still here. Can you hear me on your end?", "You have gone quiet. Are you still there?",
+        # "Hello. बोलिए." (Hello, speak) from a caller who heard nothing: the agent kept starting answers until they hung
+        # up (2026-10-30). Said to a silent line, it asks whether anyone is there, not for the agent to go on.
+        "Hello? Speak.", "Hello, say something.", "Hello? Please speak, I can't hear anything.",
     ],
     "request": [
         "Hello, what are your opening hours?", "Hello, I need a refund.",

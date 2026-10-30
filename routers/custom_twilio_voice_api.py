@@ -945,6 +945,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     websocket_close_code = None
     callback_requested = False
     pending_saves: set[asyncio.Task[Any]] = set()
+    warmed_replies: set[str] = set()  # our replies whose English translation was started
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
     prefetched_at = 0.0
     semantic_prefetch = _SemanticPrefetch(prepare_turn_meaning)
@@ -1014,6 +1015,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             task = asyncio.create_task(asyncio.to_thread(live_transcript.save_live, call_sid, caller, "custom_twilio", lines))
             pending_saves.add(task)  # hold a reference until it finishes, or the task can be garbage-collected
             task.add_done_callback(pending_saves.discard)
+        # The next turn's checks read our last reply in English (goodbye said? callback offered?): an Urdu reply's
+        # translation took about 1 s there, before any answer started (2026-10-30). Translate it while the caller talks.
+        reply = str(responses[-1].get("content") or "") if responses else ""
+        if reply and reply not in warmed_replies and meaning_foreign(reply):
+            warmed_replies.add(reply)
+            asyncio.create_task(asyncio.to_thread(english_text, reply))
 
     def bot_busy() -> bool:
         return bool(pending_mark) or bool(reply_task and not reply_task.done()) or bool(presence_task and not presence_task.done())
@@ -2284,6 +2291,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         await memory.close()
         if speaker is not None:
             await speaker.close()
+        # Words heard while their turn was still being checked when the caller hung up: the record had lost a whole
+        # last sentence (2026-10-30). Keep them, marked as never answered.
+        last_words = " ".join((recently_completed_turn_text or "").split())
+        if last_words and not any(last_words in " ".join(str(turn.get("content") or "").split()) for turn in transcript):
+            transcript.append({"content": last_words, "timestamp": utc_iso(), "language": preferred_language,
+                               "turn_kind": "unanswered_at_hangup"})
         if transcript or responses:
             await asyncio.to_thread(log_call, caller, None, {
                 "direction": "inbound",

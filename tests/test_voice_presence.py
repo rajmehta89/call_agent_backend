@@ -24,6 +24,8 @@ def warm_semantic_decisions():
     "Hello? Hello? Are you with me?", "Can you still hear what I am saying?",
     "Is anybody listening?", "Hello, are you still on the phone?", "Have you gone away?",
     "Can you hear me? Hello? Hello?",
+    # A caller who heard nothing asks the line to speak ("Hello. बोलिए." on 2026-10-30).
+    "Hello? Please say something.", "Hello, speak up, I can't hear you.",
 ])
 def test_connection_checks_are_recognized_by_meaning(text):
     assert voice_presence.is_connection_check(text)
@@ -35,6 +37,7 @@ def test_connection_checks_are_recognized_by_meaning(text):
     "Please say that price again.", "Wait, I need to ask something else.",
     "No, I meant kitchen taps.", "Hello, hello. What are your hours tomorrow?",
     "Are you there? Cancel my callback and help me with delivery instead.", "Okay, thank you.",
+    "Go ahead.", "Yes, go ahead and tell me the price.",
 ])
 def test_real_requests_and_explicit_interruptions_are_not_suppressed(text):
     assert not voice_presence.is_connection_check(text)

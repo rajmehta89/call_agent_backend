@@ -14,11 +14,13 @@ from mongo_client import mongo_client
 DEFAULT_LANGUAGE = "en"
 LANGUAGE_SETTINGS_KEY = "voice_supported_languages"
 # "also_called": what callers may name the language when asking for it. Spoken Urdu and Hindi are understood by the
-# same callers, so a caller asking for Hindi is answered in Urdu.
+# same callers, so a caller asking for Hindi is answered in Urdu. "understands": shown on the Call languages page, the
+# speech a language's calls also cover (Hindi and Hinglish callers are heard and answered on the Urdu line).
 SUPPORTED_LANGUAGES: Dict[str, Dict[str, Any]] = {
-    "en": {"label": "English", "native_label": "English", "locale": "en-US", "also_called": []},
-    "ar": {"label": "Arabic", "native_label": "العربية", "locale": "ar-SA", "also_called": []},
-    "ur": {"label": "Urdu", "native_label": "اردو", "locale": "ur-PK", "also_called": ["Hindi"]},
+    "en": {"label": "English", "native_label": "English", "locale": "en-US", "also_called": [], "understands": []},
+    "ar": {"label": "Arabic", "native_label": "العربية", "locale": "ar-SA", "also_called": [], "understands": []},
+    "ur": {"label": "Urdu", "native_label": "اردو", "locale": "ur-PK", "also_called": ["Hindi"],
+           "understands": ["Hindi", "Hinglish"]},
 }
 # The switches are read on every voice turn (the language rule); a short cache keeps that off the database.
 _ENABLED_CACHE_SECONDS = 30.0
