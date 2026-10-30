@@ -19,6 +19,7 @@ from pymongo.errors import DuplicateKeyError
 
 from ai_services import AIServices
 from mongo_client import mongo_client
+from call_history import caller_turns
 import realtime
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,9 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         "Classify by the main unresolved reason for the latest call. A team callback about an existing order does not "
         "turn an order or delivery problem into outreach. Declining a callback or transfer while continuing a business "
         "question does not by itself mean the caller lost interest. If the caller says they paid and their order has not arrived, "
-        "choose servicing; choose payment_collection only when the payment, charge, balance or refund itself needs resolution.\n\n"
+        "choose servicing; choose payment_collection only when the payment, charge, balance or refund itself needs resolution. "
+        "An unanswered call, greeting, language preference or connection check is not evidence that an existing enquiry "
+        "became unqualified. Keep the current stage when no new customer decision is established.\n\n"
         f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n"
         f"System-validated contact number: {contact_phone or '(none)'}. If present, it is valid and overrides any agent guess that it was short or incomplete.\n"
         f"System transfer result: requested={bool(call.get('transfer_requested'))}, status={call.get('transfer_status') or 'not attempted'}, "
@@ -119,7 +122,7 @@ def may_move(current: str, stage: str) -> bool:
     (a callback, a time, an order), a later call with just a general question must not undo that by sending the
     conversation back to New lead. Moves between the other stages are the model's judgement (e.g. Follow-up ->
     Scheduling when the caller comes back to book a time)."""
-    return stage != "new_lead" or current == "new_lead"
+    return stage != "new_lead" or current in {"new_lead", "unqualified"}
 
 
 def is_placeholder_summary(text: Any) -> bool:
@@ -162,7 +165,9 @@ def apply_auto_status(call_id: str) -> Optional[str]:
                                                 {"$set": {"call_summary": verdict["summary"], "summary": verdict["summary"], "summary_by": AI_ACTOR}})
         if written.modified_count:
             realtime.publish("call", key=call.get("call_session_id") or str(call["_id"]))
-    if person_set:
+    if person_set or not caller_turns(call):
+        # Delivery errors, missed calls and an agent-only greeting say nothing
+        # about the customer's interest. Summaries may still be refreshed above.
         return None
     try:
         minimum = float(os.getenv("CALL_STATUS_MIN_CONFIDENCE", "0.6"))

@@ -1156,7 +1156,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if not pending_mark:
                 break
             await asyncio.sleep(0.1)
-        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, "", text, preferred_language):
+        if await asyncio.to_thread(call_forwarding.transfer, call_sid, caller, "", text, preferred_language,
+                                   conversation_history=memory.history()):
             logger.info("custom voice: call=%s handed to the team %.2fs after the caller asked", call_sid, perf_counter() - heard_at)
             return
         transfer_pending = False
@@ -1244,6 +1245,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "",
                 "The caller requested a callback. Please follow up using the caller's phone number.",
                 contact_email=email,
+                conversation_history=memory.history(),
             )
             callback_requested = True
             known_phone = bool(re.fullmatch(r"\+?[0-9 ()-]{8,}", callback_number))
@@ -1265,6 +1267,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "",
                 "The caller asked to speak with a specific team member. Please follow up with this caller.",
                 contact_email=contact_email_from_messages(memory.history()),
+                conversation_history=memory.history(),
             )
             callback_requested = True
             line = call_forwarding.caller_line(call_forwarding.NAMED_REQUEST_LINE, preferred_language, destination=destination)

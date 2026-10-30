@@ -963,6 +963,14 @@ class BrainService:
             parts.append(f"Customer: {customer.get('name') or phone}; tags: {', '.join(customer.get('tags') or [])}; notes: {customer.get('notes', '')}")
         if lead:
             parts.append(f"Existing CRM lead: {lead.get('name') or phone}; status: {lead.get('status', 'new')}; assigned to: {lead.get('assigned_to_name') or 'the team'}; requirement: {lead.get('requirement') or lead.get('notes', '')}; score: {lead.get('lead_score', 'not scored')}")
+        try:
+            from call_history import caller_history_context
+            previous = caller_history_context(phone, mongo_client)
+            if previous:
+                parts.append(previous)
+        except Exception as error:
+            # A history outage must not discard the known CRM record or stop a voice reply.
+            logger.warning("voice caller history unavailable: %s", type(error).__name__)
         return "\n".join(parts)
 
     # Order names may carry the store's own letters ("DFO001001", "dfo 001001") as well as "#1001" or plain digits.

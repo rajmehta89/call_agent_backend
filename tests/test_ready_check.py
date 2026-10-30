@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import main
+import pytest
 
 
 def _status(response):
@@ -23,3 +24,14 @@ def test_ready_never_blocks_a_deploy_forever(monkeypatch):
     monkeypatch.setattr(main, "_voice_warm", __import__("threading").Event())
     code, body = _status(asyncio.run(main.ready_check()))
     assert code == 200 and body["ready"] is True and body["warm"] is False
+
+
+@pytest.mark.parametrize("revision,expected", [("a" * 40, "a" * 12), ("", None), ("not-a-revision", None)])
+def test_readiness_identifies_only_a_valid_deployed_commit(monkeypatch, revision, expected):
+    monkeypatch.setenv("RENDER_GIT_COMMIT", revision)
+    monkeypatch.setenv("READY_MAX_SECONDS", "240")
+    monkeypatch.setattr(main, "_voice_warm", __import__("threading").Event())
+    _, cold = _status(asyncio.run(main.ready_check()))
+    main._voice_warm.set()
+    _, warm = _status(asyncio.run(main.ready_check()))
+    assert cold["revision"] == warm["revision"] == expected

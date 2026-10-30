@@ -124,7 +124,8 @@ def test_analysis_arriving_during_a_stale_write_is_preserved(provider_storage):
 
 
 def test_human_stage_change_during_classification_wins(monkeypatch):
-    call = {"_id": ObjectId(), "phone_number": "+15550001111", "status": "completed", "call_summary": "Specific request"}
+    call = {"_id": ObjectId(), "phone_number": "+15550001111", "status": "completed", "call_summary": "Specific request",
+            "messages": [{"role": "customer", "text": "I would like help with a bathroom renovation."}]}
     state = {"_id": call["phone_number"], "stage": "new_lead", "stage_revision": 1}
     published = []
     def classify(*args):

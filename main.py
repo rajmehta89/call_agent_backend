@@ -128,9 +128,13 @@ async def ready_check():
     embeddings = "local" if _LOCAL_EMBEDDER is not None else "network"
     # memory_mb: this process's resident memory (Linux; null elsewhere). A 512 MB instance near its limit crashes mid-call.
     memory = memory_care.resident_mb()
+    # Render supplies a commit SHA. Report only a validated identifier so a
+    # pushed fix can be distinguished from the version actually taking calls.
+    revision = (os.getenv("RENDER_GIT_COMMIT") or "").strip().lower()
+    revision = revision[:12] if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision) else None
     if _voice_warm.is_set() or waited >= ceiling:
-        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory}
-    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory})
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision})
 
 # Register all routers
 app.include_router(config_api.router)

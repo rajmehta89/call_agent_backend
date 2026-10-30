@@ -715,7 +715,8 @@ def dial_result_twiml(accepted: bool, language: str = "en") -> str:
 
 
 # ---- Moving a live call to the team, and recording what happened
-def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: str = "", preferred_language: str = "") -> bool:
+def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: str = "", preferred_language: str = "",
+             conversation_history=None) -> bool:
     """Take the live call away from the AI and ring the team. False when it could not be started (the AI carries on).
     `session_id`: the id the call is stored under when it is not the Twilio call (Retell)."""
     from routers.twilio_api import _get_twilio_client
@@ -723,7 +724,8 @@ def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: s
     if client is None or not call_sid:
         logger.warning("call forwarding: Twilio is not configured; cannot transfer %s", call_sid)
         create_callback_outreach(caller, requested_text, session_id or call_sid,
-                                 message="A caller asked to speak with a team member, but the live transfer was unavailable.")
+                                 message="A caller asked to speak with a team member, but the live transfer was unavailable.",
+                                 conversation_history=conversation_history)
         return False
     settings = get_settings()
     matched = requested_agent(requested_text, settings)
@@ -741,11 +743,15 @@ def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: s
     except Exception as error:
         logger.warning("call forwarding: could not transfer %s: %s", call_sid, error)
         create_callback_outreach(caller, requested_text, session_id or call_sid, destination=destination,
-                                 message=f"A caller asked to speak with {destination}, but the live transfer could not start.")
+                                 message=f"A caller asked to speak with {destination}, but the live transfer could not start.",
+                                 conversation_history=conversation_history)
         return False
     targets = [{"name": agent["name"], "phone": agent["phone"], "preferred_languages": agent.get("preferred_languages", []), "status": "requested"}
                for agent in targets]
+    from call_history import handoff_brief
+    brief = handoff_brief([*(conversation_history or []), {"role": "user", "content": requested_text}])
     _record(call_sid, {"transfer_requested": True, "transfer_status": "ringing", "transfer_mode": MODE, "twilio_call_sid": call_sid,
+                       "handoff_context": brief,
                        "transfer_targets": targets, "transfer_language": effective_language(preferred_language),
                        "status": "transfer_requested", "transfer_destination": destination, "requested_agent": destination if matched else None,
                        "transfer_started_at": datetime.utcnow()},
@@ -753,7 +759,8 @@ def transfer(call_sid: str, caller: str, session_id: str = "", requested_text: s
     _timeline(call_sid, caller, f"Caller asked for {destination}: ringing {destination if matched else f'{len(targets)} team member(s)'}")
     try:
         create_callback_outreach(caller, requested_text, session_id or call_sid, destination=destination,
-                                 message=f"A caller is being connected to {destination}.", notify_only=True)
+                                 message=f"A caller is being connected to {destination}.", notify_only=True,
+                                 conversation_history=conversation_history)
     except Exception as error:
         logger.warning("call forwarding: could not notify %s about %s: %s", destination, call_sid, error)
     logger.info("call forwarding: %s moved to %s (%d agent(s), %ss)", call_sid, destination, len(targets), settings["ring_seconds"])
@@ -768,6 +775,7 @@ def create_callback_outreach(
     message: str = "",
     notify_only: bool = False,
     contact_email: str = "",
+    conversation_history=None,
 ) -> str:
     """Create the in-app outreach notification for a named request or the general human team."""
     settings = get_settings()
@@ -776,13 +784,16 @@ def create_callback_outreach(
     if matched:
         assign_lead_to_requested_agent(caller, requested_text, settings)
     from notification_service import notify_human_assignment
+    from call_history import handoff_brief
+    brief = handoff_brief([*(conversation_history or []), {"role": "user", "content": requested_text}])
     notify_human_assignment(
         channel="voice",
         customer=caller or "caller",
         recipient=recipient,
         call_session_id=session_id or None,
         message=(message or f"A caller asked to speak with {recipient}. Please follow up.")
-                + (f" Caller email: {contact_email}." if contact_email else ""),
+                + (f" Caller email: {contact_email}." if contact_email else "")
+                + (f"\n\n{brief}" if brief else ""),
     )
     if not notify_only:
         logger.info("call forwarding: outreach created for %s (%s)", recipient, session_id)
@@ -853,8 +864,10 @@ def dial_finished(call_sid: str, dial_status: str, caller: str, dial_call_sid: s
         from notification_service import notify_human_assignment
         number = caller or (call or {}).get("phone_number") or ""
         destination = str((call or {}).get("transfer_destination") or "Human team")
+        brief = str((call or {}).get("handoff_context") or "")
         notify_human_assignment(channel="voice", customer=number, recipient=destination, call_session_id=call_sid,
-                                message=f"{number or 'A caller'} asked to speak with {destination} but nobody was free: please call them back.")
+                                message=f"{number or 'A caller'} asked to speak with {destination} but nobody was free: please call them back."
+                                        + (f"\n\n{brief}" if brief else ""))
     except Exception as error:
         logger.warning("call forwarding: could not notify the team about %s: %s", call_sid, error)
     logger.info("call forwarding: %s not accepted (%s); callback requested", call_sid, status)

@@ -17,7 +17,8 @@ class FakeCollection:
 
 
 def run(monkeypatch, thread_state, verdict):
-    call = {"_id": "6a0000000000000000000001", "status": "completed", "phone_number": "+61400000000"}
+    call = {"_id": "6a0000000000000000000001", "status": "completed", "phone_number": "+61400000000",
+            "messages": [{"role": "customer", "text": "I would like help with a bathroom renovation."}]}
     threads = FakeCollection({"+61400000000": thread_state} if thread_state is not None else {})
     fake = SimpleNamespace(is_connected=lambda: True, calls=SimpleNamespace(find_one=lambda q: call), inbox_threads=threads,
                            users=SimpleNamespace(find_one=lambda q: None))
