@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from ai_services import AIServices
 from mongo_client import mongo_client
@@ -129,7 +130,7 @@ def apply_auto_status(call_id: str) -> Optional[str]:
         return None
     key = inbox_api._thread_key(call)
     state = mongo_client.inbox_threads.find_one({"_id": key}) or {}
-    person_set = bool(state.get("stage_by_name") and state.get("stage_by") != AI_ACTOR)
+    person_set = bool((state.get("stage_by") or state.get("stage_by_name")) and state.get("stage_by") != AI_ACTOR)
     needs_summary = is_placeholder_summary(call.get("call_summary") or call.get("summary")) or bool(
         call.get("provider") == "custom_twilio" and call.get("summary_by") in (None, AI_ACTOR))
     if person_set and not needs_summary:
@@ -164,12 +165,18 @@ def apply_auto_status(call_id: str) -> Optional[str]:
         return None
     now = datetime.utcnow()
     stage = verdict["stage"]
-    mongo_client.inbox_threads.update_one(
-        {"_id": key},
-        {"$set": {"stage": stage, "stage_by": AI_ACTOR, "stage_by_name": AI_NAME, "stage_at": now, "stage_reason": verdict["reason"], "updated_at": now},
-         "$push": {"stage_history": {"from": current, "to": stage, "by": AI_ACTOR, "by_name": AI_NAME, "reason": verdict["reason"], "at": now}}},
-        upsert=True,
-    )
+    try:
+        written = mongo_client.inbox_threads.update_one(
+            {"_id": key, "stage_revision": state.get("stage_revision"), "stage_by": state.get("stage_by"), "stage_at": state.get("stage_at")},
+            {"$set": {"stage": stage, "stage_by": AI_ACTOR, "stage_by_name": AI_NAME, "stage_at": now, "stage_reason": verdict["reason"], "updated_at": now},
+             "$inc": {"stage_revision": 1},
+             "$push": {"stage_history": {"from": current, "to": stage, "by": AI_ACTOR, "by_name": AI_NAME, "reason": verdict["reason"], "at": now}}},
+            upsert=True,
+        )
+    except DuplicateKeyError:  # another writer created/changed the thread meanwhile
+        return None
+    if written.matched_count == 0 and written.upserted_id is None:
+        return None
     realtime.publish("stage", key=key)
     logger.info("auto status: %s moved %s -> %s (%.2f): %s", key, current, stage, verdict["confidence"], verdict["reason"])
     assignee_id = state.get("assigned_to")

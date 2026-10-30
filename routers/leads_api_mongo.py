@@ -1,3 +1,4 @@
+import re
 #!/usr/bin/env python3
 """MongoDB-backed lead CRM API."""
 
@@ -22,6 +23,8 @@ from twilio.rest import Client
 
 from env_loader import load_project_env
 from mongo_client import mongo_client
+from list_paging import record_cursor, record_after
+from resource_scopes import intersect
 from routers.calls_api import log_call, update_lead_status_from_call
 import realtime
 from twilio_security import verify_twilio_request
@@ -169,7 +172,7 @@ def _call_counts(lead_ids: List[Any]) -> Dict[str, int]:
     return {row["_id"]: row["count"] for row in rows}
 
 
-def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope: Dict[str, Any] | None = None):
+def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope: Dict[str, Any] | None = None, after: str = ""):
     _require_db()
 
     query: Dict[str, Any] = dict(scope or {})
@@ -177,7 +180,7 @@ def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope
         if filters.get("status"):
             query["status"] = filters["status"]
         if filters.get("search"):
-            search_term = filters["search"]
+            search_term = re.escape(filters["search"][:200])
             query["$or"] = [
                 {"name": {"$regex": search_term, "$options": "i"}},
                 {"phone": {"$regex": search_term, "$options": "i"}},
@@ -185,7 +188,17 @@ def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope
                 {"company": {"$regex": search_term, "$options": "i"}},
             ]
 
-    leads = list(mongo_client.leads.find(query).sort("created_at", -1).skip(skip).limit(limit))
+    if filters and (filters.get("since") or filters.get("until")):
+        from routers.inbox_api import _when_param
+        bounds = {}
+        if filters.get("since"): bounds["$gte"] = _when_param(filters["since"], "since")
+        if filters.get("until"): bounds["$lt"] = _when_param(filters["until"], "until")
+        query = intersect(query, {"$or": [{"last_call": bounds}, {"created_at": bounds}]})
+    page_query = intersect(query, record_after(after, "created_at")) if after else query
+    leads = list(mongo_client.leads.find(page_query).sort([("created_at", -1), ("_id", -1)]).skip(skip).limit(limit + 1))
+    has_more = len(leads) > limit
+    leads = leads[:limit]
+    next_cursor = record_cursor(leads[-1], "created_at") if has_more else None
     # The stored call_attempts counter was never increased when calls came in (every lead showed 0), so the
     # Calls column is counted from the calls actually linked to each lead, in one query for the page.
     counts = _call_counts([lead["_id"] for lead in leads])
@@ -196,6 +209,7 @@ def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope
     return {
         "success": True,
         "data": leads,
+        "next_cursor": next_cursor,
         "total": mongo_client.leads.count_documents(query),
         "limit": limit,
         "skip": skip,
@@ -293,6 +307,8 @@ def get_leads_stats(scope: Dict[str, Any] | None = None):
             "contacted": status_counts["contacted"],
             "converted": status_counts["converted"],
             "total_calls": total_calls,
+            "assigned": mongo_client.leads.count_documents(intersect(scope, {"assigned_to": {"$exists": True, "$nin": [None, ""]}})),
+            "unassigned": mongo_client.leads.count_documents(intersect(scope, {"$or": [{"assigned_to": None}, {"assigned_to": ""}]})),
         },
     }
 
@@ -304,13 +320,14 @@ def get_leads_endpoint(
     limit: int = Query(50, ge=1, le=200),
     skip: int = Query(0, ge=0),
     user: Dict[str, Any] = Depends(require_user),
+    since: str = "", until: str = "", after: str = Query("", max_length=2000),
 ):
-    filters: Dict[str, Any] = {}
+    filters: Dict[str, Any] = {"since": since, "until": until}
     if status:
         filters["status"] = status
     if search:
         filters["search"] = search
-    return get_leads(filters, limit, skip, owner_scope(user))
+    return get_leads(filters, limit, skip, owner_scope(user), after=after)
 
 
 @router.post("/")

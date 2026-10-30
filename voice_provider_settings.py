@@ -147,7 +147,7 @@ def provider_snapshot() -> Dict[str, Dict[str, Any]]:
     ]
     twilio_deepgram_missing = [name for name in custom_missing if not name.startswith("ELEVENLABS_")]
     retell_missing = [
-        name for name in ("RETELL_API_KEY", "RETELL_AGENT_ID", "OPENROUTER_API_KEY") if not os.getenv(name, "").strip()
+        name for name in ("RETELL_API_KEY", "RETELL_AGENT_ID", "OPENROUTER_API_KEY", "RETELL_CUSTOM_LLM_SECRET") if not os.getenv(name, "").strip()
     ]
     return {
         "retell": {

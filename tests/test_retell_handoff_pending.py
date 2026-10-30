@@ -8,7 +8,7 @@ from routers import retell_api as retell
 
 
 def test_pending_handoff_does_not_start_another_reply_or_transfer(monkeypatch):
-    monkeypatch.setenv("RETELL_CUSTOM_LLM_SECRET", "")
+    monkeypatch.setenv("RETELL_CUSTOM_LLM_SECRET", "test-retell-websocket")
     monkeypatch.setattr(retell, "_enabled", lambda: True)
     monkeypatch.setattr(retell, "_trace", lambda *args, **kwargs: None)
     monkeypatch.setattr(retell, "prepare_turn_meaning", lambda *args: None)
@@ -35,7 +35,7 @@ def test_pending_handoff_does_not_start_another_reply_or_transfer(monkeypatch):
     monkeypatch.setattr(retell, "_stream_reply", unexpected_reply)
     app = FastAPI()
     app.include_router(retell.router)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/call_handoff_test") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/call_handoff_test?token=test-retell-websocket") as socket:
         socket.receive_json()  # config
         socket.receive_json()  # greeting
         socket.send_json({"interaction_type": "response_required", "response_id": 1,

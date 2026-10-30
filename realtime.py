@@ -40,6 +40,9 @@ version = 0
 def publish(kind: str, **data: Any) -> None:
     """Tell every open dashboard that something of this kind changed. Never raises."""
     global version
+    if kind == "call":
+        from thread_summaries import schedule_refresh
+        schedule_refresh(data.get("key"))
     version += 1
     if _loop is None or _loop.is_closed():
         return

@@ -11,7 +11,7 @@ from routers import retell_api as retell
 
 @pytest.fixture
 def app(monkeypatch):
-    monkeypatch.setenv("RETELL_CUSTOM_LLM_SECRET", "")
+    monkeypatch.setenv("RETELL_CUSTOM_LLM_SECRET", "test-retell-websocket")
     monkeypatch.setattr(retell, "_enabled", lambda: True)
     monkeypatch.setattr(retell, "_trace", lambda *args, **kwargs: None)
     services = SimpleNamespace(is_llm_configured=lambda: True)
@@ -35,7 +35,7 @@ def test_sorry_is_acknowledged_without_restarting_product_reasoning(app, monkeyp
         raise AssertionError("A pause should not trigger semantic, store or model work")
 
     monkeypatch.setattr(retell, "prepare_turn_meaning", unexpected)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-pause") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-pause?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -64,7 +64,7 @@ def test_only_an_explicit_user_turn_cancels_an_old_response(app, monkeypatch, tu
             yield "New answer."
 
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-turn") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-turn?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -89,7 +89,7 @@ def test_only_an_explicit_user_turn_cancels_an_old_response(app, monkeypatch, tu
 
 def test_call_uses_responsive_turn_detection_and_one_silence_reminder(app, monkeypatch):
     monkeypatch.delenv("RETELL_INTERRUPTION_SENSITIVITY", raising=False)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-settings") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-settings?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "call_details", "call": {}})
@@ -109,7 +109,7 @@ def test_explicit_later_callback_is_queued_without_more_contact_questions(app, m
                         lambda *args, **kwargs: queued.update(args=args, kwargs=kwargs) or "Human team")
     monkeypatch.setattr(retell.transfer_service, "request_transfer", lambda *args, **kwargs: queued.update(transfer=True))
     monkeypatch.setattr(retell.transfer_service, "update_transfer", lambda *args, **kwargs: None)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -130,7 +130,7 @@ def test_slow_retell_answer_gets_one_wait_bridge_then_the_answer(app, monkeypatc
         yield "Here are the round basins."
 
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-wait-bridge") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-wait-bridge?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -152,7 +152,7 @@ def test_slow_short_retell_reply_does_not_receive_generic_filler(app, monkeypatc
         yield "Go ahead."
 
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-short-no-bridge") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-short-no-bridge?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -175,7 +175,7 @@ def test_callback_then_ok_does_not_reopen_handoff_or_invoke_model(app, monkeypat
 
     monkeypatch.setattr(retell.call_forwarding, "handoff_intent", lambda *args: "callback")
     monkeypatch.setattr(retell, "_stream_reply", no_model)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback-state") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-callback-state?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "call_details", "call": {"from_number": "+61412345678"}})
@@ -201,7 +201,7 @@ def test_yes_to_live_offer_does_not_ask_now_or_later_again(app, monkeypatch):
         raise AssertionError("Acceptance of a live transfer offer is already explicit")
 
     monkeypatch.setattr(retell.call_forwarding, "handoff_intent", no_classifier)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-offer-accepted") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-offer-accepted?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -225,7 +225,7 @@ def test_slow_retell_routing_gets_only_one_bridge_for_the_whole_turn(app, monkey
         await asyncio.sleep(0.08)
         yield "Here is the answer."
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/routing-wait") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/routing-wait?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -251,7 +251,7 @@ def test_answer_starts_alongside_the_handoff_check(app, monkeypatch):
 
     monkeypatch.setattr(retell.call_forwarding, "handoff_intent", slow_handoff)
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,
@@ -271,7 +271,7 @@ def test_a_callback_turn_never_sends_the_early_answer(app, monkeypatch):
         yield "EARLY ANSWER"
 
     monkeypatch.setattr(retell, "_stream_reply", answer)
-    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early-callback") as socket:
+    with TestClient(app).websocket_connect("/api/retell/llm-websocket/test-early-callback?token=test-retell-websocket") as socket:
         socket.receive_json()
         socket.receive_json()
         socket.send_json({"interaction_type": "response_required", "response_id": 1,

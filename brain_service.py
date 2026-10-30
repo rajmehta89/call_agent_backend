@@ -16,6 +16,7 @@ from agent_config import agent_config
 from conversation_memory import bounded_history
 from logging_setup import timed
 from mongo_client import mongo_client
+from knowledge_store import replace_source
 from qa_engine import DynamicQA
 from response_renderer import render_response
 from shopify_service import phones_match, shopify_service
@@ -465,7 +466,7 @@ class BrainService:
         return chunks
 
     def ingest_text(self, source_type: str, source_name: str, text: str, source_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
-                    chunks: Optional[List[str]] = None) -> Dict[str, Any]:
+                    chunks: Optional[List[str]] = None, replaced_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         collection = getattr(mongo_client, "brain_documents", None)
         sources = getattr(mongo_client, "brain_sources", None)
         if not mongo_client.is_connected() or collection is None or sources is None:
@@ -478,7 +479,6 @@ class BrainService:
         vectors, embedding_provider = self._embeddings(chunks)
         local_vectors = local_embeddings(chunks)
         now = datetime.utcnow()
-        collection.delete_many({"source_id": source_id})
         documents = [{
             "source_id": source_id,
             "source_key": source_id,
@@ -487,13 +487,11 @@ class BrainService:
             "text": chunk,
             "chunk_index": index,
             "embedding": vectors[index] if index < len(vectors) else [],
-            "embedding_model": self._embedding_model_name(embedding_provider) if vectors[index] else None,
+            "embedding_model": self._embedding_model_name(embedding_provider) if index < len(vectors) and vectors[index] else None,
             "embedding_local": local_vectors[index] if index < len(local_vectors) else [],
             "metadata": metadata or {},
             "updated_at": now,
         } for index, chunk in enumerate(chunks)]
-        collection.insert_many(documents)
-        clear_brain_caches()  # the next call turn searches the new knowledge at once
         source = {
             "source_id": source_id,
             "source_type": source_type,
@@ -506,24 +504,21 @@ class BrainService:
             "metadata": metadata or {},
             "updated_at": now,
         }
-        sources.update_one({"source_id": source_id}, {"$set": source, "$setOnInsert": {"created_at": now}}, upsert=True)
+        replace_source(mongo_client, source_id, documents, source, replaced_ids)
+        clear_brain_caches()  # invalidate only after the new source has committed
         return {"source_id": source_id, "source_type": source_type, "source_name": source_name, "chunks": len(documents), "embedding_enabled": bool(vectors and vectors[0])}
 
     def reindex_knowledge(self, brain: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         collection = getattr(mongo_client, "brain_documents", None)
         if not mongo_client.is_connected() or collection is None:
             return {"ready": False, "documents_count": 0, "source_count": 0, "last_indexed_at": None}
-        # Remove pre-RAG rows and replace only the settings source; uploaded, scraped, and Shopify sources remain intact.
-        collection.delete_many({"source_id": {"$exists": False}})
-        collection.delete_many({"source_id": "brain_settings"})
-        clear_brain_caches()
-        sources = getattr(mongo_client, "brain_sources", None)
-        if sources is not None:
-            sources.delete_one({"source_id": "brain_settings"})
         items = self._knowledge_source_items(brain)
         text = "\n\n".join(f"{item['source_name']}:\n{item['text']}" for item in items)
         if text:
             self.ingest_text("settings", "Business knowledge", text, source_id="brain_settings", chunks=self._section_chunks(items))
+        else:
+            replace_source(mongo_client, "brain_settings", [], None)
+            clear_brain_caches()
         return self.index_status()
 
     def ingest_pdf(self, file_bytes: bytes, filename: str) -> Dict[str, Any]:
@@ -535,22 +530,18 @@ class BrainService:
         source_id = f"pdf:{hashlib.sha256(file_bytes).hexdigest()}"
         sources = getattr(mongo_client, "brain_sources", None)
         collection = getattr(mongo_client, "brain_documents", None)
+        old_ids = []
         if sources is not None and collection is not None:
             previous = list(sources.find({"source_type": "pdf", "metadata.filename": filename, "source_id": {"$ne": source_id}}, {"source_id": 1}))
             old_ids = [row.get("source_id") for row in previous if row.get("source_id")]
-            if old_ids:
-                collection.delete_many({"source_id": {"$in": old_ids}})
-                sources.delete_many({"source_id": {"$in": old_ids}})
-        return self.ingest_text("pdf", filename, "\n\n".join(pages), source_id=source_id, metadata={"filename": filename, "pages": len(reader.pages)})
+        return self.ingest_text("pdf", filename, "\n\n".join(pages), source_id=source_id, metadata={"filename": filename, "pages": len(reader.pages)}, replaced_ids=old_ids)
 
     def ingest_url(self, url: str) -> Dict[str, Any]:
         BeautifulSoup = _optional("bs4", "BeautifulSoup")
         if BeautifulSoup is None:
             raise RuntimeError("Web scraping support is not installed")
-        import requests
-        response = requests.get(url, timeout=20, headers={"User-Agent": "AgentFlow knowledge crawler/1.0"})
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        from safe_http import fetch_public_text
+        soup = BeautifulSoup(fetch_public_text(url), "html.parser")
         title = " ".join(soup.title.get_text(" ", strip=True).split()) if soup.title else url
         for element in soup(["script", "style", "noscript", "svg", "nav", "header", "iframe", "form"]):
             element.decompose()

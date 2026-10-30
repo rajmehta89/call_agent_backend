@@ -31,6 +31,8 @@ services:
         value: AU
       - key: TWILIO_VALIDATE_SIGNATURES
         value: "true"
+      - key: RETELL_CUSTOM_LLM_SECRET
+        sync: false
       - key: DEEPGRAM_API_KEY
         sync: false
       - key: DEEPGRAM_TTS_VOICE

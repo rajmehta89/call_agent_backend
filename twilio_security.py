@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 STREAM_TOKEN_TTL_SECONDS = 300
 
 
+def validate_production_voice_security() -> None:
+    """Do not start a public voice deployment with verification silently disabled."""
+    environment = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "development").lower()
+    if environment not in {"production", "prod"}:
+        return
+    if not _enabled() or not os.getenv("TWILIO_AUTH_TOKEN", "").strip():
+        raise RuntimeError("Production voice requires TWILIO_AUTH_TOKEN and TWILIO_VALIDATE_SIGNATURES=true")
+    from voice_provider_settings import provider_enabled
+    if provider_enabled("retell") and not os.getenv("RETELL_CUSTOM_LLM_SECRET", "").strip():
+        raise RuntimeError("The enabled Retell provider requires RETELL_CUSTOM_LLM_SECRET")
+
+
 def _enabled() -> bool:
     return os.getenv("TWILIO_VALIDATE_SIGNATURES", "true").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -38,8 +50,8 @@ async def verify_twilio_request(request: Request) -> None:
         return
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
     if not auth_token:
-        logger.warning("TWILIO_AUTH_TOKEN is not set; Twilio webhook signatures are not being checked")
-        return
+        logger.error("Twilio webhook rejected: signature verification is not configured")
+        raise HTTPException(status_code=503, detail="Twilio signature verification is not configured")
     signature = request.headers.get("x-twilio-signature", "")
     params = dict(await request.form())  # Starlette caches the form, so the endpoint can read it again
     url = public_request_url(request)
@@ -49,7 +61,10 @@ async def verify_twilio_request(request: Request) -> None:
 
 
 def _secret() -> bytes:
-    return (os.getenv("AUTH_SECRET") or os.getenv("TWILIO_AUTH_TOKEN") or "").encode()
+    secret = (os.getenv("AUTH_SECRET") or os.getenv("TWILIO_AUTH_TOKEN") or "").strip()
+    if not secret:
+        raise RuntimeError("A secret is required to sign voice stream tokens")
+    return secret.encode()
 
 
 def stream_token(call_sid: str) -> str:
@@ -66,5 +81,8 @@ def valid_stream_token(call_sid: str, token: str) -> bool:
         fresh = 0 <= time.time() - int(issued) <= STREAM_TOKEN_TTL_SECONDS
     except (ValueError, AttributeError):
         return False
-    expected = hmac.new(_secret(), f"{call_sid}:{issued}".encode(), hashlib.sha256).hexdigest()[:32]
+    try:
+        expected = hmac.new(_secret(), f"{call_sid}:{issued}".encode(), hashlib.sha256).hexdigest()[:32]
+    except RuntimeError:
+        return False
     return fresh and hmac.compare_digest(digest, expected)

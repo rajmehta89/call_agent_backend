@@ -50,9 +50,19 @@ SEARCH_STOP_WORDS = {
 
 def normalize_store_domain(value: str) -> str:
     domain = (value or "").strip().lower()
-    domain = re.sub(r"^https?://", "", domain).split("/")[0]
-    if domain and "." not in domain:
+    if not domain:
+        return ""
+    from urllib.parse import urlsplit
+    parsed = urlsplit(domain if "://" in domain else "https://" + domain)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
+        raise ValueError("Use the store's canonical myshopify.com domain")
+    if parsed.port is not None:
+        raise ValueError("Shopify store domains must not include a port")
+    domain = parsed.hostname
+    if "." not in domain:
         domain = f"{domain}.myshopify.com"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*\.myshopify\.com", domain):
+        raise ValueError("Use the store's canonical myshopify.com domain")
     return domain
 
 
@@ -271,8 +281,13 @@ class ShopifyService:
     # ------------------------------------------------------------------ connection
     def configure(self, store_domain: str, access_token: str = "", api_version: str = DEFAULT_API_VERSION,
                   client_id: str = "", client_secret: str = "") -> None:
+        domain = normalize_store_domain(store_domain)
+        if not domain:
+            raise ValueError("A Shopify store domain is required")
+        if not re.fullmatch(r"\d{4}-\d{2}", api_version or DEFAULT_API_VERSION):
+            raise ValueError("Use a Shopify API version in YYYY-MM format")
         with self._lock:
-            self.store_domain = normalize_store_domain(store_domain)
+            self.store_domain = domain
             self.static_token = access_token or ""
             self.client_id = client_id or ""
             self.client_secret = client_secret or ""

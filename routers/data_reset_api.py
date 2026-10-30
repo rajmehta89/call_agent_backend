@@ -87,4 +87,6 @@ def reset_data(payload: ResetRequest, user: Dict[str, Any] = Depends(require_per
         logger.exception("call data reset failed after deleting %s", deleted)
         raise HTTPException(status_code=500, detail="Call data reset stopped before completion; check the server log")
     logger.warning("call data reset by %s: deleted=%s", user.get("_id"), deleted)
+    import realtime
+    realtime.publish("reset")
     return {"success": True, "data": {"deleted": deleted}}

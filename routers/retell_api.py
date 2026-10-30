@@ -301,6 +301,7 @@ def _upsert_retell_call(call: Dict[str, Any], event: str) -> None:
         "in_voicemail": analysis.get("in_voicemail"),
         "human_callback_requested": human_requested,
         "analysis_status": "complete" if event == "call_analyzed" else "pending",
+        "provider_event_rank": 3 if event == "call_analyzed" else 2 if event != "transcript_updated" else 1,
         "transcript_with_tool_calls": call.get("transcript_with_tool_calls") or [],
         "messages": live_transcript.ordered_from_retell(
             call.get("transcript_object") or [],
@@ -1171,12 +1172,17 @@ def recover_retell_outcomes(hours: int = 24) -> int:
 
 @router.post("/webhook", status_code=204)
 async def retell_webhook(request: Request) -> Response:
-    """Persist Retell lifecycle, transcript, and post-call analysis events."""
+    """Read the body asynchronously, then keep synchronous persistence off the voice loop."""
     raw_body = await request.body()
+    return await asyncio.to_thread(_process_retell_webhook, raw_body, request.headers.get("x-retell-signature", ""))
+
+
+def _process_retell_webhook(raw_body: bytes, signature: str) -> Response:
+    """Persist verified lifecycle events in a worker thread."""
     if not os.getenv("RETELL_API_KEY", "").strip():
         _trace("retell_webhook_unavailable reason=RETELL_API_KEY_missing", error=True)
         return Response(status_code=503, content="RETELL_API_KEY is not configured")
-    if not _valid_retell_webhook(raw_body, request.headers.get("x-retell-signature", "")):
+    if not _valid_retell_webhook(raw_body, signature):
         _trace("retell_webhook_rejected reason=invalid_signature", error=True)
         return Response(status_code=401, content="Invalid Retell webhook signature")
 
@@ -1245,7 +1251,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     # wss://api.example.com/api/retell/llm-websocket?token=... .
     # Retell appends the call_id to the path before opening the socket.
     supplied_secret = websocket.query_params.get("token", "")
-    if expected_secret and not hmac.compare_digest(supplied_secret, expected_secret):
+    if not expected_secret or not hmac.compare_digest(supplied_secret, expected_secret):
         await websocket.close(code=1008, reason="Unauthorized")
         return
 

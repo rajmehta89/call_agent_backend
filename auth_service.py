@@ -33,6 +33,7 @@ ALL_PERMISSIONS = [
     "manage_team",
     "manage_roles",
     "manage_workspace",
+    "export_data",
 ]
 
 # Two roles for a team, plus the owner who created the workspace:

@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from timeutil import api_time, local_midnight_utc, utc_iso, utc_now
 from bson import ObjectId
 from mongo_client import mongo_client
+from list_paging import record_cursor, record_after
+from resource_scopes import intersect
 from voice_languages import normalize_language
 import realtime
 from call_status import schedule_auto_status
@@ -37,6 +39,7 @@ router = APIRouter(prefix="/api/calls", tags=["calls"], dependencies=[Depends(re
 EXTRA_CALL_FIELDS = (
     "provider",
     "provider_call_id",
+    "provider_event_rank",
     "channel_type",
     "agent_id",
     "agent_name",
@@ -357,7 +360,7 @@ def _ensure_inbound_lead(
     return str(inserted.inserted_id), lead
 
 
-def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[str, Any] = None) -> Dict[str, Any]:
+def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[str, Any] = None, *, _attempt: int = 0) -> Dict[str, Any]:
     """Log a new call"""
     try:
         if not mongo_client.is_connected():
@@ -425,6 +428,11 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
         if session_id:
             existing = mongo_client.calls.find_one({"call_session_id": session_id})
             if existing:
+                is_retell_event = call_data.get("provider") == "retell" and "provider_event_rank" in call_data
+                old_rank = 3 if existing.get("analysis_status") == "complete" else int(existing.get("provider_event_rank") or 0)
+                if is_retell_event and int(call_data["provider_event_rank"]) < old_rank:
+                    existing["_id"] = str(existing["_id"])
+                    return {"success": True, "data": existing, "note": "ignored_stale_provider_event"}
                 update_data = {
                     "phone_number": phone_number,
                     "lead_id": lead_id,
@@ -457,10 +465,15 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                     # The call was moved to the team (call_forwarding.py): its outcome comes from Twilio's callbacks;
                     # the AI's end-of-call save must not reset it to "completed" / no transfer.
                     update_data.update({field: existing.get(field) for field in FORWARDING_FIELDS})
-                mongo_client.calls.update_one(
-                    {"_id": existing["_id"]},
-                    {"$set": update_data}
-                )
+                where = {"_id": existing["_id"]}
+                if is_retell_event:
+                    # CAS protects against a complete analysis arriving after the read above.
+                    where.update(analysis_status=existing.get("analysis_status"), provider_event_rank=existing.get("provider_event_rank"))
+                written = mongo_client.calls.update_one(where, {"$set": update_data})
+                if is_retell_event and written.matched_count == 0:
+                    if _attempt >= 3:
+                        raise RuntimeError("Concurrent provider updates; retry this event")
+                    return log_call(phone_number, lead_id, call_data, _attempt=_attempt + 1)
                 updated_record = mongo_client.calls.find_one({"_id": existing["_id"]})
                 updated_record["_id"] = str(updated_record["_id"])
                 realtime.publish("call", key=session_id)
@@ -471,8 +484,8 @@ def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[s
                 call_record["call_session_id"] = session_id
 
         result = mongo_client.calls.insert_one(call_record)
-        realtime.publish("call")
         call_record["_id"] = str(result.inserted_id)
+        realtime.publish("call", key=call_record.get("call_session_id") or call_record["_id"])
 
         if lead_id:
             try:
@@ -609,12 +622,14 @@ LIST_EXCLUDED_FIELDS = {field: 0 for field in ("transcript_with_tool_calls", "me
                                                "transcription", "latency", "provider_metadata", "call_cost", "metadata")}
 
 
-def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, scope: Optional[Dict[str, Any]] = None, slim: bool = False) -> Dict[str, Any]:
+def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, scope: Optional[Dict[str, Any]] = None, slim: bool = False, with_summary: bool = False, after: str = "") -> Dict[str, Any]:
     """Get calls with optional filters. slim=True leaves out the per-call detail fields (LIST_EXCLUDED_FIELDS)."""
     try:
         if not mongo_client.is_connected():
             return {"success": False, "error": "Database not connected"}
 
+        limit = max(1, min(1000, int(limit)))
+        skip = max(0, int(skip))
         query = dict(scope or {})
         if filters:
             if filters.get("direction"):
@@ -625,8 +640,33 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
                 query["lead_id"] = filters["lead_id"]
             if filters.get("status"):
                 query["status"] = filters["status"]
-            if filters.get("interest_status"):
+            if filters.get("interest_status") == "no_analysis":
+                query["interest_analysis"] = None
+            elif filters.get("interest_status"):
                 query["interest_analysis.interest_status"] = filters["interest_status"]
+            if filters.get("search"):
+                literal = {"$regex": re.escape(filters["search"][:200]), "$options": "i"}
+                from resource_scopes import lead_scope
+                matched_leads = list(mongo_client.leads.find(intersect(lead_scope(filters["actor"]), {"$or": [{field: literal} for field in ("name", "phone", "email", "company")]}), {"_id": 1}))
+                ids = [row["_id"] for row in matched_leads]
+                query["$or"] = [{"phone_number": literal}, {"call_summary": literal}, {"lead_id": {"$in": ids + [str(value) for value in ids]}}]
+            if filters.get("handling") in {"human", "ai"}:
+                human = {"$or": [{"accepted_by": {"$exists": True, "$nin": [None, ""]}}, {"handled_by": {"$exists": True, "$nin": [None, ""]}},
+                                 {"human_callback_requested": True}, {"transfer_requested": True}, {"transfer_status": {"$in": ["requested", "dialing", "ringing", "connected", "accepted", "completed"]}}]}
+                query = intersect(query, human if filters["handling"] == "human" else {"$nor": [human]})
+            if filters.get("time_from") or filters.get("time_to"):
+                def minute(value, default):
+                    if not value: return default
+                    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                        raise ValueError("Time filters must use HH:MM")
+                    return int(value[:2]) * 60 + int(value[3:])
+                start, end = minute(filters.get("time_from"), 0), minute(filters.get("time_to"), 1439)
+                offset = int(filters.get("tz_offset") or 0)
+                zone = ("+" if offset >= 0 else "-") + f"{abs(offset) // 60:02d}:{abs(offset) % 60:02d}"
+                date = {"$convert": {"input": "$call_date", "to": "date", "onError": None, "onNull": None}}
+                minutes = {"$add": [{"$multiply": [{"$hour": {"date": date, "timezone": zone}}, 60]}, {"$minute": {"date": date, "timezone": zone}}]}
+                time_test = {"$and" if start <= end else "$or": [{"$gte": [minutes, start]}, {"$lte": [minutes, end]}]}
+                query = intersect(query, {"$expr": time_test})
             if filters.get("date_from"):
                 query["call_date"] = {"$gte": datetime.fromisoformat(filters["date_from"])}
             if filters.get("date_to"):
@@ -637,7 +677,11 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
 
         if scope:  # filters such as lead_id must not widen what this user may see
             query = {"$and": [dict(scope), query]}
-        calls = list(mongo_client.calls.find(query, LIST_EXCLUDED_FIELDS if slim else None).sort("call_date", -1).skip(skip).limit(limit))
+        page_query = intersect(query, record_after(after, "call_date")) if after else query
+        calls = list(mongo_client.calls.find(page_query, LIST_EXCLUDED_FIELDS if slim else None).sort([("call_date", -1), ("_id", -1)]).skip(skip).limit(limit + 1))
+        has_more = len(calls) > limit
+        calls = calls[:limit]
+        next_cursor = record_cursor(calls[-1], "call_date") if has_more else None
 
         lead_ids = list({c.get("lead_id") for c in calls if c.get("lead_id")})
         lead_map: Dict[str, Dict[str, Any]] = {}
@@ -681,8 +725,19 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
                 call["phone_number"] = str(call["phone_number"])
 
         total_count = mongo_client.calls.count_documents(query)
+        summary = None
+        if with_summary:
+            rows = list(mongo_client.calls.aggregate([{"$match": query}, {"$group": {"_id": None,
+                "completed": {"$sum": {"$cond": [{"$in": ["$status", ["completed", "ended"]]}, 1, 0]}},
+                "missed": {"$sum": {"$cond": [{"$in": ["$status", ["missed", "failed", "busy", "no-answer", "no_answer", "canceled", "cancelled"]]}, 1, 0]}},
+                "average_duration": {"$avg": "$duration"}}}]))
+            summary = {"total": total_count, **(rows[0] if rows else {"completed": 0, "missed": 0, "average_duration": 0})}
+            summary.pop("_id", None)
 
         return {
+            "summary": summary,
+            "next_cursor": next_cursor,
+            "next_skip": skip + len(calls) if skip + len(calls) < total_count else None,
             "success": True,
             "data": calls,
             "total": total_count,
@@ -690,6 +745,8 @@ def get_calls(filters: Dict[str, Any] = None, limit: int = 50, skip: int = 0, sc
             "skip": skip
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting calls: {e}")
         return {"success": False, "error": str(e)}
@@ -815,9 +872,13 @@ def get_calls_endpoint(
         interest_status: Optional[str] = Query(None),
         date_from: Optional[str] = Query(None),
         date_to: Optional[str] = Query(None),
-        limit: int = Query(50),
-        skip: int = Query(0),
+        limit: int = Query(50, ge=1, le=1000),
+        skip: int = Query(0, ge=0),
         view: Optional[str] = Query(None, description="'list' leaves out transcripts and timings; open a call for them"),
+        search: str = Query("", max_length=200), handling: str = Query("all", pattern="^(all|ai|human)$"),
+        time_from: str = Query("", max_length=5), time_to: str = Query("", max_length=5),
+        tz_offset: int = Query(0, ge=-840, le=840), summary: bool = False,
+        after: str = Query("", max_length=2000),
         user: Dict[str, Any] = Depends(require_user),
 ):
     """Get calls with filters"""
@@ -838,7 +899,8 @@ def get_calls_endpoint(
         if date_to:
             filters["date_to"] = date_to
 
-        result = get_calls(filters, limit, skip, call_scope(user), slim=view == "list")
+        filters.update(search=search, actor=user, handling=handling, time_from=time_from, time_to=time_to, tz_offset=tz_offset)
+        result = get_calls(filters, limit, skip, call_scope(user), slim=view == "list", with_summary=summary, after=after)
 
         if not result.get("success"):
             raise HTTPException(status_code=500, detail=result.get("error", "Failed to get calls"))
@@ -991,23 +1053,5 @@ def get_call_messages(lead_id: str, user: Dict[str, Any] = Depends(require_user)
 
 @router.post("")
 def log_call_endpoint(request: LogCallRequest):
-    """Log a new call"""
-    try:
-        phone_number = request.phone_number
-        lead_id = request.lead_id
-        call_data = request.call_data or {}
-
-        if not phone_number:
-            raise HTTPException(status_code=400, detail="Phone number is required")
-
-        result = log_call(phone_number, lead_id, call_data)
-
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error", "Failed to log call"))
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Provider records are accepted only through verified provider handlers."""
+    raise HTTPException(status_code=403, detail="Call records are written by verified voice providers; manual provider updates are disabled")

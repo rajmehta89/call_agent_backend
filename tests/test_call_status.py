@@ -13,6 +13,7 @@ class FakeCollection:
 
     def update_one(self, query, update, upsert=False):
         self.updates.append(update)
+        return SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
 
 
 def run(monkeypatch, thread_state, verdict):

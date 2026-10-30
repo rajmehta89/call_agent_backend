@@ -25,6 +25,7 @@ from prospect_discovery import discover_prospects, discovery_status, search_loca
 from gmail_service import gmail_service
 from private_email_service import private_email_service
 from mongo_client import mongo_client
+from resource_scopes import lead_scope, call_scope, phone_scope, intersect
 from shopify_service import shopify_service
 from ai_services import AIServices
 from campaign_registry import CAMPAIGN_TYPES, create_campaign, delete_campaign, get_campaigns, update_campaign
@@ -191,7 +192,7 @@ def permissions():
     return {"success": True, "data": {"available": ALL_PERMISSIONS, "roles": ROLE_PERMISSIONS}}
 
 
-@router.get("/audit")
+@router.get("/audit", dependencies=[Depends(require_permission("manage_workspace"))])
 def audit_logs(limit: int = Query(100, ge=1, le=500)):
     _require_db()
     return {"success": True, "data": _serialize(list(mongo_client.audit_logs.find({}).sort("created_at", -1).limit(limit)))}
@@ -228,7 +229,7 @@ def mark_notification_read(notification_id: str, user: Dict[str, Any] = Depends(
     return {"success": True}
 
 
-@router.get("/dashboard")
+@router.get("/dashboard", dependencies=[Depends(require_permission("view_dashboard"))])
 def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = None, channel: Optional[str] = None):
     _require_db()
     calls = _count(mongo_client.calls)
@@ -303,7 +304,7 @@ def dashboard(date_from: Optional[str] = None, date_to: Optional[str] = None, ch
     }}
 
 
-@router.get("/brain")
+@router.get("/brain", dependencies=[Depends(require_permission("manage_data"))])
 def get_brain():
     config = brain_service.brain_config()
     if config.get("index", {}).get("documents_count", 0) == 0 and any(config.get(key) for key in ("company_information", "business_description", "locations", "working_hours", "services", "faqs", "policies", "website_content", "custom_knowledge")):
@@ -346,7 +347,7 @@ async def upload_brain_source(file: UploadFile = File(...)):
     if suffix != ".pdf":
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
     try:
-        result = brain_service.ingest_pdf(content, file.filename)
+        result = await __import__("asyncio").to_thread(brain_service.ingest_pdf, content, file.filename)
         return {"success": True, "data": result}
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -386,7 +387,7 @@ def resync_brain_source(source_id: str):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.get("/brain/sources")
+@router.get("/brain/sources", dependencies=[Depends(require_permission("manage_data"))])
 def get_brain_sources():
     return {"success": True, "data": brain_service.source_list()}
 
@@ -419,22 +420,22 @@ def update_channel_agent(channel: str, payload: ValuePayload, user: Dict[str, An
     return {"success": True, "data": _serialize(stored)}
 
 
-@router.get("/tools")
+@router.get("/tools", dependencies=[Depends(require_permission("manage_integrations"))])
 def get_tools():
     return {"success": True, "data": brain_service.tools()}
 
 
-@router.get("/gmail/status")
+@router.get("/gmail/status", dependencies=[Depends(require_permission("manage_integrations"))])
 def get_gmail_status():
     return {"success": True, "data": gmail_service.status()}
 
 
-@router.get("/private-email/status")
+@router.get("/private-email/status", dependencies=[Depends(require_permission("manage_integrations"))])
 def get_private_email_status():
     return {"success": True, "data": private_email_service.status()}
 
 
-@router.post("/private-email/verify")
+@router.post("/private-email/verify", dependencies=[Depends(require_permission("manage_integrations"))])
 def verify_private_email(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     if not private_email_service.configured:
         raise HTTPException(status_code=409, detail="Set PRIVATE_EMAIL_PASSWORD on the backend first")
@@ -446,7 +447,7 @@ def verify_private_email(user: Dict[str, Any] = Depends(require_permission("mana
     return {"success": True, "data": {"verified": True, "address": private_email_service.address}}
 
 
-@router.get("/private-email/inbox")
+@router.get("/private-email/inbox", dependencies=[Depends(require_permission("manage_integrations"))])
 def get_private_email_inbox(user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     if not private_email_service.configured:
         raise HTTPException(status_code=409, detail="Set PRIVATE_EMAIL_PASSWORD on the backend first")
@@ -458,37 +459,37 @@ def get_private_email_inbox(user: Dict[str, Any] = Depends(require_permission("m
     return {"success": True, "data": messages}
 
 
-@router.get("/email-policy")
+@router.get("/email-policy", dependencies=[Depends(require_permission("manage_automations"))])
 def get_email_policy_route():
     policy = get_email_policy()
     return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
 
 
-@router.put("/email-policy")
+@router.put("/email-policy", dependencies=[Depends(require_permission("manage_automations"))])
 def update_email_policy(payload: ValuePayload):
     policy = save_email_policy(payload.value)
     _audit("update", "email_policy", after=policy)
     return {"success": True, "data": {**policy, "approval_window_open": approval_window_open(policy), "send_window_open": send_window_open(policy)}}
 
 
-@router.get("/email-campaign")
+@router.get("/email-campaign", dependencies=[Depends(require_permission("manage_automations"))])
 def get_email_campaign_route():
     return {"success": True, "data": campaign_status()}
 
 
-@router.get("/campaigns")
+@router.get("/campaigns", dependencies=[Depends(require_permission("manage_automations"))])
 def get_campaign_registry_route():
     return {"success": True, "data": {"campaigns": get_campaigns(), "types": CAMPAIGN_TYPES}}
 
 
-@router.post("/campaigns")
+@router.post("/campaigns", dependencies=[Depends(require_permission("manage_automations"))])
 def create_campaign_route(payload: ValuePayload):
     campaign = create_campaign(payload.value)
     _audit("create", "campaign", after=campaign)
     return {"success": True, "data": campaign}
 
 
-@router.put("/campaigns/{campaign_id}")
+@router.put("/campaigns/{campaign_id}", dependencies=[Depends(require_permission("manage_automations"))])
 def update_campaign_route(campaign_id: str, payload: ValuePayload):
     try:
         campaign = update_campaign(campaign_id, payload.value)
@@ -498,7 +499,7 @@ def update_campaign_route(campaign_id: str, payload: ValuePayload):
     return {"success": True, "data": campaign}
 
 
-@router.post("/campaigns/{campaign_id}/scrape")
+@router.post("/campaigns/{campaign_id}/scrape", dependencies=[Depends(require_permission("manage_automations"))])
 def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
     campaigns = get_campaigns()
     campaign = next((item for item in campaigns if item["id"] == campaign_id), None)
@@ -536,7 +537,7 @@ def scrape_campaign_route(campaign_id: str, payload: ValuePayload):
     return {"success": True, "data": {"campaign": updated, "result": result}}
 
 
-@router.delete("/campaigns/{campaign_id}")
+@router.delete("/campaigns/{campaign_id}", dependencies=[Depends(require_permission("manage_automations"))])
 def delete_campaign_route(campaign_id: str):
     try:
         delete_campaign(campaign_id)
@@ -546,14 +547,14 @@ def delete_campaign_route(campaign_id: str):
     return {"success": True, "data": {"id": campaign_id}}
 
 
-@router.put("/email-campaign")
+@router.put("/email-campaign", dependencies=[Depends(require_permission("manage_automations"))])
 def update_email_campaign(payload: ValuePayload):
     campaign = save_email_campaign(payload.value)
     _audit("update", "email_campaign", after=campaign)
     return {"success": True, "data": campaign_status()}
 
 
-@router.post("/email-campaign/action")
+@router.post("/email-campaign/action", dependencies=[Depends(require_permission("manage_automations"))])
 def email_campaign_action(payload: ValuePayload):
     try:
         campaign = campaign_action(str(payload.value.get("action", "")))
@@ -564,12 +565,12 @@ def email_campaign_action(payload: ValuePayload):
     return {"success": True, "data": {**campaign_status(), "processed": processed}}
 
 
-@router.get("/email-templates")
+@router.get("/email-templates", dependencies=[Depends(require_permission("manage_automations"))])
 def get_email_templates_route():
     return {"success": True, "data": get_email_templates()}
 
 
-@router.post("/email-templates")
+@router.post("/email-templates", dependencies=[Depends(require_permission("manage_automations"))])
 def create_email_template(payload: EmailTemplatePayload):
     if not payload.name.strip() or not payload.subject.strip() or not payload.body.strip():
         raise HTTPException(status_code=400, detail="Template name, subject, and body are required")
@@ -578,7 +579,7 @@ def create_email_template(payload: EmailTemplatePayload):
     return {"success": True, "data": template}
 
 
-@router.post("/email-templates/review")
+@router.post("/email-templates/review", dependencies=[Depends(require_permission("manage_automations"))])
 def review_email_template(payload: ValuePayload):
     name = str(payload.value.get("name") or "Custom outreach template").strip()
     subject = str(payload.value.get("subject") or "").strip()
@@ -654,12 +655,12 @@ def review_email_template(payload: ValuePayload):
     return {"success": True, "data": {"subject": subject, "body": body, "suggestions": suggestions or ["The template is ready; review the personalized draft before sending."]}}
 
 
-@router.get("/prospects/discovery-status")
+@router.get("/prospects/discovery-status", dependencies=[Depends(require_permission("manage_automations"))])
 def get_prospect_discovery_status():
     return {"success": True, "data": discovery_status()}
 
 
-@router.get("/campaign-locations")
+@router.get("/campaign-locations", dependencies=[Depends(require_permission("manage_automations"))])
 def search_campaign_locations(query: str = Query("", min_length=0, max_length=120)):
     try:
         return {"success": True, "data": search_locations(query)}
@@ -667,13 +668,13 @@ def search_campaign_locations(query: str = Query("", min_length=0, max_length=12
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/prospects")
+@router.get("/prospects", dependencies=[Depends(require_permission("manage_automations"))])
 def get_campaign_prospects(limit: int = Query(100, ge=1, le=500)):
     _require_db()
     return {"success": True, "data": _serialize(list(mongo_client.campaign_prospects.find({}).sort("created_at", -1).limit(limit)))}
 
 
-@router.post("/prospects/discover")
+@router.post("/prospects/discover", dependencies=[Depends(require_permission("manage_automations"))])
 def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
     try:
         return {"success": True, "data": discover_prospects(payload.query, payload.location, payload.max_results, payload.create_drafts, campaign_goal=payload.campaign_goal, shared_context=payload.shared_context, template_id=payload.template_id)}
@@ -685,7 +686,7 @@ def discover_campaign_prospects(payload: ProspectDiscoveryPayload):
         raise HTTPException(status_code=502, detail=f"Prospect discovery failed: {exc}") from exc
 
 
-@router.get("/email-outbox")
+@router.get("/email-outbox", dependencies=[Depends(require_permission("manage_automations"))])
 def get_email_outbox(status: str = "", campaign_name: str = "", limit: int = Query(200, ge=1, le=1000)):
     _require_db()
     query: Dict[str, Any] = {}
@@ -702,7 +703,7 @@ def get_email_outbox(status: str = "", campaign_name: str = "", limit: int = Que
     return {"success": True, "data": _serialize(rows)}
 
 
-@router.get("/dubai-prospects/summary")
+@router.get("/dubai-prospects/summary", dependencies=[Depends(require_permission("manage_automations"))])
 def get_dubai_prospects_summary():
     _require_db()
     prospects = mongo_client.db["dubai_prospect_review"]
@@ -715,7 +716,7 @@ def get_dubai_prospects_summary():
     }}
 
 
-@router.get("/dubai-prospects")
+@router.get("/dubai-prospects", dependencies=[Depends(require_permission("manage_automations"))])
 def list_dubai_prospects(search: str = "", offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
     _require_db()
     query: Dict[str, Any] = {"review_status": "needs_verification"}
@@ -728,7 +729,7 @@ def list_dubai_prospects(search: str = "", offset: int = Query(0, ge=0), limit: 
     return {"success": True, "data": {"items": _serialize(rows), "total": collection.count_documents(query)}}
 
 
-@router.post("/dubai-prospects/discover")
+@router.post("/dubai-prospects/discover", dependencies=[Depends(require_permission("manage_automations"))])
 def discover_dubai_prospects(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     """Find additional Dubai businesses and stage only owner-reviewed drafts."""
     query = str(payload.value.get("query") or "businesses").strip()
@@ -780,7 +781,7 @@ def _dubai_email_copy(prospect: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-@router.post("/dubai-prospects/{lead_id}/draft")
+@router.post("/dubai-prospects/{lead_id}/draft", dependencies=[Depends(require_permission("manage_automations"))])
 def prepare_dubai_prospect_draft(lead_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     _require_db()
     prospects = mongo_client.db["dubai_prospect_review"]
@@ -819,7 +820,7 @@ def prepare_dubai_prospect_draft(lead_id: str, payload: ValuePayload, user: Dict
     return {"success": True, "data": {"id": str(result.inserted_id), "status": "awaiting_owner_review"}}
 
 
-@router.post("/email-outbox/notify")
+@router.post("/email-outbox/notify", dependencies=[Depends(require_permission("manage_automations"))])
 def notify_email_outbox(payload: ValuePayload):
     """Send the owner a review digest; it never approves or sends prospect emails."""
     _require_db()
@@ -868,7 +869,7 @@ def notify_email_outbox(payload: ValuePayload):
     return {"success": True, "data": {"status": "sent", "recipient": owner_email, "count": len(drafts)}}
 
 
-@router.post("/email-outbox")
+@router.post("/email-outbox", dependencies=[Depends(require_permission("manage_automations"))])
 def create_email_draft(payload: EmailDraftPayload):
     _require_db()
     company = payload.company_name.strip()
@@ -936,7 +937,7 @@ def create_email_draft(payload: EmailDraftPayload):
     return {"success": True, "data": _serialize(data)}
 
 
-@router.post("/email-outbox/context-preview")
+@router.post("/email-outbox/context-preview", dependencies=[Depends(require_permission("manage_automations"))])
 def generate_email_context(payload: ValuePayload):
     company = str(payload.value.get("company_name") or "").strip()
     website = str(payload.value.get("website") or "").strip()
@@ -965,7 +966,7 @@ def generate_email_context(payload: ValuePayload):
     return {"success": True, "data": {"context": str(context).strip()}}
 
 
-@router.put("/email-outbox/{draft_id}/copy")
+@router.put("/email-outbox/{draft_id}/copy", dependencies=[Depends(require_permission("manage_automations"))])
 def update_email_draft_copy(draft_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     _require_db()
     if not ObjectId.is_valid(draft_id):
@@ -983,7 +984,7 @@ def update_email_draft_copy(draft_id: str, payload: ValuePayload, user: Dict[str
     return {"success": True, "data": {"id": draft_id, "subject": subject, "body": body}}
 
 
-@router.put("/email-outbox/bulk-decision")
+@router.put("/email-outbox/bulk-decision", dependencies=[Depends(require_permission("manage_automations"))])
 def decide_email_drafts_bulk(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     """Approve or exclude a bounded set of already prepared drafts.
 
@@ -1051,7 +1052,7 @@ def decide_email_drafts_bulk(payload: ValuePayload, user: Dict[str, Any] = Depen
     }}
 
 
-@router.put("/email-outbox/{draft_id}/decision")
+@router.put("/email-outbox/{draft_id}/decision", dependencies=[Depends(require_permission("manage_automations"))])
 def decide_email_draft(draft_id: str, payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_automations"))):
     _require_db()
     if not ObjectId.is_valid(draft_id):
@@ -1094,7 +1095,7 @@ def decide_email_draft(draft_id: str, payload: ValuePayload, user: Dict[str, Any
     return {"success": True, "data": {"status": status, "id": draft_id, "processed": process_result}}
 
 
-@router.put("/tools")
+@router.put("/tools", dependencies=[Depends(require_permission("manage_integrations"))])
 def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     tools = {**DEFAULT_TOOLS, **{key: bool(value) for key, value in payload.value.items() if key in DEFAULT_TOOLS}}
     stored = _upsert_setting("ai_tools", tools)
@@ -1102,8 +1103,8 @@ def update_tools(payload: ValuePayload, user: Dict[str, Any] = Depends(require_p
     return {"success": True, "data": _serialize(stored)}
 
 
-@router.get("/activity")
-def get_activity(search: str = "", channel: str = "", success: Optional[bool] = None, limit: int = Query(100, ge=1, le=500)):
+@router.get("/activity", dependencies=[Depends(require_permission("view_analytics"))])
+def get_activity(search: str = "", channel: str = "", success: Optional[bool] = None, limit: int = Query(100, ge=1, le=500), user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     query: Dict[str, Any] = {}
     if channel:
@@ -1112,6 +1113,7 @@ def get_activity(search: str = "", channel: str = "", success: Optional[bool] = 
         query["success"] = success
     if search:
         query["$or"] = [{"request": {"$regex": search, "$options": "i"}}, {"response": {"$regex": search, "$options": "i"}}, {"customer_phone": {"$regex": search, "$options": "i"}}]
+    query = intersect(query, phone_scope(user, mongo_client, "customer_phone"))
     rows = list(mongo_client.ai_activity.find(query).sort("created_at", -1).limit(limit))
     total = mongo_client.ai_activity.count_documents(query)
     success_count = mongo_client.ai_activity.count_documents({**query, "success": True})
@@ -1120,19 +1122,20 @@ def get_activity(search: str = "", channel: str = "", success: Optional[bool] = 
     return {"success": True, "data": _serialize(rows), "total": total, "stats": {"total": total, "success": success_count, "errors": error_count, "average_latency_ms": round(latency[0].get("average", 0), 1) if latency else 0}}
 
 
-@router.get("/customers")
-def get_customers(search: str = "", status: str = "", limit: int = Query(100, ge=1, le=500)):
+@router.get("/customers", dependencies=[Depends(require_permission("view_customers"))])
+def get_customers(search: str = "", status: str = "", limit: int = Query(100, ge=1, le=500), user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     query: Dict[str, Any] = {}
     if search:
         query["$or"] = [{field: {"$regex": search, "$options": "i"}} for field in ("name", "phone", "email")]
     if status:
         query["lead_status"] = status
+    query = intersect(query, phone_scope(user, mongo_client))
     rows = list(mongo_client.customers.find(query).sort("updated_at", -1).limit(limit))
     return {"success": True, "data": _serialize(rows), "total": mongo_client.customers.count_documents(query)}
 
 
-@router.post("/customers")
+@router.post("/customers", dependencies=[Depends(require_permission("manage_leads"))])
 def create_customer(payload: CustomerPayload):
     _require_db()
     now = datetime.utcnow()
@@ -1143,32 +1146,33 @@ def create_customer(payload: CustomerPayload):
     return {"success": True, "data": _serialize(data)}
 
 
-@router.get("/customers/{customer_id}")
-def get_customer(customer_id: str):
+@router.get("/customers/{customer_id}", dependencies=[Depends(require_permission("view_customers"))])
+def get_customer(customer_id: str, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     try:
-        customer = mongo_client.customers.find_one({"_id": ObjectId(customer_id)})
+        customer = mongo_client.customers.find_one(intersect({"_id": ObjectId(customer_id)}, phone_scope(user, mongo_client)))
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid customer id") from exc
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
     phone = customer.get("phone")
     detail = _serialize(customer)
-    detail["whatsapp"] = _serialize(list(mongo_client.whatsapp_conversations.find({"customer_phone": phone}).sort("updated_at", -1)))
-    detail["calls"] = _serialize(list(mongo_client.calls.find({"phone_number": phone}).sort("call_date", -1)))
-    detail["ai_activity"] = _serialize(list(mongo_client.ai_activity.find({"customer_phone": phone}).sort("created_at", -1).limit(50)))
-    detail["lead"] = _serialize(mongo_client.leads.find_one({"phone": phone}))
+    detail["whatsapp"] = _serialize(list(mongo_client.whatsapp_conversations.find({"customer_phone": phone}).sort("updated_at", -1))) if has_permission(user, "manage_workspace") else []
+    detail["calls"] = _serialize(list(mongo_client.calls.find(intersect({"phone_number": phone}, call_scope(user, mongo_client))).sort("call_date", -1)))
+    detail["ai_activity"] = _serialize(list(mongo_client.ai_activity.find({"customer_phone": phone}).sort("created_at", -1).limit(50))) if has_permission(user, "view_analytics") else []
+    detail["lead"] = _serialize(mongo_client.leads.find_one(intersect({"phone": phone}, lead_scope(user))))
     return {"success": True, "data": detail}
 
 
-@router.put("/customers/{customer_id}")
-def update_customer(customer_id: str, payload: ValuePayload):
+@router.put("/customers/{customer_id}", dependencies=[Depends(require_permission("manage_leads"))])
+def update_customer(customer_id: str, payload: CustomerPayload, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
-    mongo_client.customers.update_one({"_id": ObjectId(customer_id)}, {"$set": {**payload.value, "updated_at": datetime.utcnow()}})
-    return get_customer(customer_id)
+    get_customer(customer_id, user)  # enforce visibility before mutating
+    mongo_client.customers.update_one({"_id": ObjectId(customer_id)}, {"$set": {**payload.model_dump(exclude_unset=True), "updated_at": datetime.utcnow()}})
+    return get_customer(customer_id, user)
 
 
-@router.get("/automations")
+@router.get("/automations", dependencies=[Depends(require_permission("manage_automations"))])
 def get_automations():
     _require_db()
     rows = list(mongo_client.automations.find({}).sort("updated_at", -1))
@@ -1181,14 +1185,14 @@ def get_automations():
     return {"success": True, "data": data}
 
 
-@router.get("/automations/runs")
+@router.get("/automations/runs", dependencies=[Depends(require_permission("manage_automations"))])
 def get_automation_runs(limit: int = Query(50, ge=1, le=200)):
     _require_db()
     rows = list(mongo_client.automation_runs.find({}).sort("created_at", -1).limit(limit))
     return {"success": True, "data": _serialize(rows)}
 
 
-@router.post("/automations")
+@router.post("/automations", dependencies=[Depends(require_permission("manage_automations"))])
 def create_automation(payload: AutomationPayload):
     _require_db()
     now = datetime.utcnow()
@@ -1199,9 +1203,12 @@ def create_automation(payload: AutomationPayload):
     return {"success": True, "data": _serialize(data)}
 
 
-@router.put("/automations/{automation_id}")
+@router.put("/automations/{automation_id}", dependencies=[Depends(require_permission("manage_automations"))])
 def update_automation(automation_id: str, payload: ValuePayload):
     _require_db()
+    allowed = set(AutomationPayload.model_fields)
+    if set(payload.value) - allowed:
+        raise HTTPException(status_code=400, detail="Unknown automation fields")
     mongo_client.automations.update_one({"_id": ObjectId(automation_id)}, {"$set": {**payload.value, "updated_at": datetime.utcnow()}, "$inc": {"version": 1}})
     row = mongo_client.automations.find_one({"_id": ObjectId(automation_id)})
     return {"success": True, "data": _serialize(row)}
@@ -1467,44 +1474,53 @@ def get_invitations(user: Dict[str, Any] = Depends(require_permission("manage_te
     return {"success": True, "data": _serialize([_team_row(row) for row in rows])}
 
 
-@router.get("/settings")
+@router.get("/settings", dependencies=[Depends(require_permission("manage_workspace"))])
 def get_settings():
     defaults = {"business": {}, "ai": {"default_model": os.getenv("OPENAI_MODEL", "")}, "notifications": {}, "security": {}, "billing": {"plan": "Development"}}
     stored = brain_service._setting("workspace_settings", {})
     return {"success": True, "data": {**defaults, **stored}}
 
 
-@router.put("/settings")
+@router.put("/settings", dependencies=[Depends(require_permission("manage_workspace"))])
 def update_settings(payload: ValuePayload):
+    if set(payload.value) - {"business", "ai", "notifications", "security"}:
+        raise HTTPException(status_code=400, detail="Unknown or read-only workspace setting")
     stored = _upsert_setting("workspace_settings", payload.value)
     _audit("update", "workspace_settings", after=payload.value)
     return {"success": True, "data": _serialize(stored)}
 
 
 @router.get("/search")
-def global_search(q: str = Query(..., min_length=2)):
+def global_search(q: str = Query(..., min_length=2, max_length=200), user: Dict[str, Any] = Depends(require_user)):
     _require_db()
-    regex = {"$regex": q, "$options": "i"}
-    customers = list(mongo_client.customers.find({"$or": [{"name": regex}, {"phone": regex}, {"email": regex}]}).limit(10))
-    leads = list(mongo_client.leads.find({"$or": [{"name": regex}, {"phone": regex}, {"email": regex}, {"notes": regex}]}).limit(10))
-    conversations = list(mongo_client.whatsapp_conversations.find({"$or": [{"customer_name": regex}, {"customer_phone": regex}, {"last_message": regex}]}).limit(10))
-    calls = list(mongo_client.calls.find({"$or": [{"phone_number": regex}, {"call_summary": regex}]}).limit(10))
+    regex = {"$regex": re.escape(q), "$options": "i"}
+    query = {"$or": [{"name": regex}, {"phone": regex}, {"email": regex}]}
+    customers = list(mongo_client.customers.find(intersect(query, phone_scope(user, mongo_client))).limit(10)) if has_permission(user, "view_customers") else []
+    leads = list(mongo_client.leads.find(intersect({"$or": [*query["$or"], {"notes": regex}]}, lead_scope(user))).limit(10)) if has_permission(user, "manage_assigned_leads") else []
+    conversations = list(mongo_client.whatsapp_conversations.find({"$or": [{"customer_name": regex}, {"customer_phone": regex}, {"last_message": regex}]}).limit(10)) if has_permission(user, "manage_workspace") else []
+    calls = list(mongo_client.calls.find(intersect({"$or": [{"phone_number": regex}, {"call_summary": regex}]}, call_scope(user, mongo_client))).limit(10)) if has_permission(user, "handle_calls") else []
     return {"success": True, "data": _serialize({"customers": customers, "leads": leads, "conversations": conversations, "calls": calls})}
 
 
-@router.get("/export/{resource}.csv")
-def export_csv(resource: str):
+@router.get("/export/{resource}.csv", dependencies=[Depends(require_permission("export_data"))])
+def export_csv(resource: str, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     collections = {"customers": mongo_client.customers, "leads": mongo_client.leads, "calls": mongo_client.calls, "activity": mongo_client.ai_activity, "automations": mongo_client.automations}
     collection = collections.get(resource)
     if collection is None:
         raise HTTPException(status_code=404, detail="Unknown export resource")
-    rows = [_serialize(row) for row in collection.find({}).limit(10000)]
+    scopes = {"customers": lambda: phone_scope(user, mongo_client), "leads": lambda: lead_scope(user),
+              "calls": lambda: call_scope(user, mongo_client), "activity": lambda: phone_scope(user, mongo_client, "customer_phone")}
+    required = {"customers": "view_customers", "leads": "manage_assigned_leads", "calls": "handle_calls", "activity": "view_analytics", "automations": "manage_automations"}
+    if not has_permission(user, required[resource]):
+        raise HTTPException(status_code=403, detail="Permission required for this export")
+    rows = [_serialize(row) for row in collection.find(scopes[resource]() if resource in scopes else {}).limit(10000)]
     fields = sorted({key for row in rows for key in row.keys() if not isinstance(row.get(key), (dict, list))}) or ["id"]
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(rows)
+    for row in rows:
+        writer.writerow({key: ("\'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")) else value) for key, value in row.items()})
     response = StreamingResponse(iter([output.getvalue()]), media_type="text/csv")
     response.headers["Content-Disposition"] = f'attachment; filename="{resource}.csv"'
     return response

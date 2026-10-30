@@ -155,6 +155,13 @@ app.include_router(realtime.router)
 
 
 @app.on_event("startup")
+async def check_voice_security() -> None:
+    import asyncio
+    from twilio_security import validate_production_voice_security
+    await asyncio.to_thread(validate_production_voice_security)
+
+
+@app.on_event("startup")
 async def watch_event_loop() -> None:
     """Log and keep what holds up the event loop during calls (loop_watch.py)."""
     import loop_watch
@@ -250,6 +257,9 @@ async def warm_local_embeddings() -> None:
         try:
             import live_transcript
             live_transcript.close_orphaned_calls()  # custom-pipeline calls cut off by the restart
+            from thread_summaries import ensure_summaries
+            if __import__("mongo_client").mongo_client.is_connected():
+                ensure_summaries()  # stream/backfill complete history before serving Inbox work
             from voice_provider_settings import provider_snapshot
             provider_snapshot()  # which voice provider is on: read once now, not while a call is starting
             from voice_turns import regions_where_valid

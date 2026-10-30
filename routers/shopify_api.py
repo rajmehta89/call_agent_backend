@@ -62,7 +62,7 @@ _apply_saved_shopify_config()
 
 
 @router.get("/status")
-async def shopify_status(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_status(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _apply_saved_shopify_config()
     saved = (mongo_client.platform_settings.find_one({"key": "shopify"}) or {}).get("value", {}) if mongo_client.is_connected() else {}
     data = {**shopify_service.status(), "oauth_redirect_uri": _oauth_redirect_uri(), "connected_via": saved.get("connected_via"),
@@ -79,20 +79,32 @@ async def shopify_status(user: Dict[str, Any] = Depends(require_permission("mana
 
 
 @router.put("/configure")
-async def configure_shopify(payload: ShopifyConfigPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def configure_shopify(payload: ShopifyConfigPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _require_db()
+    try:
+        domain = normalize_store_domain(payload.store_domain)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if not domain or payload.auth_mode not in {"admin_token", "client_credentials"}:
+        raise HTTPException(status_code=400, detail="Choose a Shopify store and a supported authentication mode")
     before = shopify_service.status()
     saved = mongo_client.platform_settings.find_one({"key": "shopify"}) or {}
     saved_values = saved.get("value", {}) if saved else {}
-    # Blank secret fields keep what is already saved, so the form never has to show secrets again.
+    # Secrets belong to one store. A host change requires fresh authorization.
+    same_store = domain == normalize_store_domain(saved_values.get("store_domain") or shopify_service.store_domain)
     if payload.auth_mode == "admin_token":
-        token = payload.access_token.strip() or decrypt_secret(str(saved_values.get("access_token") or ""))
+        token = payload.access_token.strip() or (decrypt_secret(str(saved_values.get("access_token") or "")) if same_store else "")
         client_id = client_secret = ""
     else:
         token = ""
-        client_id = payload.client_id.strip() or str(saved_values.get("client_id") or "")
-        client_secret = payload.client_secret.strip() or decrypt_secret(str(saved_values.get("client_secret") or ""))
-    shopify_service.configure(payload.store_domain.strip(), token, payload.api_version.strip() or "2025-10", client_id=client_id, client_secret=client_secret)
+        client_id = payload.client_id.strip() or (str(saved_values.get("client_id") or "") if same_store else "")
+        client_secret = payload.client_secret.strip() or (decrypt_secret(str(saved_values.get("client_secret") or "")) if same_store else "")
+    if not token and not (client_id and client_secret):
+        raise HTTPException(status_code=400, detail="Enter credentials for this store or connect with Shopify")
+    try:
+        shopify_service.configure(domain, token, payload.api_version.strip() or "2025-10", client_id=client_id, client_secret=client_secret)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     stored = {"store_domain": shopify_service.store_domain, "access_token": encrypt_secret(token), "client_id": client_id, "client_secret": encrypt_secret(client_secret), "api_version": shopify_service.api_version}
     _upsert_setting("shopify", stored)
     data = shopify_service.status()
@@ -108,7 +120,7 @@ async def configure_shopify(payload: ShopifyConfigPayload, user: Dict[str, Any] 
 
 
 @router.get("/scopes")
-async def shopify_scopes(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_scopes(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     if not shopify_service.configured:
         return {"success": True, "data": {"granted": [], "required": ["read_products", "read_inventory"]}}
     try:
@@ -121,7 +133,7 @@ async def shopify_scopes(user: Dict[str, Any] = Depends(require_permission("mana
 
 
 @router.get("/products")
-async def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     try:
         return {"success": True, "data": shopify_service.products(search, limit)}
     except Exception as exc:
@@ -129,7 +141,7 @@ async def shopify_products(search: str = "", limit: int = Query(25, ge=1, le=100
 
 
 @router.get("/orders")
-async def shopify_orders(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_orders(search: str = "", limit: int = Query(25, ge=1, le=100), user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     try:
         # Emails and phones on an order are only for verifying callers inside the backend; never sent to the browser.
         return {"success": True, "data": [{key: value for key, value in order.items() if not key.startswith("_")} for order in shopify_service.orders(search, limit)]}
@@ -165,7 +177,7 @@ class ShopifyConnectPayload(BaseModel):
 
 
 @router.post("/oauth/start")
-async def shopify_oauth_start(payload: ShopifyConnectPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_oauth_start(payload: ShopifyConnectPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     """Step 1 of "Connect with Shopify": the store owner approves the app in Shopify, which works whichever Shopify
     organization the app belongs to (the Client ID + secret method needs app and store in the same one)."""
     _require_db()
@@ -191,7 +203,7 @@ async def shopify_oauth_start(payload: ShopifyConnectPayload, user: Dict[str, An
 
 
 @public_router.get("/oauth/callback")
-async def shopify_oauth_callback(request: Request):
+def shopify_oauth_callback(request: Request):
     """Step 2: Shopify sends the browser here with a one-time code; check it really came from Shopify (HMAC with the
     app secret, the state we issued) and swap it for a permanent store access token."""
     params = dict(urllib.parse.parse_qsl(request.url.query, keep_blank_values=True))
@@ -240,12 +252,12 @@ def _store_read(read, *args):
 
 
 @router.get("/overview")
-async def shopify_overview(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_overview(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return _store_read(shopify_service.overview)
 
 
 @router.get("/catalog")
-async def shopify_catalog(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_catalog(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return _store_read(shopify_service.catalog, search.strip()[:200], after[:400])
 
 
@@ -255,7 +267,7 @@ def _public_order(order: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/order-list")
-async def shopify_order_list(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_order_list(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     """Orders for the Store data page: one order by number when searching, else a page of the newest."""
     def read() -> Dict[str, Any]:
         if search.strip():
@@ -266,18 +278,18 @@ async def shopify_order_list(search: str = "", after: str = "", user: Dict[str, 
 
 
 @router.get("/customers")
-async def shopify_customers(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_customers(search: str = "", after: str = "", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return _store_read(shopify_service.customer_list, search.strip()[:200], after[:400])
 
 
 @router.get("/health")
-async def shopify_catalog_health(refresh: bool = False, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_catalog_health(refresh: bool = False, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     """Products with problems that make the AI's answers weak or wrong, each with its Shopify admin link."""
     return _store_read(shopify_service.catalog_health, refresh)
 
 
 @router.get("/policies")
-async def shopify_policies(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_policies(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return _store_read(shopify_service.policies)
 
 
@@ -287,7 +299,7 @@ class ShopifyAskPayload(BaseModel):
 
 
 @router.post("/ask")
-async def shopify_ask(payload: ShopifyAskPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_ask(payload: ShopifyAskPayload, user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     """What the AI would get from the store for a caller's question (and caller ID): the same lookup as on a call."""
     from brain_service import brain_service
     question = payload.question.strip()[:500]
@@ -302,7 +314,7 @@ async def shopify_ask(payload: ShopifyAskPayload, user: Dict[str, Any] = Depends
 
 
 @router.post("/sync")
-async def shopify_sync(scope: str = "all", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def shopify_sync(scope: str = "all", user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     _require_db()
     if not shopify_service.configured:
         raise HTTPException(status_code=400, detail="Shopify is not configured")

@@ -38,6 +38,7 @@ import live_transcript
 import realtime
 from auth_service import can_assign_conversations, has_permission, require_permission, require_user
 from mongo_client import mongo_client
+from list_paging import thread_cursor, cursor_position
 from routers.calls_api import caller_identity
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,6 @@ FAILED_STATUSES = {"failed", "busy", "no-answer", "no_answer", "canceled", "canc
 LIVE_WINDOW = timedelta(minutes=3)
 LIST_FIELDS = {"phone_number": 1, "lead_id": 1, "status": 1, "call_date": 1, "created_at": 1, "updated_at": 1, "call_summary": 1, "human_summary": 1,
                "provider": 1, "channel_type": 1, "call_session_id": 1, "messages": {"$slice": -1}, "ai_responses": {"$slice": -1}}
-MAX_CALLS_SCANNED = 3000
 
 
 def _full_call_summary(call: Dict[str, Any]) -> str:
@@ -112,7 +112,7 @@ def _serialize(value: Any) -> Any:
     if isinstance(value, ObjectId):
         return str(value)
     if isinstance(value, datetime):
-        return value.isoformat() + "Z"
+        return _utc(value).isoformat() + "Z"
     if isinstance(value, list):
         return [_serialize(item) for item in value]
     if isinstance(value, dict):
@@ -173,8 +173,8 @@ def _when(call: Dict[str, Any]) -> datetime:
 
 
 def _utc(value: datetime) -> datetime:
-    """Call, lead and customer times are stored in UTC (timeutil; older rows moved by scripts/migrate_times_to_utc.py)."""
-    return value
+    """Normalize both PyMongo's naive UTC and timezone-aware provider timestamps."""
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
 def _when_param(value: str, name: str) -> datetime | None:
@@ -195,7 +195,7 @@ def _event(key: str, kind: str, user: Dict[str, Any], text: str) -> None:
 
 def _is_live(call: Dict[str, Any]) -> bool:
     updated = call.get("updated_at")
-    return str(call.get("status", "")).lower() == live_transcript.LIVE_STATUS and isinstance(updated, datetime) and utc_now() - updated < LIVE_WINDOW
+    return str(call.get("status", "")).lower() == live_transcript.LIVE_STATUS and isinstance(updated, datetime) and _utc(utc_now()) - _utc(updated) < LIVE_WINDOW
 
 
 def _call_messages(call: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -256,20 +256,20 @@ def _threads() -> List[Dict[str, Any]]:
 
 
 def _build_threads() -> List[Dict[str, Any]]:
-    calls = list(mongo_client.calls.find({"direction": {"$ne": "outbound"}}, LIST_FIELDS).sort("call_date", -1).limit(MAX_CALLS_SCANNED))
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for call in calls:
-        grouped.setdefault(_thread_key(call), []).append(call)
-
-    lead_ids = {ObjectId(str(call["lead_id"])) for call in calls if call.get("lead_id") and ObjectId.is_valid(str(call["lead_id"]))}
+    from thread_summaries import ensure_summaries
+    ensure_summaries()
+    states = {state["_id"]: state for state in mongo_client.inbox_threads.find({"call_summary_cache": {"$exists": True}})}
+    grouped = {key: [state["call_summary_cache"]["latest"]] for key, state in states.items()}
+    lead_ids = {ObjectId(str(state["call_summary_cache"]["lead_id"])) for state in states.values()
+                if state["call_summary_cache"].get("lead_id") and ObjectId.is_valid(str(state["call_summary_cache"]["lead_id"]))}
     leads = {str(lead["_id"]): lead for lead in mongo_client.leads.find({"_id": {"$in": list(lead_ids)}}, {"name": 1, "company": 1, "phone": 1})} if lead_ids else {}
-    states = {state["_id"]: state for state in mongo_client.inbox_threads.find({"_id": {"$in": list(grouped)}})}
     owners = _browser_owner_names()
 
     threads = []
     for key, items in grouped.items():
         latest = max(items, key=_when)
-        lead = next((leads.get(str(call.get("lead_id"))) for call in items if leads.get(str(call.get("lead_id")))), None)
+        cached = states[key]["call_summary_cache"]
+        lead = leads.get(str(cached.get("lead_id")))
         lead_phone = str((lead or {}).get("phone") or "").strip()
         display_phone = lead_phone if lead_phone and not lead_phone.startswith(("client:", "web:")) else caller_identity(latest.get("phone_number") or "")
         last_line = (latest.get("messages") or [{}])[-1].get("text") or (latest.get("ai_responses") or [{}])[-1].get("content") or ""
@@ -279,18 +279,16 @@ def _build_threads() -> List[Dict[str, Any]]:
         threads.append({
             "key": key, "name": _display_name(key, lead, owners), "phone": display_phone,
             # Closing lasts until the caller calls again (a newer call reopens it), like Podium.
-            "closed": isinstance(closed_at, datetime) and last_at <= closed_at, "closed_by_name": state.get("closed_by_name"),
+            "closed": isinstance(closed_at, datetime) and last_at <= _utc(closed_at), "closed_by_name": state.get("closed_by_name"),
             "last_at": last_at, "preview": last_line or _full_call_summary(latest), "summary": _full_call_summary(latest),
-            "call_count": len(items), "status": latest.get("status", "completed"), "provider": latest.get("provider"),
-            "failed": str(latest.get("status", "")).lower() in FAILED_STATUSES, "live": any(_is_live(call) for call in items),
+            "call_count": cached["call_count"], "status": latest.get("status", "completed"), "provider": latest.get("provider"),
+            "failed": str(latest.get("status", "")).lower() in FAILED_STATUSES, "live": bool(cached.get("live_until") and _utc(cached["live_until"]) > _utc(utc_now())),
             "assigned_to": state.get("assigned_to"), "assigned_to_name": state.get("assigned_to_name"),
             "assigned_by_name": state.get("assigned_by_name"), "assigned_at": state.get("assigned_at"),
             "stage": state.get("stage") if state.get("stage") in STAGE_LABELS else DEFAULT_STAGE,
             "stage_by_name": state.get("stage_by_name"), "stage_at": state.get("stage_at"), "stage_reason": state.get("stage_reason"),
         })
-    threads.sort(key=lambda thread: thread["last_at"], reverse=True)
-    if len(calls) == MAX_CALLS_SCANNED:
-        logger.warning("inbox: scanned the newest %d calls only; older threads are not listed", MAX_CALLS_SCANNED)
+    threads.sort(key=lambda thread: (thread["last_at"], thread["key"]), reverse=True)
     return threads
 
 
@@ -383,12 +381,14 @@ def team_members(user: Dict[str, Any] = Depends(require_user)):
 
 @router.get("/conversations")
 def list_conversations(folder: str = "all", search: str = "", stage: str = "", state: str = "open", limit: int = Query(200, ge=1, le=1000),
-                       since: str = "", until: str = "", user: Dict[str, Any] = Depends(require_user)):
+                       since: str = "", until: str = "", user: Dict[str, Any] = Depends(require_user),
+                       after: str = Query("", max_length=2000), order: str = "desc", list_filter: str = "all",
+                       tz_offset: int = Query(0, ge=-840, le=840)):
     """`since`/`until` (ISO times, e.g. the caller's local midnights): only threads active in that range; in a status
     view (`stage`), threads that moved into that status in the range."""
     _require_db()
     start, end = _when_param(since, "since"), _when_param(until, "until")
-    in_range = lambda thread: (lambda at: isinstance(at, datetime) and (not start or at >= start) and (not end or at < end))(
+    in_range = lambda thread: (lambda at: isinstance(at, datetime) and (not start or _utc(at) >= start) and (not end or _utc(at) < end))(
         (thread.get("stage_at") or thread["last_at"]) if stage else thread["last_at"])
     if folder not in FOLDERS or folder == "mentioned":
         raise HTTPException(status_code=400, detail=f"Unknown folder {folder!r}")
@@ -396,12 +396,34 @@ def list_conversations(folder: str = "all", search: str = "", stage: str = "", s
         raise HTTPException(status_code=400, detail=f"Unknown status {stage!r}")
     if state not in CONVERSATION_STATES:
         raise HTTPException(status_code=400, detail=f"Unknown state {state!r}")
+    if order not in {"asc", "desc"} or list_filter not in {"all", "live", "assigned", "unassigned", "missed", "new_today"}:
+        raise HTTPException(status_code=400, detail="Unknown conversation order or filter")
     needle = search.strip().lower()
     rows = [thread for thread in _threads() if _in_folder(thread, folder, _user_id(user)) and (not stage or thread["stage"] == stage)
             and (state == "all" or thread["closed"] == (state == "closed")) and (not (start or end) or in_range(thread))
             and (not needle or needle in " ".join(str(thread.get(field) or "") for field in ("name", "phone", "preview", "summary", "assigned_to_name")).lower())]
     logger.info("inbox: %s listed %s (%d %s threads, stage=%r, search=%r, since=%r, until=%r)", user.get("email"), folder, len(rows), state, stage, search, since, until)
-    return {"success": True, "data": _serialize(rows[:limit])}
+    today = (utc_now() + timedelta(minutes=tz_offset)).date()
+    def matches(thread, filter_name):
+        if filter_name == "live": return bool(thread.get("live"))
+        if filter_name == "assigned": return bool(thread.get("assigned_to"))
+        if filter_name == "unassigned": return not thread.get("assigned_to")
+        if filter_name == "missed": return bool(thread.get("failed"))
+        if filter_name == "new_today":
+            at = thread.get("stage_at")
+            return isinstance(at, datetime) and (_utc(at) + timedelta(minutes=tz_offset)).date() == today
+        return True
+    filter_counts = {name: sum(matches(row, name) for row in rows) for name in ("all", "live", "assigned", "unassigned", "missed", "new_today")}
+    rows = [row for row in rows if matches(row, list_filter)]
+    rows = [{**row, "last_at": _utc(row["last_at"])} for row in rows]
+    rows.sort(key=lambda row: (row["last_at"], row["key"]), reverse=order == "desc")
+    total = len(rows)
+    if after:
+        position = cursor_position(after)
+        rows = [row for row in rows if ((row["last_at"], row["key"]) < position if order == "desc" else (row["last_at"], row["key"]) > position)]
+    page = rows[:limit]
+    return {"success": True, "data": _serialize(page), "total": total, "filter_counts": filter_counts,
+            "next_cursor": thread_cursor(page[-1]) if len(rows) > limit else None}
 
 
 def _thread_name(key: str) -> str:
@@ -532,6 +554,7 @@ def set_stage(key: str, payload: StagePayload, user: Dict[str, Any] = Depends(re
     now = datetime.utcnow()
     # stage_by marks a person's choice: the AI's automatic status (call_status.py) never overrides it.
     mongo_client.inbox_threads.update_one({"_id": key}, {"$set": {"stage": payload.stage, "stage_by": _user_id(user), "stage_by_name": user.get("name"), "stage_at": now, "updated_at": now},
+                                                         "$inc": {"stage_revision": 1},
                                                          "$push": {"stage_history": {"from": before, "to": payload.stage, "by": _user_id(user), "by_name": user.get("name"), "at": now}}}, upsert=True)
     realtime.publish("stage", key=key, workspace=user.get("workspace_id", "default"))
     logger.info("inbox: %s moved thread %s from %s to %s", user.get("email"), key, before, payload.stage)

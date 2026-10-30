@@ -93,6 +93,8 @@ class MongoDBClient:
             self.calls.create_index("call_date")
             self.calls.create_index("status")
             self.inbox_threads.create_index("assigned_to", sparse=True)
+            self.inbox_threads.create_index("call_summary_cache.latest.call_date")
+            self.calls.create_index([("phone_number", 1), ("call_date", -1)])
             self.sms_messages.create_index([("workspace_id", 1), ("lead_id", 1), ("created_at", -1)])
             self.team_messages.create_index([("workspace_id", 1), ("created_at", -1)])
             self.team_messages.create_index("mentions")

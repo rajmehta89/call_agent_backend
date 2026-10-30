@@ -22,17 +22,17 @@ class LanguageSettingsPayload(BaseModel):
 
 
 @router.get("")
-async def list_voice_providers(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def list_voice_providers(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return {"success": True, "data": {"providers": list(provider_snapshot().values())}}
 
 
 @router.get("/languages")
-async def list_voice_languages(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
+def list_voice_languages(user: Dict[str, Any] = Depends(require_permission("manage_integrations"))):
     return {"success": True, "data": {"languages": language_options()}}
 
 
 @router.put("/languages")
-async def update_voice_languages(
+def update_voice_languages(
     payload: LanguageSettingsPayload,
     user: Dict[str, Any] = Depends(require_permission("manage_integrations")),
 ):
@@ -46,7 +46,7 @@ async def update_voice_languages(
 
 
 @router.put("/{provider}")
-async def update_voice_provider(
+def update_voice_provider(
     provider: str,
     payload: ProviderTogglePayload,
     user: Dict[str, Any] = Depends(require_permission("manage_integrations")),
@@ -54,6 +54,10 @@ async def update_voice_provider(
     provider = provider.strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=404, detail="Unknown voice provider")
+    if payload.enabled:
+        missing = provider_snapshot()[provider]["missing_configuration"]
+        if missing:
+            raise HTTPException(status_code=400, detail="Configure this provider before enabling it: " + ", ".join(missing))
     try:
         set_provider_enabled(provider, payload.enabled, str(user.get("_id", "")))
     except RuntimeError as error:
