@@ -143,11 +143,29 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
     return selected
 
 
+def bridge_latest_seconds() -> float:
+    """VOICE_BRIDGE_LATEST_MS: no waiting phrase starts later than this after the caller finished (0 = no limit).
+    From the 2026-10-30 calls: bridges decided at 1.5-2.3 s started just as the answer was ready (median 2.1 s) and
+    held it back by the phrase's length, 1-2 s; the answer itself was then less than a second away."""
+    try:
+        return max(0.0, float(os.getenv("VOICE_BRIDGE_LATEST_MS", "1500"))) / 1000
+    except ValueError:
+        return 1.5
+
+
 async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None,
-                           late_line="", late_after=0.0):
+                           late_line="", late_after=0.0, latest=None):
     """Race the first answer against the wait deadline and bridge generation.
     A semantic rejection remains a rejection after the late deadline. Elapsed
-    time alone never gives a turn permission to play a waiting phrase."""
+    time alone never gives a turn permission to play a waiting phrase.
+    latest: seconds after started_at past which no chosen bridge starts (default bridge_latest_seconds()); a decision
+    still pending then is dropped, so the answer is not queued behind a phrase begun at the last moment. The late line
+    (a long silence) is not limited by it."""
+    latest = bridge_latest_seconds() if latest is None else latest
+
+    def too_late() -> bool:
+        return latest > 0 and perf_counter() - started_at > latest
+
     iterator = source.__aiter__()
     first = asyncio.create_task(anext(iterator))
     choice = None
@@ -163,8 +181,9 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
                 if first not in done and choice not in done and not fallback:
                     # Eligibility may itself need a semantic check. Without an approved fallback, keep racing
                     # the answer against that decision instead of inventing filler or dropping a late decision.
-                    done, _ = await asyncio.wait({first, choice}, return_when=asyncio.FIRST_COMPLETED)
-                if first not in done and not first.done():
+                    limit = max(0.0, latest - (perf_counter() - started_at)) if latest > 0 else None
+                    done, _ = await asyncio.wait({first, choice}, timeout=limit, return_when=asyncio.FIRST_COMPLETED)
+                if first not in done and not first.done() and not too_late():
                     line = fallback
                     if choice in done:
                         try:

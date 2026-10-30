@@ -259,3 +259,34 @@ def test_late_filler_never_repeats_the_last_one():
     from voice_turns import LATE_FILLERS, late_filler
     assert late_filler([LATE_FILLERS[0]]) == LATE_FILLERS[1]
     assert late_filler([LATE_FILLERS[1]]) == LATE_FILLERS[0]
+
+
+def test_bridge_decided_after_the_latest_start_is_dropped():
+    # 2026-10-30: decisions at 1.5-2.3 s started a phrase just as the answer was ready and held it back 1-2 s.
+    async def run():
+        async def source():
+            await asyncio.sleep(0.3)
+            yield "The answer."
+
+        async def choose():
+            await asyncio.sleep(0.2)
+            return "Let me check that."
+
+        return [part async for part in with_wait_bridge(source(), choose, "", 0.001, perf_counter(), latest=0.1)]
+
+    assert asyncio.run(run()) == ["The answer."]
+
+
+def test_bridge_decided_before_the_latest_start_still_plays():
+    async def run():
+        async def source():
+            await asyncio.sleep(0.3)
+            yield "The answer."
+
+        async def choose():
+            await asyncio.sleep(0.05)
+            return "Let me check that."
+
+        return [part async for part in with_wait_bridge(source(), choose, "", 0.001, perf_counter(), latest=0.2)]
+
+    assert asyncio.run(run()) == ["Let me check that. ", "The answer."]

@@ -1198,6 +1198,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
         async def routing_notice():
             line = await asyncio.shield(bridge_ready)
+            if prepared and prepared["first"].done():
+                # The answer is ready and only the routing check is still running: a phrase now would just hold the
+                # answer back by its length (ready at 0.6 s, heard at 2.1 s behind one, 2026-10-30).
+                return ""
             return spoken_bridge(STATUS_PHRASES[0], preferred_language) if bridge_said(line) in LOOKUP_BRIDGES else line
 
         bridge_pending = False
