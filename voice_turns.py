@@ -34,10 +34,10 @@ def is_acknowledgement(caller_text: str) -> bool:
 
 def pause_request(caller_text: str) -> bool:
     """Recognise a request to pause from the whole caller turn."""
-    from turn_meaning import PAUSE_TURN
-    ranked = PAUSE_TURN.rank(caller_text)
-    return bool(ranked and ranked[0][0] == "pause" and ranked[0][1] >= PAUSE_TURN.min_score
-                and ranked[0][1] - ranked[1][1] >= PAUSE_TURN.close_call)
+    from voice_control import CALLER_PAUSE
+    ranked = CALLER_PAUSE.rank(caller_text)
+    return bool(ranked and ranked[0][0] == "pause" and ranked[0][1] >= CALLER_PAUSE.min_score
+                and ranked[0][1] - ranked[1][1] >= CALLER_PAUSE.close_call)
 
 
 def asks_to_repeat(caller_text: str, spoke_over_agent: bool = False) -> bool:
@@ -54,8 +54,10 @@ def asks_to_repeat(caller_text: str, spoke_over_agent: bool = False) -> bool:
     return bool(kinds) and kinds[0] == "clarify" and not set(kinds[1:]) & {"question", "search", "request", "compound"}
 
 
-def pause_reply(caller_text: str) -> str:
-    return "Of course. Go ahead."
+def pause_reply(caller_text: str, language: str = "en") -> str:
+    from voice_languages import normalize_language
+    return {"ur": "جی ضرور، آپ اپنی بات مکمل کریں۔", "ar": "بالتأكيد، تفضل."}.get(
+        normalize_language(language), "Of course. Go ahead.")
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:

@@ -68,6 +68,8 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
     if not transcript and not summary:
         return None
     guide = "\n".join(f"- {stage}: {meaning}" for stage, meaning in STAGE_GUIDE.items())
+    interrupted = sum(bool(turn.get("interrupted")) for turn in call.get("voice_turn_timings") or [])
+    voice_metadata = call.get("provider_metadata") or {}
     prompt = (
         "You file inbound phone calls for a business into a sales pipeline. Pick the ONE stage that best describes "
         "where this caller's conversation stands now, based on what the caller said and asked for.\n\n"
@@ -75,7 +77,8 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         "moves it: an earlier request (a callback, a time, an order) stays open even if this call only asked a general "
         "question. A request for a callback or quote is outreach; wanting a time arranged is scheduling. "
         "Classify by the main unresolved reason for the latest call. A team callback about an existing order does not "
-        "turn an order or delivery problem into outreach. If the caller says they paid and their order has not arrived, "
+        "turn an order or delivery problem into outreach. Declining a callback or transfer while continuing a business "
+        "question does not by itself mean the caller lost interest. If the caller says they paid and their order has not arrived, "
         "choose servicing; choose payment_collection only when the payment, charge, balance or refund itself needs resolution.\n\n"
         f"AI call summary: {summary or '(none)'}\nHuman segment summary: {human_summary or '(none)'}\n"
         f"System-validated contact number: {contact_phone or '(none)'}. If present, it is valid and overrides any agent guess that it was short or incomplete.\n"
@@ -84,6 +87,14 @@ def classify(call: Dict[str, Any], current_stage: str) -> Optional[Dict[str, Any
         "When requested=false, no dial was initiated: say 'no live transfer was attempted' if describing the outcome. "
         "Never say a transfer was attempted or completed unless the system result confirms it.\n"
         "If the caller asked to speak with someone now, describe it as a live transfer request, even if the agent incorrectly offered a later callback.\n\n"
+        f"Recorded voice diagnostics: interrupted reply attempts={interrupted}; "
+        f"stream error={voice_metadata.get('stream_error') or 'none recorded'}; "
+        f"maximum audio-loop delay ms={voice_metadata.get('loop_lag_max_ms', 'not recorded')}. "
+        "If an answer remained unfinished, describe the unresolved request and recorded interruption or error "
+        "without assuming its cause. A normal caller interruption alone does not prove a technical failure; "
+        "do not blame the caller for being unclear based only on incomplete transcription. "
+        "No transcribed caller speech does not prove the caller was silent. "
+        "A completed call record does not establish who hung up.\n\n"
         f"Transcript:\n{transcript or '(none)'}\n\n"
         'Answer with JSON only: {"stage": "<one stage id>", "reason": "<one short sentence for the team, quoting what the caller wanted>", '
         '"confidence": <0 to 1>, "summary": "<one or two plain sentences for the team: what the caller wanted and how the call ended; '

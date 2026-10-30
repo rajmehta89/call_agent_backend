@@ -941,6 +941,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     recently_completed_turn_at = 0.0
     active = True
     stream_failure = ""
+    stream_end_event = "unknown"
+    websocket_close_code = None
     callback_requested = False
     pending_saves: set[asyncio.Task[Any]] = set()
     services: Optional[AIServices] = None   # model client, made on the first answer and reused all call
@@ -1108,7 +1110,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             save_progress()
 
     async def pause_for_caller(text: str) -> None:
-        line = pause_reply(text)
+        line = pause_reply(text, preferred_language)
         await speak(line)
         memory.add(text, line)
         responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
@@ -1217,7 +1219,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if intent in {"callback_ack", "declined"}:
             earlier_handoff_text = ""
             drop_reply(prepared)
-            line = "You're welcome." if intent == "callback_ack" else "Of course."
+            line = call_forwarding.caller_line(call_forwarding.WELCOME_LINE if intent == "callback_ack"
+                                                else call_forwarding.OF_COURSE_LINE, preferred_language)
             await control_reply(text, line, heard_at, turn_timing, intent)
         elif intent == "live" and call_forwarding.forwarding_on():
             earlier_handoff_text = ""
@@ -1229,7 +1232,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             earlier_handoff_text = ""
             drop_reply(prepared)
             if callback_requested:
-                await control_reply(text, "Your callback request is already with the team.", heard_at, turn_timing, "callback_ack")
+                await control_reply(text, call_forwarding.caller_line(call_forwarding.CALLBACK_NOTED_LINE, preferred_language), heard_at, turn_timing, "callback_ack")
                 return
             email = contact_email_from_messages(memory.history())
             callback_number = contact_phone or caller
@@ -1341,6 +1344,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         """While the greeting plays: open the model and voice connections and pre-build the prompt, so the
         caller's first question is answered as fast as later ones (a cold first turn could take several seconds)."""
         nonlocal services
+        from voice_control import has_followup_request, CALLER_PAUSE
         try:
             if services is None:
                 services = await asyncio.to_thread(_voice_services)
@@ -1349,6 +1353,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 asyncio.to_thread(warm_model_connection, services),
                 asyncio.to_thread(prepare_turn_meaning, "", last_agent_text(memory.history())),
                 asyncio.to_thread(is_connection_check, "Hello, can you hear me?"),
+                asyncio.to_thread(has_followup_request, "No callback. What time do you open?"),
+                asyncio.to_thread(CALLER_PAUSE.rank, "hello"),
                 asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
@@ -2210,6 +2216,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         if (message.get("mark") or {}).get("name") == pending_mark:
                             pending_mark = ""
                     elif event == "stop":
+                        stream_end_event = "twilio_stop"
                         break
         finally:
                 active = False
@@ -2231,9 +2238,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 if deepgram is not None:
                     await deepgram.close()
                 await close_language_watch()
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as error:
+        stream_end_event = "websocket_disconnect"
+        websocket_close_code = error.code
         active = False
     except Exception as error:
+        stream_end_event = "stream_error"
         stream_failure = f"{type(error).__name__}: {error}"
         logger.error("custom Twilio voice websocket error: %s", error)
     finally:
@@ -2248,7 +2258,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if speaker is not None:
             await speaker.close()
         if transcript or responses:
-            log_call(caller, None, {
+            await asyncio.to_thread(log_call, caller, None, {
                 "direction": "inbound",
                 "status": "transfer_requested" if callback_requested else "failed" if stream_failure else "completed",
                 "duration": int(round(perf_counter() - call_started)),
@@ -2257,6 +2267,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                                      "stream_end_event": stream_end_event,
+                                      "websocket_close_code": websocket_close_code,
                                       "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
                                       "loop_stalls": loop_watch.stalls_since(call_started_wall),
                                       # Why this call listened with Nova or Flux (no secrets): the settings that decide it.

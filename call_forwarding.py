@@ -528,6 +528,10 @@ def contextual_handoff_intent(caller_text: str, agent_text: str = "", callback_r
     reply = ranked[0][0]
     if reply not in {"accept", "decline", "live", "callback"}:
         return None
+    if reply == "decline" or (callback_requested and reply == "accept"):
+        from voice_control import has_followup_request
+        if has_followup_request(caller_text) is not False:
+            return ""  # answer the whole turn; a refusal/acknowledgement must not erase its question
     if callback_requested and reply == "accept":
         # Agreement is not a phone number when we still need a reachable number.
         if AGENT_ASKED.best(agent_text) == "phone":

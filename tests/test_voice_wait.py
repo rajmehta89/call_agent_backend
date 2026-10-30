@@ -224,7 +224,7 @@ def test_bridge_line_chosen_by_meaning_is_used_without_a_model_request(monkeypat
     assert diagnostics["bridge_selector"] == "semantic" and diagnostics["bridge_model_attempted"] is False
 
 
-def _late_run(answer_after, bridge_line):
+def _late_run(answer_after, bridge_line, fallback=""):
     async def run():
         async def source():
             await asyncio.sleep(answer_after)
@@ -234,17 +234,18 @@ def _late_run(answer_after, bridge_line):
             return bridge_line
 
         said = []
-        stream = with_wait_bridge(source(), bridge, "", 0.01, perf_counter(), said.append,
+        stream = with_wait_bridge(source(), bridge, fallback, 0.01, perf_counter(), said.append,
                                   late_line="Mm, one moment.", late_after=0.05)
         return [part async for part in stream], said
 
     return asyncio.run(run())
 
 
-def test_a_turn_without_its_own_filler_gets_one_short_late_line():
-    # "Yeah. Yeah. I will." got no acknowledgement and then 5 s of silence on a production call.
+def test_semantically_ineligible_turn_stays_without_a_wait_line_after_late_deadline():
     parts, said = _late_run(0.15, "")
-    assert parts == ["Mm, one moment. ", "The answer."] and said == ["Mm, one moment."]
+    assert parts == ["The answer."] and said == []
+    parts, said = _late_run(0.15, "", "An earlier candidate.")
+    assert parts == ["The answer."] and said == []
 
 
 def test_no_late_line_after_a_filler_or_for_a_quick_answer():

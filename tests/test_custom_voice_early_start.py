@@ -4,6 +4,7 @@ a fake model and a fake voice."""
 import asyncio
 import json
 import time
+from threading import Event
 
 import pytest
 
@@ -24,6 +25,9 @@ def warm_semantic_decisions():
             classifier.rank("hello")
     from voice_presence import CONNECTION_CHECK
     CONNECTION_CHECK.rank("hello")
+    from voice_control import CALLER_PAUSE, CONTROL_SCOPE
+    CALLER_PAUSE.rank("hello")
+    CONTROL_SCOPE.rank("hello")
 
 
 class FakeDeepgram:
@@ -76,6 +80,12 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
              bridges=False, model_seconds=0.6, bridge_selector=None, logged=None,
              answer_text="Here is the answer.", caller="unknown"):
     starts, finished = [], []
+    saved = Event()
+
+    def save_call(*args, **kwargs):
+        if logged is not None:
+            logged.append(args[2])
+        saved.set()
 
     async def fake_sentences(services, text, history, caller, summary, bridge="", verified_phone="", language="en", **kwargs):
         starts.append((round(time.perf_counter() - t0, 2), text))
@@ -112,7 +122,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     monkeypatch.setattr(custom, "warm_model_connection", lambda *a, **k: None)
     monkeypatch.setattr(custom, "_warm_tts_connection", no_op)
     monkeypatch.setattr(custom, "_warm_audio_cache", no_op)
-    monkeypatch.setattr(custom, "log_call", lambda *a, **k: logged.append(a[2]) if logged is not None else None)
+    monkeypatch.setattr(custom, "log_call", save_call)
     monkeypatch.setattr(custom, "_log_voice_activity", lambda *a, **k: None)
     monkeypatch.setattr(custom.live_transcript, "save_live", lambda *a, **k: None)
     monkeypatch.setattr(custom, "bridges_enabled", lambda: bridges)
@@ -140,6 +150,10 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
                 break
         time.sleep(call_seconds)
         ws.send_text(json.dumps({"event": "stop"}))
+        if logged is not None:
+            # Final persistence now runs in a worker. Let the handler finish
+            # saving before TestClient tears down its websocket task.
+            assert saved.wait(3), "The call was not persisted after its stop event"
     return starts, finished
 
 

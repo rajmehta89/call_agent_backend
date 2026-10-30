@@ -85,7 +85,7 @@ async def _stream(user: Dict[str, Any]) -> AsyncIterator[str]:
 
 
 @router.get("/events")
-async def events(token: str = Query(..., min_length=10)):
+def events(token: str = Query(..., min_length=10)):
     user = user_from_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Your session has expired")

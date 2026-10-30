@@ -289,6 +289,9 @@ async def warm_local_embeddings() -> None:
                     classifier.rank("hello")
             from voice_presence import is_connection_check
             is_connection_check("Hello, can you hear me?")
+            from voice_control import has_followup_request, CALLER_PAUSE
+            has_followup_request("No callback. What time do you open?")
+            CALLER_PAUSE.rank("hello")
             # The product catalogue copy is built in the background: product questions are only fast once it exists.
             deadline = time.monotonic() + 120
             while shopify_service.configured and not shopify_service.catalog_index() and time.monotonic() < deadline:

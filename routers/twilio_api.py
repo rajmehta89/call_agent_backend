@@ -391,6 +391,10 @@ async def outbound_connect(request: Request):
 @router.post("/status", dependencies=[Depends(verify_twilio_request)])
 async def status_callback(request: Request):
     payload = dict(await request.form())
+    return await asyncio.to_thread(_process_status_callback, payload)
+
+
+def _process_status_callback(payload: Dict[str, Any]):
     bind_call(payload.get("CallSid"))
     logger.info("Twilio call status: %s (duration %ss)", payload.get("CallStatus"), payload.get("CallDuration", "-"))
     updated = update_call_from_twilio(payload.get("CallSid"), call_status=payload.get("CallStatus"), call_duration=payload.get("CallDuration"))
@@ -405,6 +409,10 @@ async def status_callback(request: Request):
 async def transfer_status_callback(request: Request):
     """Persist the result of the human leg created by <Dial>."""
     payload = dict(await request.form())
+    return await asyncio.to_thread(_process_transfer_status_callback, payload)
+
+
+def _process_transfer_status_callback(payload: Dict[str, Any]):
     parent_sid = payload.get("CallSid")
     dial_status = str(payload.get("DialCallStatus") or "").lower()
     status_map = {

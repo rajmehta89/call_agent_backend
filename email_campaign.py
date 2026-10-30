@@ -466,6 +466,15 @@ def notify_pending_approval_digest() -> Dict[str, Any]:
     return {"status": "sent", "count": len(drafts), "recipient": owner_email}
 
 
+def _deliver_approved_email_outbox() -> None:
+    # Review drafts remain untouched. Existing delivery checks still enforce the
+    # campaign state, send window, suppression list and daily limits.
+    approved_ids = [str(item["_id"]) for item in mongo_client.email_outbox.find(
+        {"status": {"$in": ["approved", "scheduled"]}}, {"_id": 1}).sort("created_at", 1).limit(100)]
+    if approved_ids:
+        process_email_outbox(approved_ids)
+
+
 async def email_campaign_worker() -> None:
     import asyncio
     while True:
@@ -473,20 +482,12 @@ async def email_campaign_worker() -> None:
         # work. Without this initial yield, an active campaign can block the
         # server's startup event while discovery is running.
         await asyncio.sleep(WORKER_INTERVAL_SECONDS)
-        try:
-            # These functions perform synchronous Mongo/provider/SMTP work;
-            # keep them off FastAPI's event loop so health and UI requests
-            # remain responsive during discovery and delivery.
-            await asyncio.to_thread(refill_campaign_candidates)
-            await asyncio.to_thread(notify_pending_approval_digest)
-            # The background worker delivers drafts approved in the outbox and drafts created while approval
-            # was off ("scheduled": approved by default). "pending_approval" and "awaiting_owner_review"
-            # drafts still wait for the owner.
-            approved_ids = await asyncio.to_thread(
-                lambda: [str(item["_id"]) for item in mongo_client.email_outbox.find(
-                    {"status": {"$in": ["approved", "scheduled"]}}, {"_id": 1}).sort("created_at", 1).limit(100)]
-            )
-            if approved_ids:
-                await asyncio.to_thread(process_email_outbox, approved_ids)
-        except Exception as exc:
-            logger.error(f"Email campaign worker cycle failed: {exc}")
+        # A discovery outage must not skip approvals or already approved mail.
+        # Every phase keeps its synchronous provider/DB work off the event loop.
+        for phase, operation in (("discovery", refill_campaign_candidates),
+                                 ("approval digest", notify_pending_approval_digest),
+                                 ("approved delivery", _deliver_approved_email_outbox)):
+            try:
+                await asyncio.to_thread(operation)
+            except Exception as exc:
+                logger.error("Email campaign %s phase failed: %s", phase, exc)

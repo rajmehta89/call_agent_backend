@@ -401,6 +401,11 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         "number or email before a live transfer. For callbacks, collect only a missing reachable phone number; "
         "a name and email are optional and must not delay the request. After the system confirms a callback "
         "request, do not offer the same transfer choice again when the caller says okay or thanks."
+        " If the caller declines an offer but continues with a question, acknowledge the refusal briefly and answer "
+        "the question. Do not replace that full turn with a bare acknowledgement. For hours, schedules and holidays, "
+        "state only what the supplied business knowledge confirms. If hours or holiday exceptions are not listed, "
+        "say they are not available and give the supplied team contact; do not invent hours, claim hours vary, "
+        "or imply you checked a calendar or website without that information."
     )
     if phone and re.fullmatch(r"\+?[0-9 ()-]{8,}", phone):
         handoff_rules += " A reachable caller-ID phone number is already available. Use it for the callback unless the caller asks for a different number; do not ask them to provide or reconfirm it."
@@ -1367,7 +1372,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         # Retell handles barge-in itself, so this is a finished turn: a "Sorry?" here asks to hear the reply again.
         if caller_text and await asyncio.to_thread(pause_request, caller_text) and not await asyncio.to_thread(asks_to_repeat, caller_text):
-            reply = pause_reply(caller_text)
+            reply = pause_reply(caller_text, text_language(caller_text) or "en")
             await send_event({"response_type": "response", "response_id": response_id,
                               "content": reply, "content_complete": True})
             agent_messages.append({"content": reply, "timestamp": now})
