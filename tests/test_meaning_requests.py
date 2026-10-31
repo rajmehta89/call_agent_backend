@@ -13,7 +13,7 @@ import voice_turns
 def isolated_cache(monkeypatch):
     monkeypatch.setattr(meaning, "_CACHE", meaning.OrderedDict())
     monkeypatch.setattr(meaning, "_INFLIGHT", {})
-    monkeypatch.setattr(brain_module, "local_embeddings", lambda texts: [])
+    monkeypatch.setattr(brain_module, "local_embeddings", lambda texts, **kwargs: [])
 
 
 def test_concurrent_checks_share_a_network_embedding(monkeypatch):
@@ -91,6 +91,18 @@ def test_duplicate_inputs_keep_the_requested_order(monkeypatch):
     monkeypatch.setattr(brain_module.brain_service, "_embeddings",
                         lambda texts: ([[1.0, 0.0] if text == "one" else [0.0, 1.0] for text in texts], "openrouter"))
     np.testing.assert_allclose(meaning.vectors(["one", "two", "one"]), [[1, 0], [0, 1], [1, 0]])
+
+
+def test_semantic_vectors_use_the_separate_small_batch_setting(monkeypatch):
+    captured = []
+    def local(texts, *, batch_size):
+        captured.append((texts, batch_size))
+        return [[3.0, 4.0] for text in texts]
+    monkeypatch.setattr(brain_module, "local_embeddings", local)
+    monkeypatch.setenv("LOCAL_EMBEDDING_BATCH_SIZE", "8")
+    monkeypatch.delenv("VOICE_SEMANTIC_BATCH_SIZE", raising=False)
+    np.testing.assert_allclose(meaning.vectors(["caller", "context"]), [[0.6, 0.8], [0.6, 0.8]])
+    assert captured == [(["caller", "context"], 1)]
 
 
 def test_semantic_provider_failure_returns_unavailable_without_guessing(monkeypatch):

@@ -341,6 +341,7 @@ def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(mon
     assert any(text == reply for text, _ in spoken)
     assert "recognition" in events and "speech" in events and events[-1] == "closed"
     assert logged[-1]["provider_metadata"]["voice_runtime"] == "pipecat"
+    assert logged[-1]["provider_metadata"]["cpu"]["scope"] == "process_and_container"
     assert logged[-1]["voice_turn_timings"][0]["voice_runtime"] == "pipecat"
 
 

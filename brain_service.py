@@ -149,7 +149,15 @@ def _local_embedder() -> Any:
     return _LOCAL_EMBEDDER
 
 
-def local_embeddings(texts: List[str], query: bool = False) -> List[List[float]]:
+def semantic_embedding_batch_size() -> int:
+    """Turn checks mix short questions with long context; small batches avoid padding all of them to the longest."""
+    try:
+        return max(1, min(8, int(os.getenv("VOICE_SEMANTIC_BATCH_SIZE", "1"))))
+    except ValueError:
+        return 1
+
+
+def local_embeddings(texts: List[str], query: bool = False, *, batch_size: Optional[int] = None) -> List[List[float]]:
     """Normalised local vectors for texts (passages by default, or search queries); [] when unavailable."""
     model = _local_embedder()
     if model is None or not texts:
@@ -158,8 +166,8 @@ def local_embeddings(texts: List[str], query: bool = False) -> List[List[float]]
         # Small batches: 16 long chunks peak at +35 MB in batches of 2 against +150 MB in batches of 8, and finish
         # sooner. Questions are one text at a time anyway.
         try:
-            batch_size = max(1, min(64, int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "2"))))
-        except ValueError:
+            batch_size = max(1, min(64, int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "2") if batch_size is None else batch_size)))
+        except (ValueError, TypeError):
             batch_size = 2
         vectors = model.query_embed(texts, batch_size=batch_size) if query else model.passage_embed(texts, batch_size=batch_size)
         return [[float(value) for value in vector] for vector in vectors]

@@ -264,7 +264,7 @@ def test_semantic_classifier_uses_network_vectors_when_local_model_is_disabled(m
     import brain_service as brain_module
     import meaning
 
-    monkeypatch.setattr(brain_module, "local_embeddings", lambda texts: [])
+    monkeypatch.setattr(brain_module, "local_embeddings", lambda texts, **kwargs: [])
     vectors = {"connect me now": [3.0, 0.0], "call me later": [0.0, 4.0],
                "please connect me": [2.0, 0.0]}
     monkeypatch.setattr(brain_module.brain_service, "_embeddings",

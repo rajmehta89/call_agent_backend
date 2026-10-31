@@ -473,7 +473,7 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
 STORE_LOOKUP_SECONDS = float(os.getenv("VOICE_STORE_LOOKUP_SECONDS", "2.5"))  # never hold a reply longer for Shopify
 
 
-def _no_lookup_turn(caller_text: str) -> bool:
+def _no_lookup_turn(caller_text: str, earlier: str = "") -> bool:
     """"Sorry?", "Yes.", "Thanks, bye": nothing to look up in the store (the reply re-explains or carries on from the
     call so far). Judged by meaning; a store lookup otherwise costs up to a second or two on these turns."""
     from turn_meaning import CALLER_TURN
@@ -488,7 +488,20 @@ def _no_lookup_turn(caller_text: str) -> bool:
         if kind in {"clarify", "acknowledge", "closing"}:
             return True
         import store_intent
-        return kind == "question" and store_intent.wanted(generic) == []
+        if earlier and store_intent.clearly_wanted(" ".join(earlier.split()[-25:])):
+            return False  # An elliptical follow-up still needs the product/order/policy already being discussed.
+        # A multi-sentence planning request can be classified as a request/compound turn.
+        # Keep its complete meaning: the last generic sentence ("what can I do?") loses the project context.
+        if kind not in {"question", "request", "compound", "search"}:
+            return False
+        # Also retain the business-name normalization used for company introductions.
+        # The complete-turn store guard above protects explicit product/order requests.
+        for probe in dict.fromkeys((caller_text, generic)):
+            ranked = store_intent.rank(probe, " ".join(earlier.split()[-25:]))
+            if (ranked and ranked[0][0] == "none" and ranked[0][1] >= store_intent.STORE.min_score
+                    and ranked[0][1] - ranked[1][1] >= store_intent.STORE.close_call):
+                return True
+        return False
     except Exception:
         return False
 
@@ -496,9 +509,9 @@ def _no_lookup_turn(caller_text: str) -> bool:
 def _store_facts(caller_text: str, phone: Optional[str], history: Optional[List[Dict[str, str]]]) -> str:
     """What the connected Shopify store says about this question, as one fact block ("" when not connected or not a
     store question). The earlier turns go along so an order number said before an email still verifies the caller."""
-    if _no_lookup_turn(caller_text):
-        return ""
     earlier = " ".join(str(item.get("content") or "") for item in (history or [])[-8:] if item.get("role") == "user")
+    if _no_lookup_turn(caller_text, earlier):
+        return ""
     context, tool = brain_service._shopify_context(caller_text, phone, f"{earlier} {caller_text}".strip())
     if not context:
         return ""

@@ -135,9 +135,13 @@ async def ready_check():
     from voice_runtime import runtime_status
     speech = runtime_status()
     speech_runtime = {"selected": speech["selected"], "pipecat_version": speech["pipecat_version"]}
+    import cpu_diagnostics
+    from brain_service import semantic_embedding_batch_size
+    cpu = cpu_diagnostics.report()
+    cpu["semantic_batch_size"] = semantic_embedding_batch_size()
     if _voice_warm.is_set() or waited >= ceiling:
-        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime}
-    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime})
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime, "cpu": cpu}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime, "cpu": cpu})
 
 # Register all routers
 app.include_router(config_api.router)

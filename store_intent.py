@@ -45,6 +45,14 @@ EXAMPLES: Dict[str, List[str]] = {
         # About the business itself (the knowledge base answers these, not the store's catalogue).
         "What services do you offer?", "Do you do installation?", "Can I become a trade partner?", "Are you open on weekends?",
         "Do you have a showroom I can visit?", "How long have you been in business?",
+        # Planning a project needs business knowledge before anyone has chosen catalogue items.
+        # Specific product, price, stock and order requests retain the live-data examples above.
+        "Can you give me general advice on improving my new home?",
+        "I recently bought a house and don't know which room to work on first.",
+        "Where should I begin with a home renovation?",
+        "How can your business help me plan a home improvement project?",
+        "I want some guidance before deciding what to buy.",
+        "I just moved in and want to make my place nicer. Where do I start?",
         # Off-topic chat any shop's caller might try: nothing in the store answers it.
         "What is your company for?", "Yeah, so, uh, what is your company is for",
         "Who won the game last night?", "What's the weather like today?", "Tell me a joke.", "What's in the news?",

@@ -8,6 +8,7 @@ import base64
 import html
 from collections import OrderedDict
 import memory_care
+import cpu_diagnostics
 import json
 import logging
 import os
@@ -963,6 +964,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     translation_prefetch = _TranslationPrefetch()
     voice_turn_timings: List[Dict[str, Any]] = []
     call_started = perf_counter()
+    call_cpu_start = cpu_diagnostics.snapshot()
     call_started_wall = time.time()  # for loop_watch.stalls_since: what held the loop up during this call
     # How long this call's event loop was held up: a held-up loop delays every bridge, sentence and audio frame
     # (a Hindi call on 2026-10-29 had its first sentence ready ~4 s after the model's first words on the server,
@@ -2369,6 +2371,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                                       "websocket_close_code": websocket_close_code,
                                       "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
                                       "loop_stalls": loop_watch.stalls_since(call_started_wall),
+                                      "cpu": cpu_diagnostics.report(call_cpu_start),
                                       # Why this call listened with Nova or Flux (no secrets): the settings that decide it.
                                       "stt_selection": {"custom_stt": os.getenv("CUSTOM_STT", "flux (default)"),
                                                         "auto_language": _auto_language_enabled(),

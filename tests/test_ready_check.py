@@ -44,3 +44,12 @@ def test_readiness_reports_the_selected_speech_install_without_credentials(monke
     monkeypatch.setenv("READY_MAX_SECONDS", "0")
     _, body = _status(asyncio.run(main.ready_check()))
     assert body["speech_runtime"] == {"selected": "pipecat", "pipecat_version": "1.15.0"}
+
+
+def test_readiness_reports_cpu_diagnostics_and_the_semantic_batch_setting(monkeypatch):
+    import cpu_diagnostics
+    monkeypatch.setattr(cpu_diagnostics, "report", lambda: {"quota_cores": 0.5, "throttled_seconds": 1.2})
+    monkeypatch.setenv("VOICE_SEMANTIC_BATCH_SIZE", "1")
+    monkeypatch.setenv("READY_MAX_SECONDS", "0")
+    _, body = _status(asyncio.run(main.ready_check()))
+    assert body["cpu"] == {"quota_cores": 0.5, "throttled_seconds": 1.2, "semantic_batch_size": 1}

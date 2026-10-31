@@ -109,7 +109,7 @@ def vectors(texts: Sequence[str]):
     """Unit meaning vectors for texts, from the local model or the network embedding provider. Words in Urdu, Hindi or
     Arabic are compared in English (english_text)."""
     import numpy as np
-    from brain_service import brain_service, local_embeddings
+    from brain_service import brain_service, local_embeddings, semantic_embedding_batch_size
     keys = [english_text(text) for text in texts]
     pending, owned = {}, []
     with _CACHE_LOCK:
@@ -126,7 +126,7 @@ def vectors(texts: Sequence[str]):
     if owned:
         normalized = []
         try:
-            fresh = local_embeddings(owned)
+            fresh = local_embeddings(owned, batch_size=semantic_embedding_batch_size())
             if not fresh:
                 fresh, _ = brain_service._embeddings(owned)
             if len(fresh) == len(owned) and all(len(vector) for vector in fresh):
