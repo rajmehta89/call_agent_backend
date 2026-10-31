@@ -30,7 +30,7 @@ def test_custom_pipeline_checks_and_retrieval_overlap_off_the_audio_loop(monkeyp
         return "Coverage for Darwin has not been confirmed."
 
     def prompt(*args):
-        seen["language"] = args[-1]
+        seen["language"] = args[5]  # (text, phone, summary, history, with_knowledge, language, timings)
         prompt_started.set()
         return "Business facts"
 

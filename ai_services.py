@@ -6,7 +6,7 @@ import time
 
 import httpx
 import os
-from typing import Optional
+from typing import Dict, List, Optional
 from groq import Groq
 from openai import OpenAI
 from config import Config
@@ -94,9 +94,33 @@ _REASONING_MODEL_HINTS = ("gpt-oss", "/o1", "/o3", "/o4", "gpt-5", "deepseek-r1"
 
 
 def _no_thinking_models() -> set:
-    """VOICE_NO_THINKING_MODELS: models sent with thinking switched off (comma-separated OpenRouter ids)."""
-    default = "inception/mercury-3,google/gemini-3.1-flash-lite"
+    """VOICE_NO_THINKING_MODELS: models sent with thinking switched off (comma-separated OpenRouter ids).
+    DeepSeek V4.1 Flash thinks unless told not to: through the server it gave 7 empty replies in 48 (2026-10-31)."""
+    default = "inception/mercury-3,google/gemini-3.1-flash-lite,deepseek/deepseek-v4.1-flash"
     return {item.strip() for item in os.getenv("VOICE_NO_THINKING_MODELS", default).split(",") if item.strip()}
+
+
+def _model_providers() -> Dict[str, List[str]]:
+    """VOICE_MODEL_PROVIDERS: OpenRouter providers to try first for one model, "model=provider|provider;model=...".
+    DeepSeek V4.1 Flash runs on about 40 providers: on Together its first sentence came in 0.6 s (90% within 0.8 s),
+    on Google Vertex in 1.6 s with some at 9.4 s, on most others in 1.0-1.1 s; Gemini 3.1 Flash-Lite on Google AI Studio
+    had 90% of first sentences within 1.18 s against 1.55 s when OpenRouter chose (2026-10-31)."""
+    raw = os.getenv("VOICE_MODEL_PROVIDERS",
+                    "deepseek/deepseek-v4.1-flash=together;google/gemini-3.1-flash-lite=google-ai-studio")
+    providers: Dict[str, List[str]] = {}
+    for entry in raw.split(";"):
+        model, _, names = entry.partition("=")
+        if model.strip() and names.strip():
+            providers[model.strip()] = [name.strip().lower() for name in names.split("|") if name.strip()]
+    return providers
+
+
+def language_voice_model(language: str) -> str:
+    """VOICE_MAIN_MODEL_<LANGUAGE> (e.g. VOICE_MAIN_MODEL_UR): the main voice model for calls in that language, ""
+    for the usual one. In the 2026-10-31 tests DeepSeek V4.1 Flash answered English and Arabic 0.2-0.3 s sooner than
+    Gemini 3.1 Flash-Lite, but put English letters into 7 of 18 Urdu replies against Gemini's 2."""
+    from voice_languages import normalize_language
+    return os.getenv(f"VOICE_MAIN_MODEL_{normalize_language(language).upper()}", "").strip()
 
 
 def is_reasoning_model(model: str) -> bool:
@@ -173,6 +197,7 @@ class AIServices:
             if provider.strip()
         ]
         preferences = {"allow_fallbacks": True}
+        provider_order = _model_providers().get(model) or provider_order  # still falls back to the others
         if provider_order:
             preferences["order"] = provider_order
 

@@ -28,6 +28,16 @@ def test_long_unused_entries_are_forgotten(monkeypatch):
     assert list(cache) == ["customer:+61400000002"]
 
 
+def test_the_current_knowledge_copy_survives_a_quiet_night(monkeypatch):
+    cache = fresh_cache(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(brain_service, "monotonic", lambda: clock[0])
+    brain_service._ttl_cached("brain_documents:1", 300, lambda: ["documents"], family="brain_documents")
+    clock[0] += 8 * 3600
+    brain_service._ttl_cached("customer:+61400000002", 30, lambda: "caller two")
+    assert "brain_documents:1" in cache
+
+
 def test_the_cache_never_grows_past_its_limit(monkeypatch):
     cache = fresh_cache(monkeypatch)
     for number in range(brain_service._TTL_MAX_ENTRIES + 50):

@@ -58,7 +58,7 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
     if not fallback:
         return ""
     started = perf_counter()
-    from voice_turns import STATUS_PHRASES, bridge_model_seconds, fast_voice_model
+    from voice_turns import STATUS_PHRASES, bridge_line_model, bridge_model_seconds
 
     # VOICE_BRIDGE_MODEL (default off): the line passed in is already chosen by meaning for this turn. Asking the
     # small model to re-pick it timed out on 4 of 10 production Retell attempts (450 ms each) for no better line.
@@ -68,7 +68,7 @@ async def wait_message(services, fallback, caller_text, agent_text="", recent=()
                                bridge_model_status="off", bridge_model_ms=0)
         return fallback
 
-    model = fast_voice_model()
+    model = bridge_line_model()
     client = getattr(services, "openai_client", None)
     if not model or client is None:
         if diagnostics is not None:

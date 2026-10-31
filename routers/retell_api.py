@@ -27,14 +27,14 @@ from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
 from voice_wait import stream_in_background, with_wait_bridge, wait_message
 from voice_turns import wait_bridge_phrase, late_filler, late_filler_seconds
-from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
+from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_line_model, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
 from auth_service import require_user
 from logging_setup import bind_call
 
-from ai_services import AIServices, is_reasoning_model, warm_model_connection
+from ai_services import AIServices, is_reasoning_model, language_voice_model, warm_model_connection
 from brain_service import agent_config, brain_service
 from conversation_memory import bounded_history, voice_history_token_budget
 import call_forwarding
@@ -369,9 +369,13 @@ def conversation_knowledge(caller_text: str, history: Optional[List[Dict[str, st
 
 
 def _system_prompt(caller_text: str, caller_number: str, summary: str = "", history: Optional[List[Dict[str, str]]] = None,
-                   with_knowledge: bool = True, language: Optional[str] = None) -> str:
+                   with_knowledge: bool = True, language: Optional[str] = None, timings: Optional[Dict[str, Any]] = None) -> str:
     """with_knowledge=False: a turn without a question (a name, a number, "okay") gets no business facts at all,
-    so a small fast model has nothing to misquote and a shorter prompt to read."""
+    so a small fast model has nothing to misquote and a shorter prompt to read.
+    timings: filled with how long each part took (prompt_knowledge_ms, prompt_store_ms, prompt_caller_ms): a 3 s
+    preparation on Render took 0.1 s on a PC (2026-10-31), so each call shows which part it was."""
+    timings = timings if timings is not None else {}
+    started = perf_counter()
     try:
         phone = caller_number if caller_number != "unknown" else None
         # The caller lookup and the knowledge search are both network reads: run them side by side.
@@ -379,12 +383,15 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         # Live store data (products, stock, orders, policies) when the store is connected and the caller asks for it.
         store_lookup = _PROMPT_POOL.submit(_store_facts, caller_text, phone, history) if with_knowledge else None
         knowledge = conversation_knowledge(caller_text, history) if with_knowledge else NO_FACTS_NEEDED
+        timings["prompt_knowledge_ms"] = round((perf_counter() - started) * 1000)
         if store_lookup is not None:
             try:
                 store = store_lookup.result(timeout=STORE_LOOKUP_SECONDS)
             except Exception as error:
                 logger.warning("voice: store lookup skipped (%s)", str(error) or "too slow")
                 store = ""
+                timings["prompt_store_timed_out"] = True
+            timings["prompt_store_ms"] = round((perf_counter() - started) * 1000)
             if store:
                 knowledge = [{"text": store}, *knowledge]
         try:
@@ -394,6 +401,8 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         except Exception as error:
             logger.warning("voice: caller context skipped (%s)", type(error).__name__)
             caller = ""
+            timings["prompt_caller_timed_out"] = True
+        timings["prompt_caller_ms"] = round((perf_counter() - started) * 1000)
         if not language and phone:
             from voice_languages import language_for_phone
             language = language_for_phone(phone)
@@ -1037,13 +1046,15 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
     # made it answer an Urdu call in English (2026-10-29).
     if reminder_text:
         messages.append({"role": "system", "content": reminder_text})
+    # The main model can differ by the caller's language (VOICE_MAIN_MODEL_UR...); fast/careful turns keep theirs.
+    request_model = turn_model or language_voice_model(text_language(caller_text) or "en") or None
     try:
         iterator = services.stream_chat_completion(
             messages,
-            _max_response_tokens(turn_model or ""),
+            _max_response_tokens(request_model or ""),
             voice_temperature(),
             1.0,
-            model=turn_model,
+            model=request_model,
         )
         first_token_logged = False
         guard = SpokenReplyGuard(_max_spoken_words(fast=turn_model is not None and not places), strip_acknowledgement=bool(bridge), echo_of=bridge)
@@ -1096,7 +1107,7 @@ async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str
     Lydia mixer for you."): no facts, no reasoning, just the line. Never said before bridge_delay_seconds (if the caller
     carries on, Retell cancels this reply first); slower than bridge_model_seconds or unsafe, the fixed phrase."""
     started = perf_counter()
-    model = fast_voice_model()
+    model = bridge_line_model()
     client = getattr(services, "openai_client", None)
     line = ""
     if model and client is not None:

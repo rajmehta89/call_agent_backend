@@ -21,6 +21,13 @@ def fast_voice_model() -> str:
     return os.getenv("VOICE_FAST_MODEL", "").strip()
 
 
+def bridge_line_model() -> str:
+    """VOICE_BRIDGE_LINE_MODEL: the model that words a waiting line ("Let me check the Lydia mixer for you") within
+    bridge_model_seconds (default: VOICE_FAST_MODEL). Only speed matters there: llama-3.1-8b took 0.17 s and was in time
+    14 of 18 times, DeepSeek V4.1 Flash 0.40 s and 11 of 18, while DeepSeek answered simple turns better (2026-10-31)."""
+    return os.getenv("VOICE_BRIDGE_LINE_MODEL", "").strip() or fast_voice_model()
+
+
 def needs_facts(caller_text: str) -> bool:
     """True when the caller asked something (a question needs the main model and the business knowledge)."""
     from turn_meaning import CALLER_TURN

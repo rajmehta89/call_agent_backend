@@ -26,7 +26,7 @@ import websockets
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
-from ai_services import AIServices, warm_model_connection
+from ai_services import AIServices, language_voice_model, warm_model_connection
 from voice_audio import LevelMatcher, adjust_ulaw_gain
 from brain_service import brain_service
 from auth_service import require_user
@@ -39,6 +39,7 @@ from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRAS
 from conversation_memory import ConversationMemory, voice_history_token_budget
 from voice_wait import stream_in_background, with_wait_bridge, wait_message
 from voice_presence import is_connection_check, connection_reply
+from voice_spoken import for_voice
 from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds, bridge_lines, bridge_said, spoken_bridge
 import call_forwarding
 from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
@@ -543,8 +544,11 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     def check_places():
         return place_note(text, brain_service.knowledge_text(), agent_text)
 
+    prompt_parts: Dict[str, Any] = {}
+
     def prompt_with_facts(with_knowledge: bool) -> str:
-        return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history, with_knowledge, language)
+        return _system_prompt(search_text(text, [*history, {"role": "user", "content": text}]), phone, summary, history,
+                              with_knowledge, language, prompt_parts if with_knowledge else None)
 
     # Meaning preparation used to finish before any other per-turn work began. On Render it can
     # need a network embedding request, so overlap it with model choice, contact/place checks and
@@ -585,9 +589,12 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                    "the caller explicitly wants the team to call later. The call system announces and starts a live "
                    "transfer separately. In an ordinary AI reply, never claim a transfer is already happening.")
     prompt_ms = (perf_counter() - started) * 1000
-    requested_model = turn_model or services.config.OPENROUTER_MODEL
+    # The main model can differ by call language (VOICE_MAIN_MODEL_UR...); fast/careful turns keep their own.
+    request_model = turn_model or language_voice_model(language) or None
+    requested_model = request_model or services.config.OPENROUTER_MODEL
     if timings is not None:
         route = "careful" if places and turn_model else "fast" if turn_model else "main"
+        timings.update(prompt_parts)
         timings.update(requested_model=requested_model, preparation_ms=round(prompt_ms), semantic_checks_ms=checks_ms,
                        model_route=route, provider=getattr(services, "provider", ""), with_facts=bool(question or turn_model is None or places),
                        model_source=getattr(services, "voice_model_source", "") if route == "main" else
@@ -635,7 +642,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     iterator = None
     pieces = None
     try:
-        iterator = services.stream_chat_completion(messages, _max_response_tokens(turn_model or services.config.OPENROUTER_MODEL), voice_temperature(), 1.0, model=turn_model)
+        iterator = services.stream_chat_completion(messages, _max_response_tokens(requested_model), voice_temperature(), 1.0, model=request_model)
         pieces = stream_in_background(iterator)
         async for chunk in pieces:
             if not first_token_ms:
@@ -1314,6 +1321,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     async def speak_audio(text: str, cache_key: str = "", forced_engine: Optional[str] = None) -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
         nonlocal pending_mark, mark_count
+        text = for_voice(text, preferred_language)  # e.g. Urdu numbers as words: the Urdu voice misreads digits
         selected_engine = forced_engine or _tts_engine_for_language(engine, preferred_language)
         selected_speaker = speaker if selected_engine == "deepgram" else None
         if selected_speaker:

@@ -79,13 +79,15 @@ _TTL_MAX_ENTRIES = 256
 def _ttl_store(key: str, value: Any, ttl_seconds: float, family: str = "", stored_at: Optional[float] = None) -> None:
     """Remember a value, and forget what can no longer be used, so the cache stays flat over weeks of calls:
     another version of the same family (each knowledge edit used to leave a full copy of the knowledge documents
-    behind), entries unused for ten times their lifetime (one per caller phone number), and the oldest beyond
+    behind), entries outside a family unused for ten times their lifetime (one per caller phone number), and the oldest beyond
     _TTL_MAX_ENTRIES. Callers hold _TTL_LOCK."""
     now = monotonic()
     if family:
         for other in [name for name, item in _TTL_CACHE.items() if item[3] == family and name != key]:
             del _TTL_CACHE[other]
-    for old in [name for name, item in _TTL_CACHE.items() if now - item[0] > max(600.0, item[2] * 10)]:
+    # Not a family's current copy (one per family, replaced on each new version): after a quiet night the first
+    # caller's question reloaded every knowledge document from the database, 3 s before the answer (2026-10-31).
+    for old in [name for name, item in _TTL_CACHE.items() if not item[3] and now - item[0] > max(600.0, item[2] * 10)]:
         del _TTL_CACHE[old]
     _TTL_CACHE[key] = (now if stored_at is None else stored_at, value, ttl_seconds, family)
     for oldest in sorted(_TTL_CACHE, key=lambda name: _TTL_CACHE[name][0])[:max(0, len(_TTL_CACHE) - _TTL_MAX_ENTRIES)]:
@@ -189,7 +191,7 @@ def _brain_version() -> int:
             return int((record or {}).get("value") or 0)
         except Exception:
             return -1
-    return _swr_cached("brain_version", 5, load)
+    return _swr_cached("brain_version", 5, load, family="brain_version")
 
 
 _SWR_REFRESHING: set = set()
