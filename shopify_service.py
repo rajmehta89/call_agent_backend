@@ -277,6 +277,7 @@ class ShopifyService:
         self._live_products: Dict[str, tuple] = {}  # product id -> (read at, live prices/stock), see _with_live_prices
         self._live_lock = threading.Lock()
         self._live_refreshing: set = set()  # product ids being re-read in the background
+        self._live_removed: set = set()  # read live and gone from the store: not offered from the catalogue copy
 
     # ------------------------------------------------------------------ connection
     def configure(self, store_domain: str, access_token: str = "", api_version: str = DEFAULT_API_VERSION,
@@ -498,10 +499,14 @@ class ShopifyService:
     def _build_index(self) -> None:
         try:
             started, found, after = time.time(), [], None
+            # The price range (and stock) too: a product never read live is answered from it at once instead of waiting
+            # 1-2 s for Shopify (after every restart the live copy starts empty, 2026-10-31). No variants: too costly.
+            stock = "totalInventory " if self.has_scope("read_inventory") else ""
             for _ in range(12):  # up to 3,000 products
                 data = self.graphql(
                     "query($after: String) { products(first: 250, after: $after, query: \"status:active\") { pageInfo { hasNextPage endCursor } nodes { "
-                    "id title handle status productType vendor tags onlineStoreUrl description(truncateAt: 1400) descriptionHtml "
+                    "id title handle status productType vendor tags onlineStoreUrl description(truncateAt: 1400) descriptionHtml " + stock +
+                    "priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } } "
                     "options { name values } collections(first: 3) { nodes { title } } "
                     'reviews: metafield(namespace: "judgeme", key: "badge") { value } } } }', {"after": after})
                 products = data.get("products") or {}
@@ -512,6 +517,8 @@ class ShopifyService:
                 after = page.get("endCursor")
             self._index_vectors = None  # until the vectors for this copy are ready, ranking is by words
             self._index = (found, time.time())
+            with self._live_lock:
+                self._live_removed.clear()  # this copy no longer lists what was removed
             logger.info("shopify: catalogue index of %d products built in %.1fs", len(found), time.time() - started)
             if self.meaning_share > 0:  # vectors only when meaning takes part in the ranking
                 self._embed_index(found)
@@ -661,8 +668,10 @@ class ShopifyService:
             for product_id in product_ids:
                 if product_id in fetched:
                     self._live_products[product_id] = (read_at, fetched[product_id])
+                    self._live_removed.discard(product_id)
                 else:
                     self._live_products.pop(product_id, None)  # removed from the store: never offered from memory
+                    self._live_removed.add(product_id)
         return fetched
 
     def _refresh_live_later(self, product_ids: List[str]) -> None:
@@ -690,7 +699,9 @@ class ShopifyService:
         the same products. Now, per product:
         - read within SHOPIFY_LIVE_SECONDS (60): used as is;
         - older, up to SHOPIFY_LIVE_MAX_SECONDS (600): used at once and re-read in the background for the next turn;
-        - older than that, or never read (also after a restart, when memory starts empty): read live before answering."""
+        - never read (also after a restart, when memory starts empty): the catalogue copy's price range is used at once
+          and the product is read live in the background (the full variants come next turn);
+        - older than SHOPIFY_LIVE_MAX_SECONDS, or with no price known at all: read live before answering."""
         if not products:
             return []
         fresh_for = self._seconds_setting("SHOPIFY_LIVE_SECONDS", 60)
@@ -708,7 +719,15 @@ class ShopifyService:
                     live[product["id"]] = cached[1]
                     if age >= fresh_for:
                         stale.append(product["id"])
-        missing = [product["id"] for product in products if product["id"] not in live]
+        with self._live_lock:
+            removed = set(self._live_removed)
+            known = set(self._live_products)
+        indexed = [product for product in products if product["id"] not in live and _priced(product.get("max_price"))
+                   and product["id"] not in known and product["id"] not in removed]
+        for product in indexed:
+            live[product["id"]] = product
+        stale.extend(product["id"] for product in indexed)
+        missing = [product["id"] for product in products if product["id"] not in live and product["id"] not in removed]
         if missing:
             live.update(self._read_live(missing))
         if stale:

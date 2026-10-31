@@ -453,13 +453,15 @@ def test_an_older_price_answers_at_once_and_refreshes_in_the_background(indexed,
     assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "649"  # next turn: new price
 
 
-def test_after_a_restart_prices_are_read_live_first(indexed, monkeypatch):
+def test_after_a_restart_the_catalogue_price_answers_at_once_and_the_live_one_follows(indexed, monkeypatch):
+    # 2026-10-31: after a restart every product turn waited 1-2 s for Shopify before answering.
     graphql, requests = indexed
-    shop.search_products("freestanding oval bathtub", limit=1)
     monkeypatch.setattr(shop, "_live_products", {})  # what a restart leaves: nothing remembered
     graphql.price_change = ("Freestanding Oval Bathtub", "649")
-    assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "649"
-    assert sum("nodes(ids:" in query for query in requests) == 2
+    assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "699"  # the catalogue copy's
+    _wait_for_refresh()
+    assert shop.search_products("freestanding oval bathtub", limit=1)[0]["min_price"] == "649"  # live, next turn
+    assert sum("nodes(ids:" in query for query in requests) == 1  # read once, in the background
 
 
 def test_a_failed_background_refresh_keeps_the_remembered_price(indexed, monkeypatch):
@@ -472,11 +474,13 @@ def test_a_failed_background_refresh_keeps_the_remembered_price(indexed, monkeyp
     assert shop.search_products("freestanding oval bathtub", limit=1)  # and again, within the usable age
 
 
-def test_prices_and_stock_are_live_even_from_memory(indexed):
+def test_a_product_with_no_known_price_is_read_live_before_answering(indexed, monkeypatch):
     graphql, _ = indexed
+    unpriced = [{**product, "min_price": None, "max_price": None} for product in shop._index[0]]
+    monkeypatch.setattr(shop, "_index", (unpriced, shop._index[1]))
     graphql.price_change = ("Freestanding Oval Bathtub", "649")
     found = shop.search_products("freestanding oval bathtub", limit=1)
-    assert found[0]["min_price"] == "649"  # today's price, not the one remembered
+    assert found[0]["min_price"] == "649"  # never a price the caller cannot be given
 
 
 def test_the_memory_search_reads_descriptions_and_specs(indexed):

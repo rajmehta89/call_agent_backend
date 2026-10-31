@@ -951,6 +951,15 @@ def late_filler(recent=()) -> str:
     return next((line for line in LATE_FILLERS if not recent or line != recent[-1]), LATE_FILLERS[0])
 
 
+def silence_filler_seconds() -> float:
+    """VOICE_SILENCE_FILLER_MS (custom stack): a short "one moment" when nothing has been said this long after the
+    caller's turn ended (0 = never). 2026-10-31: turns judged not to need a lookup phrase were silent 3.5-3.8 s."""
+    try:
+        return max(0.0, float(os.getenv("VOICE_SILENCE_FILLER_MS", "1500"))) / 1000
+    except ValueError:
+        return 1.5
+
+
 def late_filler_seconds() -> float:
     """VOICE_LATE_FILLER_MS: after this long with nothing said, a turn that got no acknowledgement gets a short
     "Mm, one moment." (0 = never). From a production call: "Yeah. Yeah. I will." was followed by 5 s of silence."""

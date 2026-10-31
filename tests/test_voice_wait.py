@@ -290,3 +290,35 @@ def test_bridge_decided_before_the_latest_start_still_plays():
         return [part async for part in with_wait_bridge(source(), choose, "", 0.001, perf_counter(), latest=0.2)]
 
     assert asyncio.run(run()) == ["Let me check that. ", "The answer."]
+
+
+def test_a_long_silence_gets_a_short_line_even_when_no_lookup_phrase_suits_the_turn():
+    # 2026-10-31: turns judged not to need a lookup phrase were silent for 3.5-3.8 s.
+    async def run():
+        async def source():
+            await asyncio.sleep(0.3)
+            yield "The answer."
+
+        async def no_phrase():
+            return ""
+
+        return [part async for part in with_wait_bridge(source(), no_phrase, "", 0.001, perf_counter(),
+                                                         silence_line="One moment.", silence_after=0.1)]
+
+    assert asyncio.run(run()) == ["One moment. ", "The answer."]
+
+
+def test_no_silence_line_when_the_answer_comes_in_time_or_a_phrase_was_said():
+    async def run(answer_after, phrase):
+        async def source():
+            await asyncio.sleep(answer_after)
+            yield "The answer."
+
+        async def choose():
+            return phrase
+
+        return [part async for part in with_wait_bridge(source(), choose, "", 0.001, perf_counter(),
+                                                         silence_line="One moment.", silence_after=0.2)]
+
+    assert asyncio.run(run(0.05, "")) == ["The answer."]
+    assert asyncio.run(run(0.4, "Let me check that.")) == ["Let me check that. ", "The answer."]

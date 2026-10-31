@@ -154,13 +154,16 @@ def bridge_latest_seconds() -> float:
 
 
 async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None,
-                           late_line="", late_after=0.0, latest=None):
+                           late_line="", late_after=0.0, latest=None, silence_line="", silence_after=0.0):
     """Race the first answer against the wait deadline and bridge generation.
     A semantic rejection remains a rejection after the late deadline. Elapsed
     time alone never gives a turn permission to play a waiting phrase.
     latest: seconds after started_at past which no chosen bridge starts (default bridge_latest_seconds()); a decision
     still pending then is dropped, so the answer is not queued behind a phrase begun at the last moment. The late line
-    (a long silence) is not limited by it."""
+    (a long silence) is not limited by it.
+    silence_line: said when nothing at all has been said silence_after seconds after started_at, whatever the bridge
+    decision: that decision is whether a lookup phrase suits the turn, not whether silence is fine. Turns judged not
+    to need one were silent for 3.5-3.8 s on 2026-10-31 calls."""
     latest = bridge_latest_seconds() if latest is None else latest
 
     def too_late() -> bool:
@@ -203,9 +206,19 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
             if remaining > 0:
                 await asyncio.wait({first}, timeout=remaining)
             if not first.done():
+                said = True
                 if on_bridge is not None:
                     on_bridge(late_line)
                 yield late_line + " "
+        if not said and silence_line and silence_after > 0 and not first.done():
+            remaining = silence_after - (perf_counter() - started_at)
+            if remaining > 0:
+                await asyncio.wait({first}, timeout=remaining)
+            if not first.done():
+                said = True
+                if on_bridge is not None:
+                    on_bridge(silence_line)
+                yield silence_line + " "
         try:
             yield await first
         except StopAsyncIteration:

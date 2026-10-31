@@ -42,7 +42,7 @@ from voice_presence import is_connection_check, connection_reply
 from voice_spoken import for_voice
 from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds, bridge_lines, bridge_said, spoken_bridge
 import call_forwarding
-from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
+from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, silence_filler_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
 import live_transcript
 from logging_setup import bind_call, timed
@@ -1508,7 +1508,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge,
                                       late_line="" if prefix or not bridges_enabled() else spoken_bridge(
                                           late_filler([bridge_said(line) or line for line in recent_bridges]), preferred_language),
-                                      late_after=late_filler_seconds())
+                                      late_after=late_filler_seconds(),
+                                      silence_line="" if prefix or not bridges_enabled() else spoken_bridge(
+                                          late_filler([bridge_said(line) or line for line in recent_bridges]), preferred_language),
+                                      silence_after=silence_filler_seconds())
             try:
                 sentence = ""
                 async with contextlib.aclosing(stream):
