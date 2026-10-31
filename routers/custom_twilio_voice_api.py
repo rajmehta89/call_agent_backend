@@ -51,6 +51,7 @@ from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
 from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
+from voice_runtime import create_runtime, runtime_status
 
 logger = logging.getLogger(__name__)
 
@@ -758,6 +759,7 @@ async def custom_voice_config() -> Dict[str, Any]:
         "media_websocket_path": "/api/custom-voice/media",
         "stt_provider": "deepgram",
         "tts_provider": custom_voice_engine(),
+        "speech_runtime": runtime_status(),
     }
 
 
@@ -896,6 +898,8 @@ async def custom_inbound(request: Request) -> PlainTextResponse:
 async def custom_media_stream(websocket: WebSocket) -> None:
     """Bridge Twilio mulaw/8k audio to Deepgram and ElevenLabs."""
     stack_enabled = await asyncio.to_thread(custom_stack_enabled)
+    speech_runtime = None  # created only after the authenticated Twilio Start message
+    runtime_info = {"voice_runtime": "legacy"}
     # With Retell on, the stream also takes calls Retell could not (fallback_engine, checked with the stream token
     # in the start message); any other stream is closed there.
     if not stack_enabled and not await asyncio.to_thread(provider_enabled, "retell"):
@@ -1201,13 +1205,20 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             prepared = start_reply(text, bridge_ready, bridge_diagnostics)
 
         async def resolve():
+            checks_started = perf_counter()
             intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
+            turn_timing["handoff_context_ms"] = round((perf_counter() - checks_started) * 1000)
             turn_timing["handoff_source"] = "semantic_context" if intent is not None else "semantic"
             if intent is None:
                 # Same texts as the reply's checks (with the earlier conversation), so they are cache hits.
+                meaning_started = perf_counter()
                 await asyncio.to_thread(prepare_turn_meaning, text, agent_text,
                                         " ".join(" ".join(earlier_caller_texts(memory.history(), text)[-8:]).split()[-25:]))
+                turn_timing["handoff_meaning_ms"] = round((perf_counter() - meaning_started) * 1000)
+                intent_started = perf_counter()
                 intent = await asyncio.to_thread(call_forwarding.handoff_intent, text, earlier_handoff_text, agent_text)
+                turn_timing["handoff_intent_ms"] = round((perf_counter() - intent_started) * 1000)
+            turn_timing["handoff_checks_ms"] = round((perf_counter() - checks_started) * 1000)
             yield intent
 
         async def routing_notice():
@@ -1331,7 +1342,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         text = for_voice(text, preferred_language)  # e.g. Urdu numbers as words: the Urdu voice misreads digits
         selected_engine = forced_engine or _tts_engine_for_language(engine, preferred_language)
         selected_speaker = speaker if selected_engine == "deepgram" else None
-        if selected_speaker:
+        if selected_speaker and speech_runtime is None:
             await selected_speaker.set_language(preferred_language)
         started = perf_counter()
         first_audio = 0.0
@@ -1347,7 +1358,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             try:
                 # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
                 # once, which releases the live Deepgram line instead of holding it until garbage collection.
-                audio = _deepgram_speaker_stream(selected_speaker, text, preferred_language) if selected_speaker else _tts_stream(text, selected_engine, preferred_language)
+                audio = (speech_runtime.tts_stream(text, selected_engine, preferred_language) if speech_runtime is not None else
+                         _deepgram_speaker_stream(selected_speaker, text, preferred_language) if selected_speaker else
+                         _tts_stream(text, selected_engine, preferred_language))
                 async with contextlib.aclosing(audio):
                     async for chunk in audio:
                         if not active:
@@ -1388,6 +1401,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 asyncio.to_thread(CALLER_PAUSE.rank, "hello"),
                 asyncio.to_thread(HUMAN_REQUEST.rank, "hello"),
                 asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
+                speech_runtime.warm(_tts_engine_for_language(engine, preferred_language), preferred_language) if speech_runtime is not None else
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
             )
@@ -2081,14 +2095,16 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         connection = None
         if flux:
             try:
-                connection = await websockets.connect(_flux_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20)
+                connection = (await speech_runtime.connect_stt(_flux_url(preferred_language), deepgram_key) if speech_runtime is not None else
+                              await websockets.connect(_flux_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20))
                 logger.info("custom voice: listening with Deepgram Flux (turn detection by the model)")
             except Exception as error:
                 # e.g. Flux not enabled on the Deepgram account: the call still works with Nova-3.
                 logger.warning("custom voice: Deepgram Flux unavailable (%s); using Nova-3", error)
                 flux = False
         if connection is None:
-            connection = await websockets.connect(_deepgram_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20)
+            connection = (await speech_runtime.connect_stt(_deepgram_url(preferred_language), deepgram_key) if speech_runtime is not None else
+                          await websockets.connect(_deepgram_url(preferred_language), additional_headers=headers, open_timeout=12, ping_interval=20))
         while audio_backlog:
             await connection.send(audio_backlog.pop(0))
         deepgram = connection
@@ -2109,8 +2125,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if language_watch is not None or not (auto_language and flux and language_enabled("ar")):
             return
         try:
-            language_watch = await websockets.connect(_deepgram_url("ar"), additional_headers={"Authorization": f"Token {deepgram_key}"},
-                                                      open_timeout=12, ping_interval=20)
+            language_watch = (await speech_runtime.connect_stt(_deepgram_url("ar"), deepgram_key) if speech_runtime is not None else
+                              await websockets.connect(_deepgram_url("ar"), additional_headers={"Authorization": f"Token {deepgram_key}"},
+                                                       open_timeout=12, ping_interval=20))
         except Exception as error:
             logger.warning("custom voice: language watch unavailable call=%s: %s", call_sid, error)
             return
@@ -2226,6 +2243,19 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             logger.warning("closing media stream without a valid stream token (call %s)", call_sid)
                             await websocket.close(code=1008)
                             return
+                        if speech_runtime is not None:
+                            raise RuntimeError("Duplicate Twilio Start message")
+                        selected_runtime = runtime_status()
+                        if selected_runtime["fallback_reason"]:
+                            logger.warning("custom voice runtime: %s", selected_runtime["fallback_reason"])
+                            runtime_info["runtime_fallback"] = selected_runtime["fallback_reason"]
+                        if selected_runtime["selected"] == "pipecat":
+                            try:
+                                speech_runtime = await asyncio.to_thread(create_runtime)
+                            except Exception as error:
+                                # Loading optional audio libraries must not break an otherwise configured call.
+                                logger.warning("Pipecat runtime could not load (%s); using legacy speech", type(error).__name__)
+                                runtime_info["runtime_fallback"] = type(error).__name__
                         fallback_engine = str(params.get("fallback_engine") or "")
                         if fallback_engine in {"deepgram", "elevenlabs"}:
                             # A call Retell could not take: speak with the voice the router picked for it.
@@ -2316,6 +2346,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         await memory.close()
         if speaker is not None:
             await speaker.close()
+        if speech_runtime is not None:
+            await speech_runtime.close()
+            runtime_info.update(speech_runtime.diagnostics())
         # Words heard while their turn was still being checked when the caller hung up: the record had lost a whole
         # last sentence (2026-10-30). Keep them, marked as never answered.
         last_words = " ".join((recently_completed_turn_text or "").split())
@@ -2331,7 +2364,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "provider_call_id": call_sid or stream_sid,
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
-                "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine,
+                "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine, **runtime_info,
                                       "stream_end_event": stream_end_event,
                                       "websocket_close_code": websocket_close_code,
                                       "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
@@ -2355,7 +2388,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 "transcription": [{"type": "user", **item} for item in transcript],
                 "ai_responses": [{"type": "bot", **item} for item in responses],
                 "messages": live_transcript.ordered_from_lists(transcript, responses),
-                "voice_turn_timings": voice_turn_timings[-200:],
+                "voice_turn_timings": [{**turn, "voice_runtime": runtime_info["voice_runtime"]} for turn in voice_turn_timings[-200:]],
                 "contact_phone": contact_phone,
                 "contact_email": contact_email_from_messages(memory.history()),
                 "transfer_requested": callback_requested,

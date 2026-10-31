@@ -68,6 +68,42 @@ def test_prompt_timings_separate_work_queue_and_cumulative_checkpoints(monkeypat
     }
 
 
+def test_optional_lookups_use_remaining_prompt_budget_and_cancel_obsolete_work(monkeypatch):
+    from types import SimpleNamespace
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(retell_api, "perf_counter", lambda: clock.now)
+    waits, cancelled = [], []
+
+    class Pending:
+        def result(self, timeout):
+            waits.append(timeout)
+            clock.now += timeout
+            raise TimeoutError("still waiting")
+
+        def cancel(self):
+            cancelled.append(True)
+
+    monkeypatch.setattr(retell_api, "_PROMPT_POOL", SimpleNamespace(submit=lambda *args: Pending()))
+    monkeypatch.setattr(retell_api, "STORE_LOOKUP_SECONDS", 2.5)
+
+    def knowledge(*args):
+        clock.now += 1
+        return [{"text": "Confirmed business facts"}]
+
+    monkeypatch.setattr(retell_api, "conversation_knowledge", knowledge)
+    monkeypatch.setattr(retell_api.agent_config, "get_voice_prompt", lambda: "")
+    monkeypatch.setattr(retell_api.agent_config, "get_system_prompt", lambda: "Business")
+    monkeypatch.setattr(retell_api.brain_service, "channel_config", lambda *args: {})
+    monkeypatch.setattr(retell_api, "_voice_prompt", lambda business, channel, caller, phone, facts, summary: facts[0]["text"])
+    timings = {}
+    prompt = retell_api._system_prompt("Question", "+61412345678", language="en", timings=timings)
+    assert "Confirmed business facts" in prompt
+    assert waits == [1.5, 0]
+    assert len(cancelled) == 2 and clock.now == 2.5  # previously 1 + 2.5 + 0.5 = 4 seconds
+    assert timings["prompt_store_timed_out"] is True and timings["prompt_caller_timed_out"] is True
+
+
 def test_order_details_go_to_the_main_model(monkeypatch):
     monkeypatch.setenv("VOICE_FAST_MODEL", "meta-llama/llama-3.1-8b-instruct")
     assert choose_voice_model("DFO001114", "What's your order number?") is None

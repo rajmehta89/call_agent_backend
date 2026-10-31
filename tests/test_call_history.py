@@ -154,6 +154,9 @@ def test_caller_history_failure_keeps_the_answerable_business_facts(monkeypatch,
                 assert timeout <= 0.5
                 raise
 
+        def cancel(self):
+            return True
+
     def unavailable(*args):
         raise problem("simulated caller history failure")
 
@@ -167,4 +170,5 @@ def test_caller_history_failure_keeps_the_answerable_business_facts(monkeypatch,
     timings = {}
     prompt = retell_api._system_prompt("Where do I pick up?", "+61400000000", language="en", timings=timings)
     assert "Pickup is available in Campbellfield." in prompt
-    assert timings["prompt_caller_timed_out"] is True
+    assert timings["prompt_caller_failed"] is True
+    assert timings["prompt_caller_timed_out"] is (problem is TimeoutError)

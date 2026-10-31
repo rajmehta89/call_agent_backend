@@ -407,22 +407,27 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         timings["prompt_knowledge_ms"] = round((perf_counter() - started) * 1000)
         if store_lookup is not None:
             try:
-                store = part_result(store_lookup, "store", STORE_LOOKUP_SECONDS)
+                # The lookup started alongside knowledge retrieval. Do not give it a fresh full timeout afterwards.
+                store = part_result(store_lookup, "store", max(0, STORE_LOOKUP_SECONDS - (perf_counter() - started)))
             except Exception as error:
                 logger.warning("voice: store lookup skipped (%s)", str(error) or "too slow")
                 store = ""
-                timings["prompt_store_timed_out"] = True
+                store_lookup.cancel()  # remove an obsolete queued lookup; a running read may still warm its cache
+                timings["prompt_store_failed"] = True
+                timings["prompt_store_timed_out"] = isinstance(error, TimeoutError)
             timings["prompt_store_ms"] = round((perf_counter() - started) * 1000)
             if store:
                 knowledge = [{"text": store}, *knowledge]
         try:
             # History is optional context. Its cold read must not hold a ready
             # answer for five seconds or erase the business facts on failure.
-            caller = part_result(caller_lookup, "caller", 0.5) if caller_lookup is not None else ""
+            caller = part_result(caller_lookup, "caller", max(0, 0.5 - (perf_counter() - started))) if caller_lookup is not None else ""
         except Exception as error:
             logger.warning("voice: caller context skipped (%s)", type(error).__name__)
             caller = ""
-            timings["prompt_caller_timed_out"] = True
+            caller_lookup.cancel()
+            timings["prompt_caller_failed"] = True
+            timings["prompt_caller_timed_out"] = isinstance(error, TimeoutError)
         timings["prompt_caller_ms"] = round((perf_counter() - started) * 1000)
         if not language and phone:
             from voice_languages import language_for_phone

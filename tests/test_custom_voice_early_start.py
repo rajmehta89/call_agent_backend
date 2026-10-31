@@ -297,6 +297,73 @@ def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(mo
     assert not any("back later" in line or "phone number" in line or "email" in line for line in spoken)
 
 
+def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(monkeypatch):
+    logged, events = [], []
+    script = [(0.2, "What products do you sell?", True, True)]
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
+
+    class Runtime:
+        async def connect_stt(self, url, key):
+            events.append("recognition")
+            return FakeDeepgram(script)
+
+        async def tts_stream(self, text, engine, language):
+            events.append("speech")
+            yield b"\xff" * 160
+
+        async def warm(self, *args):
+            pass
+
+        async def close(self):
+            events.append("closed")
+
+        def diagnostics(self):
+            return {"voice_runtime": "pipecat", "pipecat_version": "1.15.0"}
+
+    monkeypatch.setattr(custom, "runtime_status", lambda: {"selected": "pipecat", "fallback_reason": ""})
+    monkeypatch.setattr(custom, "create_runtime", Runtime)
+    _, finished = run_call(monkeypatch, script, logged=logged, model_seconds=0.05, call_seconds=1.5)
+    assert finished == ["What products do you sell?"]
+    assert "recognition" in events and "speech" in events and events[-1] == "closed"
+    assert logged[-1]["provider_metadata"]["voice_runtime"] == "pipecat"
+    assert logged[-1]["voice_turn_timings"][0]["voice_runtime"] == "pipecat"
+
+
+def test_pipecat_is_not_created_for_an_unsigned_stream(monkeypatch):
+    created = []
+    monkeypatch.setattr(custom, "custom_stack_enabled", lambda: True)
+    monkeypatch.setattr(custom, "provider_snapshot", lambda: {})
+    monkeypatch.setattr(custom, "_active_custom", lambda snapshot: {"ready": True})
+    monkeypatch.setattr(custom, "custom_voice_engine", lambda: "elevenlabs")
+    monkeypatch.setattr(custom, "valid_stream_token", lambda *args: False)
+    monkeypatch.setattr(custom, "create_runtime", lambda: created.append(True))
+    app = FastAPI()
+    app.include_router(custom.router)
+    with TestClient(app) as client, client.websocket_connect("/api/custom-voice/media") as ws:
+        ws.send_json({"event": "start", "start": {"callSid": "CA_UNTRUSTED", "streamSid": "MZ1",
+                     "customParameters": {"stream_token": "invalid"}}})
+        with pytest.raises(custom.WebSocketDisconnect) as error:
+            ws.receive_text()
+        assert error.value.code == 1008
+    assert not created
+
+
+def test_pipecat_import_failure_preserves_the_working_legacy_call(monkeypatch):
+    logged = []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
+    monkeypatch.setattr(custom, "runtime_status", lambda: {"selected": "pipecat", "fallback_reason": ""})
+
+    def unavailable():
+        raise ImportError("synthetic optional dependency failure")
+
+    monkeypatch.setattr(custom, "create_runtime", unavailable)
+    _, finished = run_call(monkeypatch, [(0.2, "What products do you sell?", True, True)],
+                           logged=logged, model_seconds=0.05, call_seconds=1.5)
+    assert finished == ["What products do you sell?"]
+    assert logged[-1]["provider_metadata"]["voice_runtime"] == "legacy"
+    assert logged[-1]["provider_metadata"]["runtime_fallback"] == "ImportError"
+
+
 def test_nova_fallback_preserves_the_newer_interim_after_a_final_prefix(monkeypatch):
     monkeypatch.setenv("CUSTOM_TURN_TIMEOUT_MS", "350")
     script = [(0.3, "I'm looking for", True, False),

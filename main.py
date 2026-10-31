@@ -266,6 +266,11 @@ async def warm_local_embeddings() -> None:
                 ensure_summaries()  # stream/backfill complete history before serving Inbox work
             from voice_provider_settings import provider_snapshot
             provider_snapshot()  # which voice provider is on: read once now, not while a call is starting
+            from voice_runtime import warm_runtime
+            try:
+                warm_runtime()  # optional Pipecat audio imports happen before accepting ready traffic
+            except Exception as error:
+                logger.warning("Optional Pipecat warmup failed (%s); ordinary voice warmup continues", type(error).__name__)
             from voice_turns import regions_where_valid
             regions_where_valid("0412345678")  # loads every country's number formats now (~0.1 s), not mid-call
             brain_service.ensure_local_embeddings()

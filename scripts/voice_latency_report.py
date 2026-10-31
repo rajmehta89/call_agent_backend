@@ -23,6 +23,9 @@ STAGES = (
     ("stt_provider_detection_ms", "STT provider endpoint"),
     ("stt_delivery_backlog_ms", "STT delivery/backlog estimate"),
     ("semantic_checks_ms", "turn checks"),
+    ("handoff_context_ms", "handoff context check (includes queue)"),
+    ("handoff_meaning_ms", "handoff meaning prep (includes queue)"),
+    ("handoff_intent_ms", "handoff intent check (includes queue)"),
     ("prompt_knowledge_work_ms", "knowledge work"),
     ("prompt_store_work_ms", "store work"),
     ("prompt_store_queue_ms", "store pool queue"),
@@ -75,6 +78,8 @@ def report(turns):
         route = turn.get("model_route") or turn.get("action") or "unrecorded"
         routes[route] = routes.get(route, 0) + 1
     print("routes:", ", ".join(f"{name} {count}" for name, count in sorted(routes.items())))
+    runtimes = sorted({turn.get("voice_runtime") or "unrecorded" for turn in turns})
+    print("speech runtimes:", ", ".join(runtimes))
     print("filler played:", sum(1 for turn in turns if turn.get("filler_played") or "bridge_first_audio_ms" in turn),
           "| interrupted:", sum(1 for turn in turns if turn.get("interrupted")), "| turns:", len(turns))
     print("Milliseconds; overlapping stages are not additive. Audio is sent to the provider, not measured at the phone.")
@@ -84,6 +89,7 @@ def report(turns):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--calls", type=int, default=1, help="how many of the latest calls to include")
+    parser.add_argument("--by-runtime", action="store_true", help="report legacy and Pipecat turns separately")
     args = parser.parse_args()
     load_project_env()
     uri = os.getenv("MONGO_URI")
@@ -104,7 +110,13 @@ def main():
         sys.exit("no call with saved voice timings")
     for call in calls:
         print(f"call {call['_id']}  {call.get('call_date') or call.get('created_at')} UTC  {call.get('duration') or '?'} s  {len(call['voice_turn_timings'])} turns")
-    report([turn for call in calls for turn in call["voice_turn_timings"]])
+    turns = [turn for call in calls for turn in call["voice_turn_timings"]]
+    if args.by_runtime:
+        for runtime in sorted({turn.get("voice_runtime") or "unrecorded" for turn in turns}):
+            print(f"\nSpeech runtime: {runtime}")
+            report([turn for turn in turns if (turn.get("voice_runtime") or "unrecorded") == runtime])
+    else:
+        report(turns)
 
 
 if __name__ == "__main__":
