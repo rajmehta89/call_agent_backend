@@ -215,7 +215,7 @@ def test_slow_bridge_classifier_does_not_delay_a_ready_answer(monkeypatch):
     assert starts[0][0] < 0.6
 
 
-def test_callback_request_is_queued_once_without_chat_generation_or_more_questions(monkeypatch):
+def test_callback_request_is_queued_once_without_a_spoken_answer_or_more_questions(monkeypatch):
     queued, spoken, logged = [], [], []
     monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
     monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
@@ -230,7 +230,8 @@ def test_callback_request_is_queued_once_without_chat_generation_or_more_questio
 
     script = [(0.3, "Yeah. Someone call me later.", True, True)]
     starts, _ = run_call(monkeypatch, script, tts=tts, logged=logged, call_seconds=1.2, caller="+61412345678")
-    assert not starts
+    # The answer starts alongside the person/callback check (it would otherwise wait for it) and is dropped unheard.
+    assert "Here is the answer." not in spoken
     assert len(queued) == 1
     assert any("I've noted your callback request." in line for line in spoken)
     assert not any("?" in line for line in spoken[1:])
@@ -290,7 +291,8 @@ def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(mo
               (1.5, "Yeah. Yeah. Please.", True, True)]
     starts, _ = run_call(monkeypatch, script, tts=tts, model_seconds=0.05,
                          answer_text=offer, call_seconds=2.4)
-    assert len(starts) == 1
+    # The "yes" turn's answer starts alongside the check and is dropped: the offer is said once, then the transfer.
+    assert spoken.count(offer) == 1
     assert custom.call_forwarding.CONNECTING_LINE in spoken
     assert not any("back later" in line or "phone number" in line or "email" in line for line in spoken)
 
@@ -604,3 +606,26 @@ def test_complete_nova_question_ends_before_the_long_watchdog(monkeypatch):
                                 model_seconds=0.05, logged=logged, call_seconds=1.2)
     assert finished == ["What services do you provide?"]
     assert logged[-1]["voice_turn_timings"][0]["turn_end_trigger"] == "nova_semantic_complete"
+
+
+def test_the_answer_is_written_while_the_person_check_runs(monkeypatch):
+    # 2026-10-31: answers ready at 1.9 s were heard at 4.0-4.3 s because they only started after this check.
+    heard = []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: False)
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", lambda *args: None)
+
+    def slow_check(*args):
+        time.sleep(0.6)
+        return ""
+    monkeypatch.setattr(custom.call_forwarding, "handoff_intent", slow_check)
+    started = time.perf_counter()
+
+    async def tts(text, engine, language="en"):
+        heard.append((time.perf_counter() - started, text))
+        yield b"\xff" * 160
+
+    run_call(monkeypatch, [(0.3, "Do you deliver to Perth?", True, True)], tts=tts, model_seconds=0.5, call_seconds=2.4)
+    answer_at = next(at for at, text in heard if text == "Here is the answer.")
+    # Turn ends at 0.3 s; one after the other (0.6 s check + 0.5 s answer) it would be heard after 1.4 s.
+    assert answer_at < 1.3, heard

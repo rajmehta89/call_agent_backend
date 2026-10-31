@@ -1186,12 +1186,18 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
     async def answer_or_forward(text: str, heard_at: float, prepared: Optional[Dict[str, Any]], turn_timing: Optional[Dict[str, Any]] = None) -> None:
         """Resolve semantic handoff intent and conversation state, otherwise answer as usual."""
-        nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested
+        nonlocal transfer_pending, earlier_handoff_text, unanswered_text, callback_requested, services
         agent_text = last_agent_text(memory.history())
         turn_timing = dict(turn_timing or {})
         bridge_diagnostics = prepared["bridge_diagnostics"] if prepared else {}
         bridge_ready = prepared["bridge_ready"] if prepared else asyncio.create_task(
             prepare_bridge(text, memory.history(), bridge_diagnostics))
+        # The answer is written while the person/callback check runs, not after it: answers ready at 1.9 s were heard
+        # at 4.0-4.3 s behind that check (2026-10-31). A turn that asks for a person drops it (every branch below does).
+        if prepared is None:
+            if services is None:
+                services = await asyncio.to_thread(_voice_services)
+            prepared = start_reply(text, bridge_ready, bridge_diagnostics)
 
         async def resolve():
             intent = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, text, agent_text, callback_requested)
