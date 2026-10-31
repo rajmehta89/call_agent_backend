@@ -2,7 +2,7 @@
 
 The controller remains the single owner of semantics, callbacks, language changes, interruption decisions,
 transcripts and playback marks. These adapters replace its STT/TTS network implementations with native Pipecat
-services, retaining the same provider/model/voice settings. Import only when the optional runtime is selected.
+services, retaining the same provider/model/voice settings. Import only when the native runtime is selected.
 """
 
 from __future__ import annotations
@@ -28,10 +28,13 @@ from pipecat.services.deepgram.flux.tts import DeepgramFluxTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.elevenlabs.dialogue.tts import ElevenLabsDialogueTTSService
+from pipecat.services.elevenlabs.tts_base import elevenlabs_language_code
 from pipecat.workers.runner import WorkerRunner
 
 from voice_audio import pcm_to_ulaw, ulaw_to_pcm
 from voice_provider_settings import deepgram_voice
+from voice_languages import normalize_language
 
 _LOGGING_LOCK = threading.Lock()
 _LOGGING_READY = False
@@ -337,6 +340,11 @@ class PipecatVoiceRuntime:
         return await connection.open()
 
     def _speech(self, engine, language):
+        from routers.custom_twilio_voice_api import _elevenlabs_voice, _tts_engine_for_language
+        # Apply the same language routing to warmup, direct synthesis and controller replies.
+        # In particular, an Arabic call must not get the default English Deepgram voice.
+        language = normalize_language(language)
+        engine = _tts_engine_for_language(engine, language)
         key = (engine, language)
         existing = self.speakers.get(key)
         if existing is not None and not existing.channel.closing:
@@ -347,17 +355,20 @@ class PipecatVoiceRuntime:
             service = cls(api_key=os.getenv("DEEPGRAM_API_KEY", ""), sample_rate=8000,
                           settings=cls.Settings(voice=voice))
         else:
-            from routers.custom_twilio_voice_api import _elevenlabs_voice
-            service = ElevenLabsTTSService(
+            model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"
+            cls = ElevenLabsDialogueTTSService if model.startswith(("eleven_v3", "eleven_v4")) else ElevenLabsTTSService
+            service = cls(
                 api_key=os.getenv("ELEVENLABS_API_KEY", ""), sample_rate=8000,
-                settings=ElevenLabsTTSService.Settings(voice=_elevenlabs_voice(language),
-                    model=os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")),
+                settings=cls.Settings(voice=_elevenlabs_voice(language),
+                    model=model, language=elevenlabs_language_code(model, language)),
             )
         speech = PipecatSpeech(service, self.metrics)
         self.speakers[key] = speech
         return speech
 
     async def warm(self, engine, language):
+        if self.closed:
+            raise SpeechRuntimeError("Pipecat call runtime is closed")
         await self._speech(engine, language).channel.open()
 
     async def tts_stream(self, text, engine, language):

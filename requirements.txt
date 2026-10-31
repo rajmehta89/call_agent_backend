@@ -26,6 +26,7 @@ websocket-client>=1.8,<2
 numpy>=2.0,<3
 fastembed>=0.9,<1  # local query embeddings for fast knowledge search (brain_service.local_embeddings)
 scipy>=1.14,<2
+pipecat-ai[deepgram]==1.15.0  # shared STT/TTS runtime for every supported call language
 
 # LLM and telephony
 groq>=0.31,<2

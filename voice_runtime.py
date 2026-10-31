@@ -1,4 +1,4 @@
-"""Select an optional speech runtime without importing its audio stack on ordinary calls."""
+"""Select the speech runtime without importing its audio stack before call authentication."""
 
 from importlib import metadata
 import os
@@ -7,7 +7,7 @@ PIPECAT_VERSION = "1.15.0"
 
 
 def runtime_status():
-    requested = os.getenv("CUSTOM_VOICE_RUNTIME", "legacy").strip().lower() or "legacy"
+    requested = os.getenv("CUSTOM_VOICE_RUNTIME", "pipecat").strip().lower() or "pipecat"
     try:
         installed = metadata.version("pipecat-ai")
     except metadata.PackageNotFoundError:

@@ -25,4 +25,4 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements-pipecat.txt pytest
-      - run: python -m pytest tests/test_pipecat_runtime.py tests/test_voice_runtime_selection.py tests/test_pipecat_benchmark.py tests/test_voice_store_lookup.py
+      - run: python -m pytest tests/test_pipecat_runtime.py tests/test_voice_runtime_selection.py tests/test_pipecat_benchmark.py tests/test_voice_store_lookup.py tests/test_custom_voice_early_start.py tests/test_ready_check.py

@@ -1,3 +1,2 @@
-# Optional speech runtime. Install in the backend environment, then select CUSTOM_VOICE_RUNTIME=pipecat.
+# Compatibility install entry point. The standard backend now includes Pipecat.
 -r requirements.txt
-pipecat-ai[deepgram]==1.15.0

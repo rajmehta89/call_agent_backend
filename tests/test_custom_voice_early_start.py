@@ -78,7 +78,7 @@ class FakeDeepgram:
 
 def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0,
              bridges=False, model_seconds=0.6, bridge_selector=None, logged=None,
-             answer_text="Here is the answer.", caller="unknown"):
+             answer_text="Here is the answer.", caller="unknown", language="en"):
     starts, finished = [], []
     saved = Event()
 
@@ -142,7 +142,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     app.include_router(custom.router)
     t0 = time.perf_counter()
     with TestClient(app) as client, client.websocket_connect("/api/custom-voice/media") as ws:
-        ws.send_text(json.dumps({"event": "start", "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {"caller": caller}}}))
+        ws.send_text(json.dumps({"event": "start", "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {"caller": caller, "preferred_language": language}}}))
         while True:  # like Twilio: report the greeting's playback marker once it has played
             message = json.loads(ws.receive_text())
             if message.get("event") == "mark":
@@ -297,9 +297,20 @@ def test_yes_to_connect_offer_starts_live_transfer_without_collecting_contact(mo
     assert not any("back later" in line or "phone number" in line or "email" in line for line in spoken)
 
 
-def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(monkeypatch):
+@pytest.mark.parametrize("language,question,reply", [
+    ("en", "What products do you sell?", "Here is the answer."),
+    ("ur", "آپ کیا فروخت کرتے ہیں؟", "ہمارے پاس باتھ روم کی چیزیں ہیں۔"),
+    ("ar", "ما المنتجات التي تبيعونها؟", "لدينا منتجات الحمام."),
+])
+def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(monkeypatch, language, question, reply):
+    import meaning
+    # Exercise the multilingual controller with a deterministic translation, without a real model request.
+    monkeypatch.setenv("MEANING_TRANSLATION", "true")
+    monkeypatch.setattr(meaning, "_TRANSLATIONS", meaning.OrderedDict())
+    monkeypatch.setattr(meaning, "_translate", lambda text: "What products do you sell?" if text == question else "How can I help?")
     logged, events = [], []
-    script = [(0.2, "What products do you sell?", True, True)]
+    spoken = []
+    script = [(0.2, question, True, True)]
     monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
 
     class Runtime:
@@ -309,6 +320,7 @@ def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(mon
 
         async def tts_stream(self, text, engine, language):
             events.append("speech")
+            spoken.append((text, language))
             yield b"\xff" * 160
 
         async def warm(self, *args):
@@ -322,8 +334,11 @@ def test_pipecat_speech_path_uses_the_shared_controller_and_persists_runtime(mon
 
     monkeypatch.setattr(custom, "runtime_status", lambda: {"selected": "pipecat", "fallback_reason": ""})
     monkeypatch.setattr(custom, "create_runtime", Runtime)
-    _, finished = run_call(monkeypatch, script, logged=logged, model_seconds=0.05, call_seconds=1.5)
-    assert finished == ["What products do you sell?"]
+    _, finished = run_call(monkeypatch, script, logged=logged, model_seconds=0.05, call_seconds=1.5,
+                           language=language, answer_text=reply)
+    assert finished == [question]
+    assert spoken and all(code == language for _, code in spoken)
+    assert any(text == reply for text, _ in spoken)
     assert "recognition" in events and "speech" in events and events[-1] == "closed"
     assert logged[-1]["provider_metadata"]["voice_runtime"] == "pipecat"
     assert logged[-1]["voice_turn_timings"][0]["voice_runtime"] == "pipecat"

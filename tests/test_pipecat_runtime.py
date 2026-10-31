@@ -176,3 +176,71 @@ def test_flux_tts_waits_for_speech_metadata_after_early_flushed(monkeypatch):
         assert isinstance(appended[-1][1], voice.TTSStoppedFrame)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("language,voice_name", [
+    ("en", "english-test-voice"), ("ur", "urdu-test-voice"), ("ar", "arabic-test-voice"),
+])
+def test_native_elevenlabs_uses_the_call_language_and_configured_voice(monkeypatch, language, voice_name):
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "english-test-voice")
+    monkeypatch.setenv("ELEVENLABS_VOICE_UR", "urdu-test-voice")
+    monkeypatch.setenv("ELEVENLABS_VOICE_AR", "arabic-test-voice")
+    monkeypatch.setenv("ELEVENLABS_MODEL_ID", "eleven_v4_turbo")
+    runtime = voice.PipecatVoiceRuntime()
+    service = runtime._speech("elevenlabs", language).channel.service
+    assert isinstance(service, voice.ElevenLabsDialogueTTSService)
+    assert service._settings.voice == voice_name
+    assert service._settings.language == language
+    assert service._settings.model == "eleven_v4_turbo"
+
+
+def test_arabic_deepgram_preference_uses_the_arabic_provider_and_reuses_it(monkeypatch):
+    monkeypatch.delenv("DEEPGRAM_TTS_VOICE_AR", raising=False)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test")
+    monkeypatch.setenv("ELEVENLABS_VOICE_AR", "arabic-test-voice")
+    runtime = voice.PipecatVoiceRuntime()
+    speech = runtime._speech("deepgram", "ar-SA")
+    assert isinstance(speech.channel.service, voice.ElevenLabsTTSService)
+    assert speech is runtime._speech("elevenlabs", "ar")
+    assert speech.channel.service._settings.voice == "arabic-test-voice"
+
+
+def test_language_switches_keep_separate_native_speech_workers(monkeypatch):
+    monkeypatch.setenv("ELEVENLABS_MODEL_ID", "eleven_v4_turbo")
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "test-voice")
+    runtime = voice.PipecatVoiceRuntime()
+    english = runtime._speech("elevenlabs", "en")
+    urdu = runtime._speech("elevenlabs", "Hindi")
+    arabic = runtime._speech("elevenlabs", "ar")
+    assert len({id(english), id(urdu), id(arabic)}) == 3
+    assert runtime._speech("elevenlabs", "en-US") is english
+    assert runtime._speech("elevenlabs", "ur") is urdu
+    assert [worker.channel.service._settings.language for worker in (english, urdu, arabic)] == ["en", "ur", "ar"]
+
+
+def test_unsupported_elevenlabs_language_hint_keeps_model_auto_detection(monkeypatch):
+    monkeypatch.setenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "test-voice")
+    runtime = voice.PipecatVoiceRuntime()
+    assert runtime._speech("elevenlabs", "ur").channel.service._settings.language is None
+
+
+@pytest.mark.parametrize("language,expected_class,model,stt_language", [
+    ("en", voice.DeepgramFluxSTTService, "flux-general-multi", None),
+    ("ur", voice.DeepgramFluxSTTService, "flux-general-multi", None),
+    ("ar", voice.DeepgramSTTService, "nova-3", "multi"),
+])
+def test_native_recognition_preserves_each_supported_language_route(monkeypatch, language, expected_class, model, stt_language):
+    from routers import custom_twilio_voice_api as controller
+    monkeypatch.setenv("CUSTOM_AUTO_LANGUAGE", "true")
+    monkeypatch.setenv("CUSTOM_STT", "flux")
+    monkeypatch.setattr(controller, "current_keyterms", lambda: [])
+    for variable in ("CUSTOM_FLUX_MODEL", "CUSTOM_FLUX_MODEL_EN", "CUSTOM_FLUX_MODEL_UR",
+                     "CUSTOM_DEEPGRAM_MODEL_MULTI", "CUSTOM_DEEPGRAM_MODEL_AR", "CUSTOM_DEEPGRAM_MODEL"):
+        monkeypatch.delenv(variable, raising=False)
+    url = controller._flux_url(language) if controller._use_flux_for_language(language) else controller._deepgram_url(language)
+    connection = voice.PipecatRecognition(url, "test", [])
+    assert isinstance(connection.channel.service, expected_class)
+    assert connection.channel.service._settings.model == model
+    if stt_language:
+        assert connection.channel.service._settings.language == stt_language

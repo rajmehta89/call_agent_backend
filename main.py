@@ -132,9 +132,12 @@ async def ready_check():
     # pushed fix can be distinguished from the version actually taking calls.
     revision = (os.getenv("RENDER_GIT_COMMIT") or "").strip().lower()
     revision = revision[:12] if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision) else None
+    from voice_runtime import runtime_status
+    speech = runtime_status()
+    speech_runtime = {"selected": speech["selected"], "pipecat_version": speech["pipecat_version"]}
     if _voice_warm.is_set() or waited >= ceiling:
-        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision}
-    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision})
+        return {"ready": True, "warm": _voice_warm.is_set(), "seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime}
+    return JSONResponse(status_code=503, content={"ready": False, "warming_up_seconds": round(waited), "embeddings": embeddings, "memory_mb": memory, "revision": revision, "speech_runtime": speech_runtime})
 
 # Register all routers
 app.include_router(config_api.router)

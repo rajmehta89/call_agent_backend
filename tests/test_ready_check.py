@@ -35,3 +35,12 @@ def test_readiness_identifies_only_a_valid_deployed_commit(monkeypatch, revision
     main._voice_warm.set()
     _, warm = _status(asyncio.run(main.ready_check()))
     assert cold["revision"] == warm["revision"] == expected
+
+
+def test_readiness_reports_the_selected_speech_install_without_credentials(monkeypatch):
+    import voice_runtime
+    monkeypatch.setenv("CUSTOM_VOICE_RUNTIME", "pipecat")
+    monkeypatch.setattr(voice_runtime.metadata, "version", lambda name: voice_runtime.PIPECAT_VERSION)
+    monkeypatch.setenv("READY_MAX_SECONDS", "0")
+    _, body = _status(asyncio.run(main.ready_check()))
+    assert body["speech_runtime"] == {"selected": "pipecat", "pipecat_version": "1.15.0"}

@@ -1,6 +1,6 @@
 """Compare legacy and Pipecat speech with identical provider settings and synthetic questions.
 
-Requires requirements-pipecat.txt. --live uses the configured speech APIs (normal usage charges), never places
+Requires the standard backend dependencies. --live uses the configured speech APIs (normal usage charges), never places
 a phone call, never imports the application database client with a URI, and writes only an ignored local report.
 STT replay is paced at 8 kHz, including trailing silence; these are speech-stage measurements, not full call latency.
 """
@@ -14,6 +14,7 @@ from pathlib import Path
 import statistics
 import sys
 from time import perf_counter
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["MONGO_URI"] = ""  # this diagnostic cannot create indexes, call records, or CRM activities
@@ -106,31 +107,42 @@ async def benchmark(args):
     rows = []
     reference = args.audio_input.read_bytes() if args.audio_input else None
     warm = {}
+    warm_errors = {}
     try:
         for name in (() if args.audio_input else ("legacy", "pipecat")):
             started = perf_counter()
-            if name == "pipecat":
-                await runtime.warm(engine, args.language)
-            elif old_speaker:
-                await old_speaker.warm()
-            else:
-                await legacy._warm_tts_connection(engine)
+            try:
+                if name == "pipecat":
+                    await runtime.warm(engine, args.language)
+                elif old_speaker:
+                    await old_speaker.warm()
+                else:
+                    await legacy._warm_tts_connection(engine)
+            except (RuntimeError, TimeoutError, httpx.HTTPError) as error:
+                warm_errors[name] = type(error).__name__
             warm[name] = round((perf_counter() - started) * 1000)
         for repeat in range(0 if args.audio_input else args.repeats):
             # Alternate order to reduce systematic provider/time-of-run bias.
             for name in (("legacy", "pipecat") if repeat % 2 == 0 else ("pipecat", "legacy")):
-                source = (runtime.tts_stream(question, engine, args.language) if name == "pipecat" else
-                          old_speaker.stream(question) if old_speaker else legacy._tts_stream(question, engine, args.language))
-                metrics, audio = await measure_tts(source)
-                reference = reference or audio
-                if not args.audio_input:
+                row = {"stage": "tts", "runtime": name, "repeat": repeat + 1}
+                try:
+                    if name in warm_errors:
+                        raise RuntimeError("Voice connection warmup failed")
+                    source = (runtime.tts_stream(question, engine, args.language) if name == "pipecat" else
+                              old_speaker.stream(question) if old_speaker else legacy._tts_stream(question, engine, args.language))
+                    metrics, audio = await measure_tts(source)
+                    reference = reference or audio
                     args.output.parent.mkdir(parents=True, exist_ok=True)
                     args.output.with_suffix(".ulaw").write_bytes(reference)
-                row = {"stage": "tts", "runtime": name, "repeat": repeat + 1, **metrics}
+                    row.update(metrics)
+                except (RuntimeError, TimeoutError, httpx.HTTPError) as error:
+                    row["error"] = type(error).__name__
+                    if isinstance(error, httpx.HTTPStatusError):
+                        row["http_status"] = error.response.status_code
                 rows.append(row)
                 print(json.dumps(row), flush=True)
-        if args.stt:
-            flux = args.stt == "flux"
+        if args.stt and reference:
+            flux = legacy._use_flux_for_language(args.language) if args.stt == "auto" else args.stt == "flux"
             url = legacy._flux_url(args.language) if flux else legacy._deepgram_url(args.language)
             for repeat in range(args.repeats):
                 for name in (("legacy", "pipecat") if repeat % 2 == 0 else ("pipecat", "legacy")):
@@ -159,7 +171,10 @@ async def benchmark(args):
                                       "n": len(values), "median_ms": statistics.median(values), "max_ms": max(values)})
         report = {"scope": "Speech APIs only; excludes CRM, semantic routing, LLM, Twilio and phone playback",
                   "language": args.language, "engine": engine, "repeats": args.repeats,
-                  "tts_connection_warmup_ms": warm, "stt": args.stt,
+                  "tts_connection_warmup_ms": warm, "tts_warmup_errors": warm_errors,
+                  "stt": ("flux" if flux else "nova") if args.stt and reference else None,
+                  "tts_model": (legacy.deepgram_voice(args.language) if engine == "deepgram" else
+                                os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"),
                   "summaries": summaries, "results": rows}
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -177,7 +192,7 @@ def main():
     parser.add_argument("--engine", choices=["deepgram", "elevenlabs"], default="deepgram")
     parser.add_argument("--language", choices=["en", "ur", "ar"], default="en")
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--stt", choices=["flux", "nova"])
+    parser.add_argument("--stt", choices=["auto", "flux", "nova"], help="auto follows the configured call-language route")
     parser.add_argument("--text")
     parser.add_argument("--audio-input", type=Path, help="Replay existing synthetic 8 kHz mulaw audio; skip TTS")
     parser.add_argument("--output", type=Path, default=Path("logs/pipecat-speech-benchmark.json"))
