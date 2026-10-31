@@ -271,6 +271,7 @@ class ShopifyService:
         self._catalog_words: tuple = (frozenset(), 0.0)  # (words, built at)
         self._catalog_building = threading.Event()
         self._index: tuple = ([], 0.0)  # (products, built at): see catalog_index
+        self._index_retry_at = 0.0
         self._index_building = threading.Event()
         self._index_vectors: Any = None  # meaning vectors, row for row with the index
         self._vector_cache: Dict[str, List[float]] = {}  # product text hash -> vector (only changed products are re-embedded)
@@ -297,6 +298,7 @@ class ShopifyService:
             self._caller_orders.clear()
             self._catalog_words = (frozenset(), 0.0)  # another store: learn its catalogue again
             self._index = ([], 0.0)
+            self._index_retry_at = 0.0
 
     @property
     def auth_mode(self) -> str:
@@ -484,14 +486,15 @@ class ShopifyService:
                 terms.append(word)
         return terms[:6]
 
-    # ---- the whole catalogue in memory: searched instantly; prices and stock still fetched live per question
+    # ---- the whole catalogue in memory, with bounded-age prices and background live refreshes
     INDEX_SECONDS = 600
 
     def catalog_index(self) -> List[Dict[str, Any]]:
         """Every active product's descriptive data (title, type, brand, tags, options, collections, description, specs,
         reviews), kept in memory and refreshed every 10 minutes in the background. Empty until the first build."""
         products, built = self._index
-        if self.configured and time.time() - built > self.INDEX_SECONDS and not self._index_building.is_set():
+        if (self.configured and time.time() - built > self.INDEX_SECONDS
+                and time.time() >= self._index_retry_at and not self._index_building.is_set()):
             self._index_building.set()
             threading.Thread(target=self._build_index, name="shopify-catalogue-index", daemon=True).start()
         return products
@@ -499,8 +502,6 @@ class ShopifyService:
     def _build_index(self) -> None:
         try:
             started, found, after = time.time(), [], None
-            # The price range (and stock) too: a product never read live is answered from it at once instead of waiting
-            # 1-2 s for Shopify (after every restart the live copy starts empty, 2026-10-31). No variants: too costly.
             stock = "totalInventory " if self.has_scope("read_inventory") else ""
             for _ in range(12):  # up to 3,000 products
                 data = self.graphql(
@@ -517,6 +518,7 @@ class ShopifyService:
                 after = page.get("endCursor")
             self._index_vectors = None  # until the vectors for this copy are ready, ranking is by words
             self._index = (found, time.time())
+            self._index_retry_at = 0.0
             with self._live_lock:
                 self._live_removed.clear()  # this copy no longer lists what was removed
             logger.info("shopify: catalogue index of %d products built in %.1fs", len(found), time.time() - started)
@@ -524,7 +526,8 @@ class ShopifyService:
                 self._embed_index(found)
         except Exception as exc:
             logger.warning("shopify: catalogue index not built: %s", exc)
-            self._index = (self._index[0], time.time() - self.INDEX_SECONDS + 120)  # retry in 2 minutes
+            # Retrying must not make old catalogue prices appear fresh again.
+            self._index_retry_at = time.time() + 120
         finally:
             self._index_building.clear()
 
@@ -722,7 +725,8 @@ class ShopifyService:
         with self._live_lock:
             removed = set(self._live_removed)
             known = set(self._live_products)
-        indexed = [product for product in products if product["id"] not in live and _priced(product.get("max_price"))
+        index_usable = now_time - self._index[1] < usable_for
+        indexed = [product for product in products if index_usable and product["id"] not in live and _priced(product.get("max_price"))
                    and product["id"] not in known and product["id"] not in removed]
         for product in indexed:
             live[product["id"]] = product

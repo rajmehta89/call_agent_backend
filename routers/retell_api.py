@@ -372,21 +372,42 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
                    with_knowledge: bool = True, language: Optional[str] = None, timings: Optional[Dict[str, Any]] = None) -> str:
     """with_knowledge=False: a turn without a question (a name, a number, "okay") gets no business facts at all,
     so a small fast model has nothing to misquote and a shorter prompt to read.
-    timings: filled with how long each part took (prompt_knowledge_ms, prompt_store_ms, prompt_caller_ms): a 3 s
-    preparation on Render took 0.1 s on a PC (2026-10-31), so each call shows which part it was."""
+    The original prompt_*_ms fields are cumulative readiness checkpoints. Schema 2 also records each operation's
+    work and pool queue time separately; overlapping work must never be added together."""
     timings = timings if timings is not None else {}
+    timings["prompt_timing_schema"] = 2
     started = perf_counter()
+
+    def submit_part(function, *args):
+        submitted = perf_counter()
+
+        def run():
+            work_started = perf_counter()
+            value = function(*args)
+            return value, round((perf_counter() - work_started) * 1000), round((work_started - submitted) * 1000)
+
+        return _PROMPT_POOL.submit(run)
+
+    def part_result(future, name, timeout):
+        value, work_ms, queue_ms = future.result(timeout=timeout)
+        timings[f"prompt_{name}_work_ms"] = work_ms
+        timings[f"prompt_{name}_queue_ms"] = queue_ms
+        return value
+
     try:
         phone = caller_number if caller_number != "unknown" else None
         # The caller lookup and the knowledge search are both network reads: run them side by side.
-        caller_lookup = _PROMPT_POOL.submit(brain_service.customer_context, phone) if phone else None
+        caller_lookup = submit_part(brain_service.customer_context, phone) if phone else None
         # Live store data (products, stock, orders, policies) when the store is connected and the caller asks for it.
-        store_lookup = _PROMPT_POOL.submit(_store_facts, caller_text, phone, history) if with_knowledge else None
+        store_lookup = submit_part(_store_facts, caller_text, phone, history) if with_knowledge else None
+        knowledge_started = perf_counter()
         knowledge = conversation_knowledge(caller_text, history) if with_knowledge else NO_FACTS_NEEDED
+        if with_knowledge:
+            timings["prompt_knowledge_work_ms"] = round((perf_counter() - knowledge_started) * 1000)
         timings["prompt_knowledge_ms"] = round((perf_counter() - started) * 1000)
         if store_lookup is not None:
             try:
-                store = store_lookup.result(timeout=STORE_LOOKUP_SECONDS)
+                store = part_result(store_lookup, "store", STORE_LOOKUP_SECONDS)
             except Exception as error:
                 logger.warning("voice: store lookup skipped (%s)", str(error) or "too slow")
                 store = ""
@@ -397,7 +418,7 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         try:
             # History is optional context. Its cold read must not hold a ready
             # answer for five seconds or erase the business facts on failure.
-            caller = caller_lookup.result(timeout=0.5) if caller_lookup is not None else ""
+            caller = part_result(caller_lookup, "caller", 0.5) if caller_lookup is not None else ""
         except Exception as error:
             logger.warning("voice: caller context skipped (%s)", type(error).__name__)
             caller = ""

@@ -14,6 +14,7 @@ def test_store_answer_is_in_the_voice_prompt(monkeypatch):
         return "Order DFO001114: paid, fulfilled.", "get_order"
 
     monkeypatch.setattr(retell_api.brain_service, "_shopify_context", lookup)
+    monkeypatch.setattr(retell_api, "_no_lookup_turn", lambda *args: False)
     history = [{"role": "user", "content": "my order is DFO001114"}, {"role": "assistant", "content": "What's the email on it?"}]
     prompt = retell_api._system_prompt("it's priya@example.com", "+61412345678", "", history)
     assert "Live store data from Shopify" in prompt and "Order DFO001114: paid, fulfilled." in prompt
@@ -21,16 +22,50 @@ def test_store_answer_is_in_the_voice_prompt(monkeypatch):
 
 
 def test_no_store_question_adds_nothing(monkeypatch):
+    monkeypatch.setattr(retell_api, "_no_lookup_turn", lambda *args: False)
     monkeypatch.setattr(retell_api.brain_service, "_shopify_context", lambda *args: ("", None))
     assert "Live store data" not in retell_api._system_prompt("what are your opening hours?", "unknown", "")
 
 
 def test_a_slow_store_never_holds_the_reply(monkeypatch):
+    monkeypatch.setattr(retell_api, "_no_lookup_turn", lambda *args: False)
     monkeypatch.setattr(retell_api, "STORE_LOOKUP_SECONDS", 0.2)
     monkeypatch.setattr(retell_api.brain_service, "_shopify_context", lambda *args: (time.sleep(1), ("STORE_LATE_MARKER", "get_order"))[1])
     started = time.perf_counter()
     prompt = retell_api._system_prompt("where is my order 1114?", "unknown", "")
     assert "STORE_LATE_MARKER" not in prompt and time.perf_counter() - started < 0.9
+
+
+def test_prompt_timings_separate_work_queue_and_cumulative_checkpoints(monkeypatch):
+    from types import SimpleNamespace
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(retell_api, "perf_counter", lambda: clock.now)
+
+    class DeferredPool:
+        def submit(self, function):
+            return SimpleNamespace(result=lambda timeout: function())
+
+    def work(seconds, value):
+        clock.now += seconds
+        return value
+
+    monkeypatch.setattr(retell_api, "_PROMPT_POOL", DeferredPool())
+    monkeypatch.setattr(retell_api, "conversation_knowledge", lambda *args: work(0.4, []))
+    monkeypatch.setattr(retell_api, "_store_facts", lambda *args: work(0.2, "Store facts"))
+    monkeypatch.setattr(retell_api.brain_service, "customer_context", lambda *args: work(0.1, "Caller context"))
+    monkeypatch.setattr(retell_api.agent_config, "get_voice_prompt", lambda: "")
+    monkeypatch.setattr(retell_api.agent_config, "get_system_prompt", lambda: "Business")
+    monkeypatch.setattr(retell_api.brain_service, "channel_config", lambda *args: {})
+    monkeypatch.setattr(retell_api, "_voice_prompt", lambda *args: "Prompt")
+    timings = {}
+    assert "Prompt" in retell_api._system_prompt("Product question", "+61412345678", language="en", timings=timings)
+    assert timings == {
+        "prompt_timing_schema": 2,
+        "prompt_knowledge_work_ms": 400, "prompt_knowledge_ms": 400,
+        "prompt_store_work_ms": 200, "prompt_store_queue_ms": 400, "prompt_store_ms": 600,
+        "prompt_caller_work_ms": 100, "prompt_caller_queue_ms": 600, "prompt_caller_ms": 700,
+    }
 
 
 def test_order_details_go_to_the_main_model(monkeypatch):

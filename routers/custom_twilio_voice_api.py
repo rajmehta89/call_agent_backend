@@ -1150,8 +1150,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         timing = {"pipeline": "custom_twilio", "tts_engine": engine, **(turn_timing or {}),
                   "action": action, "routing_ms": routing_ms, "tts_first_audio_ms": round(first_audio * 1000),
                   "first_audio_ms": first_audio_ms, "first_audible_ms": first_audio_ms}
+        timing["first_audible_ms"] = timing.get("bridge_first_audio_ms", first_audio_ms)
         if "turn_detection_ms" in timing:
-            timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + first_audio_ms
+            timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + timing["first_audible_ms"]
         voice_turn_timings.append(timing)
         spoken_line = " ".join(part for part in ((turn_timing or {}).get("bridge_text", ""), line) if part)
         memory.add(text, spoken_line)

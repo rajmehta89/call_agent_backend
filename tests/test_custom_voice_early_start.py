@@ -597,6 +597,27 @@ def test_slow_semantic_routing_gets_one_bridge_before_the_answer(monkeypatch):
     assert logged[-1]["voice_turn_timings"][0]["bridge_first_audio_ms"] < logged[-1]["voice_turn_timings"][0]["first_audio_ms"]
 
 
+def test_control_reply_keeps_the_earlier_routing_bridge_audio_clock(monkeypatch):
+    logged = []
+    monkeypatch.setattr(custom, "complete_nova_turn", lambda text: True)
+    monkeypatch.setenv("VOICE_STATUS_AFTER_MS", "40")
+    monkeypatch.setenv("VOICE_BRIDGE_DELAY_MS", "40")
+
+    def slow_routing(*args):
+        time.sleep(0.2)
+        return "live"
+
+    monkeypatch.setattr(custom.call_forwarding, "contextual_handoff_intent", slow_routing)
+    monkeypatch.setattr(custom.call_forwarding, "forwarding_on", lambda: True)
+    monkeypatch.setattr(custom.call_forwarding, "transfer", lambda *args, **kwargs: True)
+    run_call(monkeypatch, [(0.2, "Connect me to the team now.", True, True)],
+             logged=logged, bridges=True, model_seconds=0.5, call_seconds=1.3,
+             bridge_selector=lambda *args: "Just putting that together for you.")
+    timing = logged[-1]["voice_turn_timings"][0]
+    assert timing["action"] == "live_transfer"
+    assert timing["first_audible_ms"] == timing["bridge_first_audio_ms"] < timing["first_audio_ms"]
+
+
 def test_complete_nova_question_ends_before_the_long_watchdog(monkeypatch):
     logged = []
     monkeypatch.setenv("CUSTOM_COMPLETE_TURN_MS", "350")

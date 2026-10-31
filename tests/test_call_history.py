@@ -148,15 +148,23 @@ def test_caller_history_failure_keeps_the_answerable_business_facts(monkeypatch,
             self.function = function
 
         def result(self, timeout):
-            if self.function == retell_api.brain_service.customer_context:
+            try:
+                return self.function()
+            except problem:
                 assert timeout <= 0.5
-                raise problem("simulated caller history failure")
-            return ""
+                raise
+
+    def unavailable(*args):
+        raise problem("simulated caller history failure")
 
     monkeypatch.setattr(retell_api, "_PROMPT_POOL", NS(submit=lambda function, *a: Result(function)))
+    monkeypatch.setattr(retell_api.brain_service, "customer_context", unavailable)
+    monkeypatch.setattr(retell_api, "_store_facts", lambda *args: "")
     monkeypatch.setattr(retell_api, "conversation_knowledge", lambda *a: [{"text": "Pickup is available in Campbellfield."}])
     monkeypatch.setattr(retell_api.agent_config, "get_system_prompt", lambda: "You answer for the store.")
     monkeypatch.setattr(retell_api.agent_config, "get_voice_prompt", lambda: "Use supplied knowledge: {{business_knowledge}}")
     monkeypatch.setattr(retell_api.brain_service, "channel_config", lambda *a: {})
-    prompt = retell_api._system_prompt("Where do I pick up?", "+61400000000", language="en")
+    timings = {}
+    prompt = retell_api._system_prompt("Where do I pick up?", "+61400000000", language="en", timings=timings)
     assert "Pickup is available in Campbellfield." in prompt
+    assert timings["prompt_caller_timed_out"] is True
