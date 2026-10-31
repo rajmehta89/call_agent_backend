@@ -62,3 +62,42 @@ def test_waiting_lines_can_use_a_quicker_model_than_simple_answers(monkeypatch):
     monkeypatch.setenv("VOICE_BRIDGE_LINE_MODEL", "meta-llama/llama-3.1-8b-instruct")
     assert bridge_line_model() == "meta-llama/llama-3.1-8b-instruct"
     assert fast_voice_model() == "deepseek/deepseek-v4.1-flash"
+
+
+def test_translation_and_handoff_tie_break_use_the_voice_model_settings(monkeypatch):
+    """DeepSeek V4.1 Flash thought through its few tokens without them: every Hindi turn came back untranslated and
+    every handoff tie-break empty (2026-10-31)."""
+    import call_forwarding
+    import meaning
+    from types import SimpleNamespace
+    sent = []
+
+    class Client:
+        def with_options(self, **_):
+            return self
+
+        @property
+        def chat(self):
+            return SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kwargs):
+            sent.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="other"))])
+
+    class Services:
+        provider = "openrouter"
+        openai_client = Client()
+
+        def _openrouter_extra_body(self, model):
+            return {"reasoning": {"enabled": False}, "model": model}
+
+    monkeypatch.setenv("RETELL_OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
+    monkeypatch.delenv("TRANSLATION_MODEL", raising=False)
+    monkeypatch.delenv("HANDOFF_CLASSIFIER_MODEL", raising=False)
+    monkeypatch.setattr(meaning, "_translator", Services())
+    meaning._translate("मुझे bathtub चाहिए")
+    import ai_services
+    monkeypatch.setattr(ai_services, "AIServices", Services)
+    call_forwarding._adjudicate_handoff.cache_clear()
+    call_forwarding._adjudicate_handoff("मुझे किसी से बात करनी है")
+    assert [item["extra_body"] for item in sent] == [{"reasoning": {"enabled": False}, "model": "deepseek/deepseek-v4.1-flash"}] * 2

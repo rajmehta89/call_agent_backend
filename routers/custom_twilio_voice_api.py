@@ -50,7 +50,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
-from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language
+from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
 
 logger = logging.getLogger(__name__)
 
@@ -1944,7 +1944,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         # A Hinglish turn starting "Yes. So what..." can be labelled English: with Hindi words in it the
                         # caller is still speaking Hindi/Urdu, so only a turn without them switches to English.
                         if spoken == "en" and meaning_foreign(" ".join(words)):
-                            spoken = ""
+                            # Mostly written in Hindi/Urdu script: the Urdu line. "home dear को क्या सहायता कर" was
+                            # labelled English and the whole call stayed in English (2026-10-31). Arabic stays the
+                            # language watch's call.
+                            spoken = "ur" if text_language(" ".join(words)) == "ur" else ""
                         if spoken in {"en", "ur"} and spoken != preferred_language and language_enabled(spoken):
                             logger.info("custom voice: caller is speaking %s; replying in it call=%s", spoken, call_sid)
                             preferred_language = spoken

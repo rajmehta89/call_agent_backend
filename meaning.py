@@ -46,8 +46,10 @@ def _translate(text: str) -> str:
         model = (os.getenv("TRANSLATION_MODEL") or os.getenv("RETELL_OPENROUTER_MODEL")
                  or ("openai/gpt-4.1-mini" if _translator.provider == "openrouter" else "gpt-4.1-mini"))
         timeout = float(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "2.5") or 2.5)
+        # The voice model's routing (thinking off, fast provider first): without it DeepSeek V4.1 Flash thought through
+        # its 160 tokens and every Hindi turn came back untranslated, after up to 5.7 s (2026-10-31).
         response = _translator.openai_client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
-            model=model, max_tokens=160, temperature=0,
+            model=model, max_tokens=160, temperature=0, extra_body=_translator._openrouter_extra_body(model),
             messages=[{"role": "system", "content": "Translate what a phone caller said into plain English, keeping its "
                        "meaning and tone. The words come from speech recognition and may be in Urdu, Hindi, Arabic or "
                        "a mix with English. Reply with the English only."},

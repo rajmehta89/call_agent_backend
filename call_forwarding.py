@@ -575,8 +575,10 @@ def _adjudicate_handoff(caller_text: str, earlier: str = "", agent_text: str = "
         message = "\n".join(part for part in (f"Assistant just said: {agent_text}" if agent_text else "",
                                                f"Earlier caller request: {earlier}" if earlier else "",
                                                f"Current caller turn: {caller_text}") if part)
+        # Thinking off, fast provider first: DeepSeek V4.1 Flash otherwise spent its 8 tokens thinking and every
+        # tie-break came back empty (2026-10-31).
         response = services.openai_client.with_options(timeout=2, max_retries=0).chat.completions.create(
-            model=model,
+            model=model, extra_body=services._openrouter_extra_body(model),
             messages=[
                 {"role": "system", "content": "The caller is on the phone with an AI assistant. Classify whether the caller "
                  "wants to speak with a human team member. Reply with exactly one word: LIVE, CALLBACK, UNCLEAR, or OTHER. "
