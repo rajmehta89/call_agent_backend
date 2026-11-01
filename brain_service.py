@@ -71,9 +71,21 @@ _EMBEDDING_CACHE_SIZE = 512
 _EMBEDDING_LOCK = threading.Lock()
 _EMBEDDING_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
 _EMBEDDING_INFLIGHT: Dict[str, Future] = {}
+_EMBEDDING_HTTP = threading.local()
 _TTL_CACHE: Dict[str, tuple] = {}  # key -> (stored at, value, ttl seconds, family)
 _TTL_LOCK = threading.Lock()
 _TTL_MAX_ENTRIES = 256
+
+
+def _embedding_http_session() -> requests.Session:
+    """Keep TLS connections warm per worker thread for network embedding fallbacks."""
+    session = getattr(_EMBEDDING_HTTP, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        session.mount("https://", adapter)
+        _EMBEDDING_HTTP.session = session
+    return session
 
 
 def _ttl_store(key: str, value: Any, ttl_seconds: float, family: str = "", stored_at: Optional[float] = None) -> None:
@@ -370,7 +382,7 @@ class BrainService:
         model = os.getenv("OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small").strip()
         try:
             with timed(logger, f"embeddings {model}", warn_after_ms=2000):
-                response = requests.post(
+                response = _embedding_http_session().post(
                     "https://openrouter.ai/api/v1/embeddings",
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                     json={"model": model, "input": texts, "dimensions": self._embedding_dimensions(), "encoding_format": "float"},
@@ -402,7 +414,7 @@ class BrainService:
             },
         }
         try:
-            response = requests.post(
+            response = _embedding_http_session().post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}",
                 json=payload,
                 timeout=20,
