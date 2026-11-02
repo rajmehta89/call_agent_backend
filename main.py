@@ -59,7 +59,7 @@ app = FastAPI(
 # Browsers may only call this API from the dashboard's own origins. Set CORS_ORIGINS
 # (comma-separated) in production, e.g. "https://app.example.com".
 _environment = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "development").lower()
-_local_cors_origins = "http://localhost:3000,http://127.0.0.1:3000,http://192.168.56.1:3000"
+_local_cors_origins = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3010,http://127.0.0.1:3010,http://192.168.56.1:3000"
 _production_cors_origin = os.getenv("RELAYDESK_PUBLIC_APP_URL", "").strip().rstrip("/")
 DEFAULT_CORS_ORIGINS = _production_cors_origin if _environment in {"production", "prod"} and _production_cors_origin else _local_cors_origins
 app.add_middleware(
