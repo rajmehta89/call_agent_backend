@@ -1413,9 +1413,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.debug("call warm-up failed: %s", error)
 
-    async def prepare_bridge(text, history, diagnostics=None, still_waiting=None):
+    async def prepare_bridge(text, history, diagnostics=None, still_waiting=None, language=None):
         diagnostics = diagnostics if diagnostics is not None else {}
         started = perf_counter()
+        language = language or preferred_language
         if not bridges_enabled():
             diagnostics.update(bridge_candidate=False, bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
@@ -1438,11 +1439,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             return ""
         bridge_services = services or await asyncio.to_thread(_voice_services)
         selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent_context, diagnostics,
-                                      language=preferred_language)
+                                      language=language)
         if still_waiting is not None and not still_waiting():
             selected = ""
         diagnostics["bridge_ready_ms"] = round((perf_counter() - started) * 1000)
-        return spoken_bridge(selected, preferred_language)  # in the call's language (only neutral ones there)
+        return spoken_bridge(selected, language)  # in the call's language (only neutral ones there)
 
     async def get_prepared_bridge(prepared: Dict[str, Any]) -> str:
         state = prepared["bridge_state"]
@@ -1450,7 +1451,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if task is None:
             task = asyncio.create_task(prepare_bridge(
                 prepared["text"], prepared["history"], prepared["bridge_diagnostics"],
-                still_waiting=lambda: not prepared["first"].done()))
+                still_waiting=lambda: not prepared["first"].done(), language=prepared["language"]))
             state["task"] = task
         return await asyncio.shield(task)
 
@@ -1478,10 +1479,18 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     yield sentence
 
         sentences = stream().__aiter__()
-        return {"text": text, "history": history, "language": preferred_language,
-                "bridge_state": bridge_state, "bridge_diagnostics": diagnostics,
-                "reply_timings": reply_timings, "sentences": sentences,
-                "first": asyncio.ensure_future(sentences.__anext__()), "started": perf_counter()}
+        first = asyncio.ensure_future(sentences.__anext__())
+        prepared = {"text": text, "history": history, "language": preferred_language,
+                    "bridge_state": bridge_state, "bridge_diagnostics": diagnostics,
+                    "reply_timings": reply_timings, "sentences": sentences,
+                    "first": first, "started": perf_counter()}
+        # The wait budget begins at the end of speech. Start checking eligibility while the early answer is already
+        # being prepared, so a caller-specific line can be ready inside that short window. No model request is made
+        # when eligibility says there is no suitable update, and a ready answer still cancels the bridge.
+        if bridges_enabled() and bridge_state.get("task") is None:
+            bridge_state["task"] = asyncio.create_task(prepare_bridge(
+                text, history, diagnostics, still_waiting=lambda: not first.done(), language=prepared["language"]))
+        return prepared
 
     def drop_reply(prepared: Optional[Dict[str, Any]]) -> None:
         """Throw away a reply that was prepared early but will not be used (the caller said something else)."""
