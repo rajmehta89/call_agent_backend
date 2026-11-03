@@ -27,7 +27,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from timeutil import utc_now
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from bson import ObjectId
@@ -246,6 +246,15 @@ def _display_name(key: str, lead: Optional[Dict[str, Any]], owners: Dict[str, st
 THREADS_CACHE_SECONDS = 30
 _threads_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "rows": []}
 _threads_cache_lock = threading.Lock()
+COUNTS_CACHE_SECONDS = 2
+_counts_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, int]]] = {}
+_counts_cache_guard = threading.Lock()
+_counts_cache_locks: Dict[Tuple[str, str], Any] = {}
+
+
+def _counts_cache_lock_for(key: Tuple[str, str]):
+    with _counts_cache_guard:
+        return _counts_cache_locks.setdefault(key, threading.Lock())
 
 
 def _threads() -> List[Dict[str, Any]]:
@@ -371,6 +380,16 @@ def _notify_team_operation(user: Dict[str, Any], kind: str, title: str, message:
 def folder_counts(user: Dict[str, Any] = Depends(require_user)):
     started = time.perf_counter()
     _require_db()
+    cache_key = (str(user.get("workspace_id", "default")), _user_id(user))
+    with _counts_cache_lock_for(cache_key):
+        cached = _counts_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < COUNTS_CACHE_SECONDS:
+            logger.debug("inbox: reused counts for %s", user.get("email"))
+            return {"success": True, "data": dict(cached[1])}
+        return _calculate_folder_counts(user, cache_key, started)
+
+
+def _calculate_folder_counts(user: Dict[str, Any], cache_key: Tuple[str, str], started: float):
     threads_started = time.perf_counter()
     threads = _threads()
     threads_ms = round((time.perf_counter() - threads_started) * 1000)
@@ -387,6 +406,8 @@ def folder_counts(user: Dict[str, Any] = Depends(require_user)):
         counts[f"stage:{stage}"] = sum(1 for thread in threads if thread["stage"] == stage)
     logger.debug("inbox: counts for %s -> %s", user.get("email"), counts)
     total_ms = round((time.perf_counter() - started) * 1000)
+    with _counts_cache_guard:
+        _counts_cache[cache_key] = (time.monotonic(), dict(counts))
     if total_ms >= 500:
         logger.warning("inbox: slow counts for %s total_ms=%d threads_ms=%d threads=%d mentions_ms=%d channel_ms=%d",
                        user.get("email"), total_ms, threads_ms, len(threads), mentions_ms, channel_ms)
