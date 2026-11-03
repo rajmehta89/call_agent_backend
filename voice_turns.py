@@ -1141,8 +1141,14 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     # The voice turn detector has already ended this utterance. If the meaning
     # classifier recognizes a question/request and does not positively label it
     # unfinished, a generic status is safer than leaving a long silent gap.
-    complete_request = kind in {"question", "search", "request"} and completion not in {None, "unfinished"}
+    complete_request = kind in {"question", "search", "request", "compound", "problem"} and completion != "unfinished"
     if complete_question or complete_request:
+        return status_phrase(recent)
+    # The speech turn detector has already ended this utterance. If meaning is
+    # inconclusive rather than explicitly unfinished, a fresh neutral bridge is
+    # safer than leaving a substantive caller question in silence.
+    from turn_meaning import CONTACT
+    if completion != "unfinished" and kind not in {"acknowledge", "closing", "detail", "sensitive"} and CONTACT.best(caller_text) != "email":
         return status_phrase(recent)
     return ""
 
@@ -1158,9 +1164,9 @@ def bridge_model_seconds() -> float:
 def dynamic_bridge_seconds() -> float:
     """VOICE_DYNAMIC_BRIDGE_MS: budget for generating a fresh, caller-specific status line."""
     try:
-        return min(800.0, max(100.0, float(os.getenv("VOICE_DYNAMIC_BRIDGE_MS", "400")))) / 1000
+        return min(1000.0, max(100.0, float(os.getenv("VOICE_DYNAMIC_BRIDGE_MS", "1000")))) / 1000
     except ValueError:
-        return 0.4
+        return 1.0
 
 
 # The small model only phrases what to say while the store lookup runs; it is given no facts and must not answer.

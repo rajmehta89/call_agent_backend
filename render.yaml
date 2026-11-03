@@ -59,5 +59,9 @@ services:
         value: "1"
       - key: VOICE_FAST_MODEL
         value: meta-llama/llama-3.1-8b-instruct
+      - key: VOICE_BRIDGE_FALLBACK_MODEL
+        value: google/gemini-3.1-flash-lite
+      - key: VOICE_DYNAMIC_BRIDGE_MS
+        value: "1000"
       - key: VOICE_BRIDGE_LATEST_MS
         value: "3000"

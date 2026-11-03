@@ -139,14 +139,18 @@ async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16
     def choose():
         status = "error"
         attempts = 0
+        # Split the bridge budget between configured models. Without this, the
+        # primary can consume the full deadline and leave no time for fallback.
+        per_model_budget = budget / len(models)
         for role, model in models:
             remaining = budget - (perf_counter() - started)
             if remaining <= 0.025:
                 break
             attempts += 1
             attempt_state["count"] = attempts
+            attempt_timeout = min(remaining, per_model_budget)
             try:
-                response = client.with_options(timeout=remaining, max_retries=0).chat.completions.create(
+                response = client.with_options(timeout=attempt_timeout, max_retries=0).chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
