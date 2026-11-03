@@ -97,7 +97,7 @@ def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
     line = " ".join(str(text or "").replace('"', "").replace("`", "").split()).strip(" '`")
     line = re.split(r"(?<=[.!?؟۔])\s+", line, maxsplit=1)[0].strip()
     words = line.split()
-    if not 4 <= len(words) <= 6 or "?" in line or "؟" in line or _BRIDGE_ANSWER_CUES.search(line):
+    if not 4 <= len(words) <= 8 or "?" in line or "؟" in line or _BRIDGE_ANSWER_CUES.search(line):
         return ""
     if _BRIDGE_STOCK_OPENER.search(line):
         return ""
@@ -206,7 +206,7 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
     recent_text = "\n".join(f"- {str(line)[-180:]}" for line in recent[-8:] if line)
     system_prompt = (
         "Write one fresh, natural spoken acknowledgement for a live customer-service call. "
-        "Use 4 to 6 words, one sentence, and the caller's language (" + language_name + "). "
+        "Use 4 to 8 words, one sentence, and the caller's language (" + language_name + "). "
         "Tie it to the topic the caller just raised and sound like a person responding to them. "
         "Do not narrate preparation, model or backend activity. Never say you are preparing an answer, "
         "working through details, putting something together, or confirming details. Do not answer, guess, "
@@ -232,12 +232,13 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
             {"role": "user", "content": (
                 f"Previous agent response: {agent_text[-300:]}\n"
                 f"Previous progress updates to avoid:\n{recent_text or '- none'}\n"
+                f"Acknowledgement seed to rephrase (do not repeat or closely paraphrase): {candidate}\n"
                 f"Caller: {caller_text[-500:]}"
             )},
         ],
         lambda text: _clean_dynamic_bridge(text, recent, candidate, lookup_requested, language),
         budget,
-        max_tokens=16,
+        max_tokens=20,
         temperature=0.7,
     )
     if diagnostics is not None:
