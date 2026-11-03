@@ -75,7 +75,7 @@ def pause_reply(caller_text: str, language: str = "en") -> str:
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:
-    """Use the fast model for ordinary conversation and the main model for clear product/order data.
+    """Use the fast model for ordinary conversation and grounded policy answers; keep product/order lookups careful.
 
     Both decisions use semantic classifiers. If either classifier cannot decide, keep the main model. General
     business questions still receive retrieved business knowledge; only live product and order turns need the
@@ -89,12 +89,32 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
     from meaning import is_foreign
     if is_foreign(caller_text):
         return None
+    try:
+        import store_intent
+        store_context = " ".join(" ".join(part for part in (earlier, agent_text) if part).split()[-25:])
+        ranked_store = store_intent.rank(caller_text, store_context)
+    except Exception:
+        return None
+    if ranked_store is None:
+        return None
+    store_scores = dict(ranked_store)
+    none_score = store_scores.get("none", 0.0)
+    product_score = store_scores.get("product", 0.0)
+    order_score = store_scores.get("order", 0.0)
+    policy_score = store_scores.get("policy", 0.0)
     # The whole turn, judged by meaning, clearly asks about the store's products or an order: the careful model, which
     # gets the live store data. The checks below read only the last sentence: "Okay. So I just bought a new house and
     # I was thinking about the handle and the basin. So is it possible?" was judged by "So is it possible?" and a
     # production call answered it on the fast model with no products at all.
-    if store_question(caller_text, " ".join(part for part in (earlier, agent_text) if part), lead=STORE_ROUTE_LEAD):
+    if (max(product_score, order_score) >= store_intent.STORE.min_score
+            and max(product_score, order_score) - none_score >= STORE_ROUTE_LEAD):
         return None
+    # Shopify policy text is retrieved into the answer prompt. When meaning clearly identifies a policy question and
+    # neither a product nor an order leads, the fast model can summarize those same live facts without waiting on the
+    # careful model route.
+    if (policy_score >= store_intent.STORE.min_score
+            and policy_score - max(product_score, order_score, none_score) >= store_intent.CLEAR_LEAD):
+        return fast
     is_simple = _simple_turn(caller_text, agent_text)
     if is_simple is True:
         return fast
@@ -120,18 +140,6 @@ def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = ""
     if kind in {None, "", "acknowledge", "closing", "detail"}:
         # Acknowledgements to our own question and unsolicited details need the conversation context.
         return None
-    try:
-        import store_intent
-        store_context = " ".join(" ".join(part for part in (earlier, agent_text) if part).split()[-25:])
-        ranked = store_intent.rank(caller_text, store_context)
-    except Exception:
-        return None
-    if ranked is None:
-        return None
-    scores = dict(ranked)
-    none_score = scores.get("none", 0.0)
-    order_score = scores.get("order", 0.0)
-    product_score = scores.get("product", 0.0)
     if order_score >= store_intent.STORE.min_score and order_score - none_score >= store_intent.CLEAR_LEAD:
         return None
     # Keep clearly identified catalogue questions on the careful model. Weak product matches often come from

@@ -254,6 +254,8 @@ def phones_match(left: Any, right: Any) -> bool:
 
 
 class ShopifyService:
+    POLICY_CACHE_SECONDS = 60
+
     def __init__(self) -> None:
         import os
 
@@ -266,6 +268,10 @@ class ShopifyService:
         self._token_expires_at = 0.0
         self._scopes: Optional[List[str]] = None
         self._lock = threading.Lock()
+        self._policies_lock = threading.Lock()
+        self._policies_cache: Optional[List[Dict[str, str]]] = None
+        self._policies_cache_at = 0.0
+        self._policies_cache_key: tuple = ("", "")
         self._caller_orders: Dict[str, Any] = {}  # caller digits -> (looked up at, orders)
         self._caller_lookups: Dict[str, threading.Event] = {}  # lookups still running
         self._catalog_words: tuple = (frozenset(), 0.0)  # (words, built at)
@@ -299,6 +305,10 @@ class ShopifyService:
             self._catalog_words = (frozenset(), 0.0)  # another store: learn its catalogue again
             self._index = ([], 0.0)
             self._index_retry_at = 0.0
+        with self._policies_lock:
+            self._policies_cache = None
+            self._policies_cache_at = 0.0
+            self._policies_cache_key = ("", "")
 
     @property
     def auth_mode(self) -> str:
@@ -1296,12 +1306,21 @@ class ShopifyService:
         return {"customers": rows, "next": page.get("endCursor") if page.get("hasNextPage") else None}
 
     def policies(self) -> List[Dict[str, str]]:
-        data = self.graphql("{ shop { shopPolicies { type title body } } }")
-        rows = []
-        for policy in (data.get("shop") or {}).get("shopPolicies", []):
-            text = re.sub(r"<[^>]+>", " ", policy.get("body") or "")
-            rows.append({"type": policy.get("type"), "title": policy.get("title"), "text": re.sub(r"\s+", " ", text).strip()})
-        return rows
+        cache_key = (self.store_domain, self.api_version)
+        with self._policies_lock:
+            if (self._policies_cache is not None and self._policies_cache_key == cache_key
+                    and time.monotonic() - self._policies_cache_at < self.POLICY_CACHE_SECONDS):
+                return [dict(policy) for policy in self._policies_cache]
+            data = self.graphql("{ shop { shopPolicies { type title body } } }")
+            rows = []
+            for policy in (data.get("shop") or {}).get("shopPolicies", []):
+                text = re.sub(r"<[^>]+>", " ", policy.get("body") or "")
+                rows.append({"type": policy.get("type"), "title": policy.get("title"),
+                             "text": re.sub(r"\s+", " ", text).strip()})
+            self._policies_cache = rows
+            self._policies_cache_at = time.monotonic()
+            self._policies_cache_key = cache_key
+            return [dict(policy) for policy in rows]
 
 
 shopify_service = ShopifyService()

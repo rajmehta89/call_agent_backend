@@ -57,3 +57,7 @@ services:
         value: pipecat
       - key: VOICE_SEMANTIC_BATCH_SIZE
         value: "1"
+      - key: VOICE_FAST_MODEL
+        value: meta-llama/llama-3.1-8b-instruct
+      - key: VOICE_BRIDGE_LATEST_MS
+        value: "3000"

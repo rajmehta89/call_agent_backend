@@ -1,10 +1,15 @@
 """A single wait acknowledgement that never holds up a ready voice answer."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import os
 import re
 from difflib import SequenceMatcher
 from time import perf_counter
+
+
+_BRIDGE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="voice-bridge")
 
 
 async def stream_in_background(iterator):
@@ -149,7 +154,9 @@ async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16
         return "", "", "", status, attempts
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(choose), timeout=budget)
+        loop = asyncio.get_running_loop()
+        context = copy_context()
+        return await asyncio.wait_for(loop.run_in_executor(_BRIDGE_EXECUTOR, context.run, choose), timeout=budget)
     except asyncio.TimeoutError:
         return "", "", "", "timeout", attempt_state["count"]
     except Exception as error:
@@ -223,13 +230,13 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
 
 
 def bridge_latest_seconds() -> float:
-    """VOICE_BRIDGE_LATEST_MS: no waiting phrase starts later than this after the caller finished (0 = no limit).
-    From the 2026-10-30 calls: bridges decided at 1.5-2.3 s started just as the answer was ready (median 2.1 s) and
-    held it back by the phrase's length, 1-2 s; the answer itself was then less than a second away."""
+    """VOICE_BRIDGE_LATEST_MS: stop looking for a fresh line after this much time, while the answer keeps racing.
+    The 2026-11-03 policy call needed about 1.5 s for semantic eligibility, then a short model request; the prior
+    1.2 s cutoff discarded that useful line before it could be generated."""
     try:
-        return max(0.0, float(os.getenv("VOICE_BRIDGE_LATEST_MS", "1200"))) / 1000
+        return max(0.0, float(os.getenv("VOICE_BRIDGE_LATEST_MS", "3000"))) / 1000
     except ValueError:
-        return 1.2
+        return 3.0
 
 
 async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None,

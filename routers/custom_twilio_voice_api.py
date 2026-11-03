@@ -1394,6 +1394,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         caller's first question is answered as fast as later ones (a cold first turn could take several seconds)."""
         nonlocal services
         from voice_control import has_followup_request, CALLER_PAUSE, HUMAN_REQUEST
+        from shopify_service import shopify_service
         try:
             if services is None:
                 services = await asyncio.to_thread(_voice_services)
@@ -1406,6 +1407,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 asyncio.to_thread(CALLER_PAUSE.rank, "hello"),
                 asyncio.to_thread(HUMAN_REQUEST.rank, "hello"),
                 asyncio.to_thread(_system_prompt, "hello", phone, "", None, True, preferred_language),
+                asyncio.to_thread(shopify_service.policies) if shopify_service.configured else asyncio.sleep(0),
                 speech_runtime.warm(_tts_engine_for_language(engine, preferred_language), preferred_language) if speech_runtime is not None else
                 speaker.warm() if speaker else _warm_tts_connection(engine),
                 return_exceptions=True,
@@ -1484,12 +1486,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     "bridge_state": bridge_state, "bridge_diagnostics": diagnostics,
                     "reply_timings": reply_timings, "sentences": sentences,
                     "first": first, "started": perf_counter()}
-        # The wait budget begins at the end of speech. Start checking eligibility while the early answer is already
-        # being prepared, so a caller-specific line can be ready inside that short window. No model request is made
-        # when eligibility says there is no suitable update, and a ready answer still cancels the bridge.
-        if bridges_enabled() and bridge_state.get("task") is None:
-            bridge_state["task"] = asyncio.create_task(prepare_bridge(
-                text, history, diagnostics, still_waiting=lambda: not first.done(), language=prepared["language"]))
+        # Bridge selection starts only after the real answer misses its short wait deadline. Speculative partial
+        # questions are often extended; doing semantic selection and a second model request for them competed with
+        # the answer and could leave cancelled Shopify/model work running on the throttled voice server.
         return prepared
 
     def drop_reply(prepared: Optional[Dict[str, Any]]) -> None:
@@ -1588,6 +1587,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             bridge_timing["bridge_first_audio_ms"] = bridge_timing["bridge_ms"] + round(audio_delay * 1000)
                         else:
                             sentence = chunk
+                bridge_timing.update({key: value for key, value in prepared.get("bridge_diagnostics", {}).items()
+                                      if key.startswith("bridge_")})
                 if not sentence:
                     sentence = "Sorry, I could not answer that just now."
                 if filler_spoken:
