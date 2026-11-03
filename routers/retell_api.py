@@ -94,7 +94,9 @@ VOICE_TURN_CHECKLIST = (
     "or confirmed, start with 'Not yet'. (5) Never ask for anything they already gave in this conversation. "
     "(6) State only facts from the business knowledge. (7) If you repeat a phone number or email the caller gave, copy it "
     "exactly as it was confirmed earlier in the conversation, digit by digit; if unsure, say 'the number you gave' instead. "
-    "(8) You already greeted the caller: never start a reply with Hi, Hello, Hi there, Hey or Welcome."
+    "(8) You already greeted the caller: never start a reply with Hi, Hello, Hi there, Hey or Welcome. "
+    "(9) For product questions, carry forward the room, item and preferences the caller already shared. Do not repeat a list "
+    "of categories already given; offer at most two relevant options and one focused follow-up."
 )
 
 
@@ -459,7 +461,8 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         "business introduction. A recorded no-answer transfer was not a successful connection. "
         "When a caller is exploring and unsure, help them take one useful step: offer two relevant options supported "
         "by the knowledge and ask one focused question. Use their already-stated room, product, size or budget; "
-        "do not ask the same broad question again or send them to the website instead of answering an answerable question. "
+        "do not repeat a category list already given, ask the same broad question again, or send them to the website "
+        "instead of answering an answerable question. Keep the reply concise and build on the caller's latest answer. "
         "In caller-facing replies, never describe internal preparation, AI, model, backend or system activity. "
         "Never say you are preparing an answer or working through details; start with the answer itself. "
         "If a separate progress acknowledgement has already been spoken, continue directly without repeating it."

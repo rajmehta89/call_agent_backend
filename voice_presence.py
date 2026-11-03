@@ -31,19 +31,76 @@ CONNECTION_CHECK = Classifier("caller connection check", {
 }, min_score=0.60, close_call=0.06)
 
 
-def is_connection_check(text: str) -> bool:
-    """Only confident standalone presence intent qualifies; ambiguous meaning changes nothing.
+def is_connection_check(text: str, earlier: str = "") -> bool:
+    """Require a confident semantic presence intent, using the prior agent turn to resolve weak matches.
 
     Shared meaning vectors provide translation for Urdu/Hindi and Arabic. There
-    are no keyword, phrase-matching or script-based intent fallbacks.
+    are no keyword, phrase-matching or script-based intent fallbacks. A weak
+    match is accepted only when the preceding agent turn supports that meaning.
     """
-    return CONNECTION_CHECK.close(text) == ["presence"]
+    if CONNECTION_CHECK.close(text) != ["presence"]:
+        return False
+    if not earlier:
+        return True
+    ranked = CONNECTION_CHECK.rank(text) or []
+    if ranked and ranked[0][0] == "presence" and ranked[0][1] >= 0.78:
+        return True
+    contextual = " ".join((earlier[-300:], text)).strip()
+    return CONNECTION_CHECK.close(contextual) == ["presence"]
 
 
-def connection_reply(language: str, pending: bool) -> str:
+def connection_reply(language: str, pending: bool, recent=()) -> str:
+    """Return a short, natural line without repeating one just heard in this call."""
     lines = {
-        "en": ("Yes, I can hear you. Please go ahead.", "Yes, I'm here. I'm still working on your question."),
-        "ur": ("جی، آپ کی آواز آ رہی ہے۔ بتائیے۔", "جی، میں موجود ہوں۔ آپ کے سوال پر کام کر رہا ہوں۔"),
-        "ar": ("نعم، أسمعك. تفضل.", "نعم، أنا هنا. ما زلت أعمل على سؤالك."),
+        "en": {
+            False: (
+                "Yes, I can hear you. Please go ahead.",
+                "I'm here, and I can hear you.",
+                "Yes, I'm here. What can I help with?",
+                "I can hear you clearly. Go ahead.",
+            ),
+            True: (
+                "Yes, I heard your question. I'll answer that.",
+                "I'm here, and I heard what you asked.",
+                "Yes, I have your question. Please go ahead.",
+                "I can hear you. I have your question.",
+            ),
+        },
+        "ur": {
+            False: (
+                "جی، آپ کی آواز آ رہی ہے۔ بتائیے۔",
+                "جی، میں سن رہا ہوں۔ آپ کہیے۔",
+                "میں آپ کو صاف سن سکتا ہوں۔",
+                "جی، میں موجود ہوں۔ آپ بتائیں۔",
+            ),
+            True: (
+                "جی، میں موجود ہوں۔ میں نے آپ کا سوال سن لیا ہے۔",
+                "جی، میں سن رہا ہوں۔ آپ اپنا سوال جاری رکھیں۔",
+                "آپ کی بات سن لی ہے۔ میں جواب دیتا ہوں۔",
+                "جی، آپ کا سوال میں نے سن لیا ہے۔",
+            ),
+        },
+        "ar": {
+            False: (
+                "نعم، أسمعك. تفضل.",
+                "أنا هنا وأسمعك بوضوح.",
+                "نعم، أنا هنا. كيف أساعدك؟",
+                "أسمعك جيدًا. تفضل.",
+            ),
+            True: (
+                "نعم، أنا هنا وقد سمعت سؤالك.",
+                "أسمعك، وقد فهمت ما سألت عنه.",
+                "نعم، سمعت سؤالك. تفضل.",
+                "أنا هنا، ويمكنك متابعة سؤالك.",
+            ),
+        },
     }
-    return lines[normalize_language(language)][int(pending)]
+    options = lines[normalize_language(language)][bool(pending)]
+    recent_items = [recent] if isinstance(recent, str) else (recent or ())
+    recent_lines = [str(line).strip() for line in recent_items]
+    for line in options:
+        if line not in recent_lines:
+            return line
+    last = next((line for line in reversed(recent_lines) if line in options), "")
+    next_index = (options.index(last) + 1) % len(options) if last else 0
+    return options[next_index]

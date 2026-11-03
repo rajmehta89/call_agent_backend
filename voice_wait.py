@@ -112,7 +112,8 @@ def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
     return line
 
 
-async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16, temperature=0.7):
+async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16, temperature=0.7,
+                              fallback_messages=None):
     """Try the fast bridge model, then its configured backup inside one shared deadline."""
     from voice_turns import bridge_fallback_model, bridge_line_model
 
@@ -152,7 +153,7 @@ async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16
             try:
                 response = client.with_options(timeout=attempt_timeout, max_retries=0).chat.completions.create(
                     model=model,
-                    messages=messages,
+                    messages=(fallback_messages if role == "fallback" and fallback_messages else messages),
                     max_tokens=max_tokens,
                     temperature=temperature,
                     extra_body=getattr(services, "_openrouter_extra_body", lambda _model: None)(model),
@@ -225,21 +226,39 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
             "without claiming to check or verify it. Use fresh wording, not a fixed template."
         )
 
+    user_context = (
+        f"Previous agent response: {agent_text[-300:]}\n"
+        f"Previous progress updates to avoid:\n{recent_text or '- none'}\n"
+        f"Acknowledgement seed to rephrase (do not repeat or closely paraphrase): {candidate}\n"
+        f"Caller: {caller_text[-500:]}"
+    )
+    bridge_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_context},
+    ]
+    fallback_prompt = (
+        "Write one fresh spoken progress line for this caller in " + language_name + ". "
+        "Use 4 to 8 words in one natural sentence, tied to the caller's topic. Do not answer the question, repeat "
+        "the previous update, use a stock waiting phrase, or describe internal work. Return only the sentence."
+    )
+    fallback_prompt += (
+        " A live lookup is happening; you may mention checking the specific topic, but do not imply a result."
+        if lookup_requested else
+        " No live lookup is happening, so do not say you are checking or verifying anything."
+    )
+    fallback_messages = [
+        {"role": "system", "content": fallback_prompt},
+        {"role": "user", "content": user_context},
+    ]
+
     selected, model_used, model_role, model_status, model_attempts = await request_bridge_line(
         services,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                f"Previous agent response: {agent_text[-300:]}\n"
-                f"Previous progress updates to avoid:\n{recent_text or '- none'}\n"
-                f"Acknowledgement seed to rephrase (do not repeat or closely paraphrase): {candidate}\n"
-                f"Caller: {caller_text[-500:]}"
-            )},
-        ],
+        bridge_messages,
         lambda text: _clean_dynamic_bridge(text, recent, candidate, lookup_requested, language),
         budget,
         max_tokens=20,
         temperature=0.7,
+        fallback_messages=fallback_messages,
     )
     if diagnostics is not None:
         diagnostics.update(bridge_selector="dynamic_model" if selected else "none",

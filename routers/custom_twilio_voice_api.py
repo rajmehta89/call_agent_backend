@@ -936,6 +936,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     presence_task: Optional[asyncio.Task[Any]] = None
     presence_noted = False
     last_presence_notice = float("-inf")
+    recent_presence_replies: List[str] = []
     presence_counts = {"checks": 0, "reassurances": 0, "preserved_answers": 0}
     transfer_pending = False  # Once promised, a new caller fragment must not cancel the handoff.
     earlier_handoff_text = ""  # keep an unclear team request so a short follow-up is read in context
@@ -1113,6 +1114,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.warning("custom voice: could not end call %s: %s", call_sid, error)
 
+    async def caller_is_connection_check(text: str) -> bool:
+        earlier = last_agent_text(memory.history())
+        try:
+            return await asyncio.to_thread(is_connection_check, text, earlier)
+        except TypeError:
+            # Keep one-argument semantic adapters compatible while they are being upgraded.
+            return await asyncio.to_thread(is_connection_check, text)
+
     async def reassure_presence(text: str, pending: bool) -> None:
         nonlocal last_presence_notice
         async with speech_lock:
@@ -1123,7 +1132,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if perf_counter() - last_presence_notice < 4:
                 return
             last_presence_notice = perf_counter()
-            line = connection_reply(preferred_language, pending)
+            line = connection_reply(preferred_language, pending, recent_presence_replies)
+            recent_presence_replies.append(line)
+            del recent_presence_replies[:-8]
             await speak_audio(line)
             presence_counts["reassurances"] += 1
             responses.append({"content": line, "timestamp": utc_iso(), "language": preferred_language})
@@ -1523,15 +1534,15 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         return True
 
     def start_reply(text: str, bridge_state=None, bridge_diagnostics=None) -> Dict[str, Any]:
-        """Start the main answer; bridge preparation begins when the final utterance is committed."""
+        """Start a speculative answer whose bridge can be prepared during the caller's pause."""
         history = memory.history()
         diagnostics = bridge_diagnostics if bridge_diagnostics is not None else {}
         bridge_state = bridge_state if bridge_state is not None else {"task": None}
         reply_timings: Dict[str, Any] = {}
 
         async def stream():
-            # The answer starts immediately. Bridge preparation starts after the final caller turn is committed,
-            # so speculative partials do not generate wording for a sentence the caller has not finished.
+            # Neither the answer nor its bridge is spoken until the utterance is committed. If the caller continues,
+            # drop_reply cancels both speculative requests.
             async with contextlib.aclosing(_voice_sentences(services, text, history, caller, memory.summary, "", contact_phone,
                                                               preferred_language, timings=reply_timings)) as source:
                 async for sentence in source:
@@ -1742,12 +1753,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         idle = (reply_task is None or reply_task.done()) and not bot_busy()
         if early_reply or not candidate or candidate != heard_text or services is None or not idle:
             return
-        if await asyncio.to_thread(is_connection_check, candidate):
+        if await caller_is_connection_check(candidate):
             return  # no speculative business lookup for a connection check
         if candidate != heard_text or early_reply or bot_busy():
             return  # transcript or call state changed while semantics ran off the loop
         try:
             early_reply = start_reply(heard_text)
+            start_prepared_bridge(early_reply)
         except Exception as error:
             logger.debug("early reply start failed: %s", error)
 
@@ -1952,7 +1964,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             logger.info("custom voice heard call=%s during handoff: %s", call_sid, text[:120])
             save_progress()
             return
-        if await asyncio.to_thread(is_connection_check, text):
+        if await caller_is_connection_check(text):
             drop_reply(prepared)
             pending = bool(unanswered_text and reply_task and not reply_task.done())
             interrupted_pending_turn = False
@@ -2093,7 +2105,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     # Real words (not line noise) while the agent is busy means the caller is barging in.
                     if bot_busy() and payload.get("event") in {"Update", "StartOfTurn"}:
                         spoke_over_agent = spoke_over_agent or bool(words)
-                        connection_check = bool(words) and await asyncio.to_thread(is_connection_check, " ".join(words))
+                        connection_check = bool(words) and await caller_is_connection_check(" ".join(words))
                         if connection_check:
                             pass  # preserve useful work while the caller checks the line
                         elif payload.get("event") == "StartOfTurn" and len(words) >= 2 and not early_reply:
@@ -2157,7 +2169,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 # Real words (not line noise) while the agent is busy means the caller is barging in.
                 if bot_busy():
                     spoke_over_agent = True
-                    if not await asyncio.to_thread(is_connection_check, text):
+                    if not await caller_is_connection_check(text):
                         pause = await asyncio.to_thread(pause_request, text)
                         if pause:
                             await interrupt(force=True)
