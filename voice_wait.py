@@ -64,6 +64,12 @@ _BRIDGE_ANSWER_CUES = re.compile(
 )
 _BRIDGE_STOCK_OPENER = re.compile(r"^\s*(?:mm+|um+|one moment|just a moment|okay[, ]+just a moment)\b", re.I)
 _BRIDGE_LOOKUP_VERB = re.compile(r"\b(?:check\w*|look\w*|find\w*|see|pull\w*)\b", re.I)
+_BRIDGE_PROCESS_NARRATION = re.compile(
+    r"\b(?:prepar\w*|generat\w*|process\w*|working through|putting (?:that|this|it) together|"
+    r"clarifying (?:the|your)|confirming (?:the|your)|(?:product )?details will be confirmed|"
+    r"(?:the|your) answer|backend|our system)\b",
+    re.I,
+)
 
 
 def bridge_is_duplicate(line, recent, threshold=0.82):
@@ -95,6 +101,8 @@ def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
         return ""
     if _BRIDGE_STOCK_OPENER.search(line):
         return ""
+    if _BRIDGE_PROCESS_NARRATION.search(line):
+        return ""  # a caller should hear a human acknowledgement, never a description of internal work
     if language == "en" and bool(_BRIDGE_LOOKUP_VERB.search(line)) != bool(lookup):
         return ""  # only claim to check something when the live lookup actually runs
     if bridge_is_duplicate(line, (*recent, semantic_candidate)):
@@ -193,16 +201,25 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
     language_name = {"en": "English", "ur": "Urdu", "ar": "Arabic"}.get(str(language or "en").lower(), "the caller's language")
     recent_text = "\n".join(f"- {str(line)[-180:]}" for line in recent[-8:] if line)
     system_prompt = (
-        "Write one fresh, natural spoken progress update for a live customer-service call. "
+        "Write one fresh, natural spoken acknowledgement for a live customer-service call. "
         "Use 4 to 6 words, one sentence, and the caller's language (" + language_name + "). "
-        "Tie it to the topic the caller just raised. Do not answer, guess, give facts, ask a question, "
-        "greet, or use a generic wait phrase such as 'Mm', 'one moment', or 'just a moment'. "
+        "Tie it to the topic the caller just raised and sound like a person responding to them. "
+        "Do not narrate preparation, model or backend activity. Never say you are preparing an answer, "
+        "working through details, putting something together, or confirming details. Do not answer, guess, "
+        "give facts, ask a question, greet, or use a generic wait phrase such as 'Mm', 'one moment', or 'just a moment'. "
         "Avoid the wording of the previous agent update. Return only the sentence. "
     )
     if lookup_requested:
-        system_prompt += "A store lookup may start after call routing, but it has not started yet; only say you are preparing that topic."
+        system_prompt += (
+            "A live store lookup is the next step for this topic. You may say you will check the specific item, order, "
+            "or policy, but do not imply you found or confirmed anything. Use a fresh, topic-specific construction, "
+            "not a stock template."
+        )
     else:
-        system_prompt += "No live store lookup is running; say you are preparing the answer, not checking an external source."
+        system_prompt += (
+            "No live store lookup is used for this turn. Acknowledge the topic or say what you can explain, "
+            "without claiming to check or verify it. Use fresh wording, not a fixed template."
+        )
 
     selected, model_used, model_role, model_status, model_attempts = await request_bridge_line(
         services,
@@ -214,7 +231,7 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
                 f"Caller: {caller_text[-500:]}"
             )},
         ],
-        lambda text: _clean_dynamic_bridge(text, recent, candidate, False, language),
+        lambda text: _clean_dynamic_bridge(text, recent, candidate, lookup_requested, language),
         budget,
         max_tokens=16,
         temperature=0.7,

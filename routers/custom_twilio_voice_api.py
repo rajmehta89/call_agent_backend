@@ -1160,6 +1160,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if "turn_detection_ms" in timing:
             timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + timing["first_audible_ms"]
         voice_turn_timings.append(timing)
+        logger.info(
+            "custom voice control call=%s action=%s route_ms=%s tts_first_audio_ms=%s "
+            "bridge_played=%s bridge_audio_ms=%s callback_outreach_ms=%s",
+            call_sid, action, timing.get("routing_ms", "n/a"), timing.get("tts_first_audio_ms", "n/a"),
+            bool(timing.get("bridge_text")), timing.get("bridge_first_audio_ms", "n/a"),
+            timing.get("callback_outreach_ms", "n/a"),
+        )
         spoken_line = " ".join(part for part in ((turn_timing or {}).get("bridge_text", ""), line) if part)
         memory.add(text, spoken_line)
         responses.append({"content": spoken_line, "timestamp": spoke_at, "language": preferred_language})
@@ -1260,6 +1267,58 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         else:
             if bridge_state.get("task") and not bridge_state["task"].done():
                 bridge_state["task"].cancel()
+
+        async def create_callback_with_progress(callback_number, reason, contact_email="", conversation_history=None):
+            """Keep a slow callback write covered by one fresh, contextual acknowledgement."""
+            operation_started = perf_counter()
+            operation = asyncio.create_task(asyncio.to_thread(
+                call_forwarding.create_callback_outreach,
+                callback_number,
+                text,
+                call_sid,
+                "",
+                reason,
+                contact_email=contact_email,
+                conversation_history=conversation_history or memory.history(),
+            ))
+            diagnostics: Dict[str, Any] = {}
+            bridge_pending = False
+
+            async def callback_result():
+                yield await operation
+
+            async def callback_bridge():
+                if turn_timing.get("bridge_text"):
+                    return ""  # one progress line per caller turn is enough
+                return await prepare_bridge(
+                    text, memory.history(), diagnostics,
+                    still_waiting=lambda: not operation.done(), language=preferred_language,
+                )
+
+            def record_callback_bridge(line):
+                nonlocal bridge_pending
+                bridge_pending = True
+                turn_timing.update(diagnostics)
+                turn_timing.update(bridge_text=line, bridge_ms=round((perf_counter() - heard_at) * 1000))
+
+            deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
+            result = None
+            stream = with_wait_bridge(
+                callback_result(), callback_bridge, "", deadline, operation_started,
+                record_callback_bridge, claim_bridge=claim_bridge_line,
+            )
+            async with contextlib.aclosing(stream):
+                async for item in stream:
+                    if bridge_pending:
+                        bridge_pending = False
+                        delay = await speak(item.strip())
+                        turn_timing["bridge_first_audio_ms"] = turn_timing["bridge_ms"] + round(delay * 1000)
+                    else:
+                        result = item
+            turn_timing.update(diagnostics)
+            turn_timing["callback_outreach_ms"] = round((perf_counter() - operation_started) * 1000)
+            return result
+
         if intent in {"callback_ack", "declined"}:
             earlier_handoff_text = ""
             drop_reply(prepared)
@@ -1280,12 +1339,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                 return
             email = contact_email_from_messages(memory.history())
             callback_number = contact_phone or caller
-            await asyncio.to_thread(
-                call_forwarding.create_callback_outreach,
+            await create_callback_with_progress(
                 callback_number,
-                text,
-                call_sid,
-                "",
                 "The caller requested a callback. Please follow up using the caller's phone number.",
                 contact_email=email,
                 conversation_history=memory.history(),
@@ -1302,12 +1357,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             # is unavailable or the caller did not clearly say "now". Create the outreach for that person.
             earlier_handoff_text = ""
             drop_reply(prepared)
-            destination = await asyncio.to_thread(
-                call_forwarding.create_callback_outreach,
+            destination = await create_callback_with_progress(
                 caller,
-                text,
-                call_sid,
-                "",
                 "The caller asked to speak with a specific team member. Please follow up with this caller.",
                 contact_email=contact_email_from_messages(memory.history()),
                 conversation_history=memory.history(),
@@ -1618,7 +1669,17 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             if "turn_detection_ms" in timing:
                 timing["speech_end_to_first_audible_ms"] = timing["turn_detection_ms"] + timing["first_audible_ms"]
             voice_turn_timings.append(timing)
-            logger.info("custom voice turn call=%s first_sentence=%.2fs first_audio=%.2fs total=%.2fs", call_sid, brain_seconds, first_audio, brain_seconds + first_audio)
+            logger.info(
+                "custom voice turn call=%s first_sentence=%.2fs first_audio=%.2fs total=%.2fs "
+                "bridge_played=%s bridge_selector=%s bridge_status=%s bridge_audio_ms=%s "
+                "bridge_ready_ms=%s prompt_ms=%s model_wait_ms=%s",
+                call_sid, brain_seconds, first_audio, brain_seconds + first_audio,
+                bool(timing.get("filler_played")), timing.get("bridge_selector", "none"),
+                timing.get("bridge_model_status", "n/a"), timing.get("bridge_first_audio_ms", "n/a"),
+                timing.get("bridge_ready_ms", "n/a"),
+                timing.get("prompt_ms", timing.get("prompt_caller_ms", "n/a")),
+                timing.get("model_wait_ms", "n/a"),
+            )
             async for sentence in sentences:
                 spoken.append(sentence)
                 await speak(sentence)

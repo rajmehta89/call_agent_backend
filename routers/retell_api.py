@@ -459,7 +459,10 @@ def _system_prompt(caller_text: str, caller_number: str, summary: str = "", hist
         "business introduction. A recorded no-answer transfer was not a successful connection. "
         "When a caller is exploring and unsure, help them take one useful step: offer two relevant options supported "
         "by the knowledge and ask one focused question. Use their already-stated room, product, size or budget; "
-        "do not ask the same broad question again or send them to the website instead of answering an answerable question."
+        "do not ask the same broad question again or send them to the website instead of answering an answerable question. "
+        "In caller-facing replies, never describe internal preparation, AI, model, backend or system activity. "
+        "Never say you are preparing an answer or working through details; start with the answer itself. "
+        "If a separate progress acknowledgement has already been spoken, continue directly without repeating it."
     )
     if phone and re.fullmatch(r"\+?[0-9 ()-]{8,}", phone):
         handoff_rules += " A reachable caller-ID phone number is already available. Use it for the callback unless the caller asks for a different number; do not ask them to provide or reconfirm it."
