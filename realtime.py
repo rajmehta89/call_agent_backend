@@ -33,17 +33,23 @@ def attach_loop(loop: asyncio.AbstractEventLoop) -> None:
     _loop = loop
 
 
-# Bumped on every change; caches of inbox data (inbox_api._threads) are valid only for the version they were built at.
+# General event sequence plus a thread-state sequence. Raw call transcript events can arrive several times
+# during one call, but they do not change the thread rows until the async summary refresh publishes a thread event.
 version = 0
+thread_version = 0
+
+_THREAD_CACHE_INVALIDATING_KINDS = {"thread", "assignment", "stage", "close", "profile", "reset"}
 
 
 def publish(kind: str, **data: Any) -> None:
     """Tell every open dashboard that something of this kind changed. Never raises."""
-    global version
+    global version, thread_version
     if kind == "call":
         from thread_summaries import schedule_refresh
         schedule_refresh(data.get("key"))
     version += 1
+    if kind in _THREAD_CACHE_INVALIDATING_KINDS:
+        thread_version += 1
     if _loop is None or _loop.is_closed():
         return
     event = {"kind": kind, **{key: value for key, value in data.items() if value is not None}}

@@ -23,6 +23,7 @@ Every write is logged as "inbox: <action> ..." so it can be followed with tail_l
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from timeutil import utc_now
@@ -240,19 +241,27 @@ def _display_name(key: str, lead: Optional[Dict[str, Any]], owners: Dict[str, st
 
 
 # The sidebar, the list and the open conversation all poll; reuse the thread list briefly instead of
-# re-reading every call each time. Any change (realtime.publish) makes it stale immediately.
+# re-reading every caller summary each time. Only changes to thread state invalidate this cache; raw call
+# transcript events are summarized asynchronously and do not make the cached rows stale.
 THREADS_CACHE_SECONDS = 5
 _threads_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "rows": []}
+_threads_cache_lock = threading.Lock()
 
 
 def _threads() -> List[Dict[str, Any]]:
     """Every caller thread, newest activity first, with its assignment (cached, see THREADS_CACHE_SECONDS)."""
     now = time.monotonic()
-    if _threads_cache["version"] == realtime.version and now - _threads_cache["at"] < THREADS_CACHE_SECONDS:
+    if _threads_cache["version"] == realtime.thread_version and now - _threads_cache["at"] < THREADS_CACHE_SECONDS:
         return _threads_cache["rows"]
-    rows = _build_threads()
-    _threads_cache.update(version=realtime.version, at=now, rows=rows)
-    return rows
+    # Concurrent sidebar/count requests used to all rebuild the same thread list at once.
+    with _threads_cache_lock:
+        now = time.monotonic()
+        version = realtime.thread_version
+        if _threads_cache["version"] == version and now - _threads_cache["at"] < THREADS_CACHE_SECONDS:
+            return _threads_cache["rows"]
+        rows = _build_threads()
+        _threads_cache.update(version=version, at=time.monotonic(), rows=rows)
+        return rows
 
 
 def _build_threads() -> List[Dict[str, Any]]:
@@ -360,16 +369,27 @@ def _notify_team_operation(user: Dict[str, Any], kind: str, title: str, message:
 
 @router.get("/counts")
 def folder_counts(user: Dict[str, Any] = Depends(require_user)):
+    started = time.perf_counter()
     _require_db()
+    threads_started = time.perf_counter()
     threads = _threads()
+    threads_ms = round((time.perf_counter() - threads_started) * 1000)
     threads = [thread for thread in threads if not thread["closed"]]  # every count is of open conversations
     counts = {folder: sum(1 for thread in threads if _in_folder(thread, folder, _user_id(user))) for folder in ("all", "unassigned", "mine", "assigned", "failed")}
+    mentions_started = time.perf_counter()
     counts["mentioned"] = mongo_client.team_messages.count_documents({**_mention_query(user), "read_by": {"$ne": _user_id(user)}})
+    mentions_ms = round((time.perf_counter() - mentions_started) * 1000)
+    channel_started = time.perf_counter()
     counts["channel"] = mongo_client.team_messages.count_documents(_unread_channel_query(user))
+    channel_ms = round((time.perf_counter() - channel_started) * 1000)
     counts["live"] = sum(1 for thread in threads if thread["live"])
     for stage in STAGE_LABELS:
         counts[f"stage:{stage}"] = sum(1 for thread in threads if thread["stage"] == stage)
     logger.debug("inbox: counts for %s -> %s", user.get("email"), counts)
+    total_ms = round((time.perf_counter() - started) * 1000)
+    if total_ms >= 500:
+        logger.warning("inbox: slow counts for %s total_ms=%d threads_ms=%d threads=%d mentions_ms=%d channel_ms=%d",
+                       user.get("email"), total_ms, threads_ms, len(threads), mentions_ms, channel_ms)
     return {"success": True, "data": counts}
 
 
