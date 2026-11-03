@@ -36,14 +36,14 @@ from routers.retell_api import voice_turn_reminder, SpokenReplyGuard, _max_respo
 from routers.retell_api import _SemanticPrefetch, _TranslationPrefetch
 from voice_turns import prepare_turn_meaning, needs_facts
 from meaning import english_text, is_foreign as meaning_foreign
-from voice_turns import asks_to_repeat, pause_request, pause_reply, STATUS_PHRASES, LOOKUP_BRIDGES, contact_email_followup_note, contact_email_from_messages
+from voice_turns import asks_to_repeat, pause_request, pause_reply, contact_email_followup_note, contact_email_from_messages
 from conversation_memory import ConversationMemory, voice_history_token_budget
-from voice_wait import stream_in_background, with_wait_bridge, wait_message
+from voice_wait import bridge_is_duplicate, stream_in_background, with_wait_bridge, wait_message
 from voice_presence import is_connection_check, connection_reply
 from voice_spoken import for_voice
-from voice_turns import wait_bridge_phrase, complete_nova_turn, late_filler, late_filler_seconds, bridge_lines, bridge_said, spoken_bridge
+from voice_turns import wait_bridge_phrase, complete_nova_turn, bridge_lines, bridge_said, spoken_bridge
 import call_forwarding
-from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, silence_filler_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
+from voice_turns import caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, provided_contact_phone, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, status_after_seconds, status_phrase, ALL_BRIDGES, FAST_TURN_NOTE, call_is_over, yes_to_offer_note, search_text
 from voice_keyterms import business_name, current_keyterms
 import live_transcript
 from logging_setup import bind_call, timed
@@ -943,7 +943,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     contact_tasks: set[asyncio.Task[Any]] = set()
     pending_mark = ""
     mark_count = 0
-    recent_bridges: List[str] = []  # acknowledgements said so far, so the last few are never repeated
+    recent_bridges: List[str] = []  # every bridge reserved for speech during this call
     # Question currently being answered, until its reply starts playing.
     unanswered_text = ""
     unanswered_turn: Optional[Dict[str, str]] = None
@@ -1197,14 +1197,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         agent_text = last_agent_text(memory.history())
         turn_timing = dict(turn_timing or {})
         bridge_diagnostics = prepared["bridge_diagnostics"] if prepared else {}
-        bridge_ready = prepared["bridge_ready"] if prepared else asyncio.create_task(
-            prepare_bridge(text, memory.history(), bridge_diagnostics))
+        bridge_state = prepared["bridge_state"] if prepared else {"task": None}
         # The answer is written while the person/callback check runs, not after it: answers ready at 1.9 s were heard
         # at 4.0-4.3 s behind that check (2026-10-31). A turn that asks for a person drops it (every branch below does).
         if prepared is None:
             if services is None:
                 services = await asyncio.to_thread(_voice_services)
-            prepared = start_reply(text, bridge_ready, bridge_diagnostics)
+            prepared = start_reply(text, bridge_state, bridge_diagnostics)
 
         async def resolve():
             checks_started = perf_counter()
@@ -1224,12 +1223,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             yield intent
 
         async def routing_notice():
-            line = await asyncio.shield(bridge_ready)
+            line = await get_prepared_bridge(prepared)
             if prepared and prepared["first"].done():
                 # The answer is ready and only the routing check is still running: a phrase now would just hold the
                 # answer back by its length (ready at 0.6 s, heard at 2.1 s behind one, 2026-10-30).
                 return ""
-            return spoken_bridge(STATUS_PHRASES[0], preferred_language) if bridge_said(line) in LOOKUP_BRIDGES else line
+            return line
 
         bridge_pending = False
         def record_notice(line):
@@ -1239,24 +1238,28 @@ async def custom_media_stream(websocket: WebSocket) -> None:
 
         deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
         try:
-            async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "", deadline, heard_at, record_notice)) as routed:
+            async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "", deadline, heard_at,
+                                                            record_notice, claim_bridge=claim_bridge_line)) as routed:
                 async for item in routed:
                     if bridge_pending:
                         bridge_pending = False
-                        recent_bridges.append(item.strip())
+                        if prepared["first"].done():
+                            continue
                         delay = await speak(item.strip())
                         turn_timing["bridge_first_audio_ms"] = turn_timing["bridge_ms"] + round(delay * 1000)
                     else:
                         intent = item
         except BaseException:
-            bridge_ready.cancel()
+            if bridge_state.get("task") and not bridge_state["task"].done():
+                bridge_state["task"].cancel()
             drop_reply(prepared)
             raise
         turn_timing.update(bridge_diagnostics)
         if not intent:
-            prepared = prepared or start_reply(text, bridge_ready, bridge_diagnostics)
+            prepared = prepared or start_reply(text, bridge_state, bridge_diagnostics)
         else:
-            bridge_ready.cancel()
+            if bridge_state.get("task") and not bridge_state["task"].done():
+                bridge_state["task"].cancel()
         if intent in {"callback_ack", "declined"}:
             earlier_handoff_text = ""
             drop_reply(prepared)
@@ -1410,33 +1413,60 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         except Exception as error:
             logger.debug("call warm-up failed: %s", error)
 
-    async def prepare_bridge(text, history, diagnostics=None):
+    async def prepare_bridge(text, history, diagnostics=None, still_waiting=None):
         diagnostics = diagnostics if diagnostics is not None else {}
         started = perf_counter()
         if not bridges_enabled():
             diagnostics.update(bridge_candidate=False, bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
+        if still_waiting is not None and not still_waiting():
+            diagnostics.update(bridge_candidate=False, bridge_selector="none",
+                               bridge_ready_ms=round((perf_counter() - started) * 1000))
+            return ""
         eligibility_started = perf_counter()
         earlier_text = " ".join(" ".join(earlier_caller_texts(history, text)[-8:]).split()[-25:])
         await asyncio.to_thread(prepare_turn_meaning, text, last_agent_text(history), earlier_text)
-        recent = [bridge_said(line) or line for line in recent_bridges[-3:]]  # in English, whatever language was said
-        candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent,
+        recent_phrases = list(recent_bridges)
+        recent_context = recent_phrases + [str(item.get("content") or "") for item in history
+                                           if item.get("role") in {"assistant", "agent"}]
+        candidate = await asyncio.to_thread(wait_bridge_phrase, text, recent_phrases,
                                            " ".join(earlier_caller_texts(history, text)[-8:]))
         diagnostics.update(bridge_candidate=bool(candidate),
                            bridge_eligibility_ms=round((perf_counter() - eligibility_started) * 1000))
-        if not candidate:
+        if not candidate or (still_waiting is not None and not still_waiting()):
             diagnostics.update(bridge_selector="none", bridge_ready_ms=round((perf_counter() - started) * 1000))
             return ""
         bridge_services = services or await asyncio.to_thread(_voice_services)
-        selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent, diagnostics)
+        selected = await wait_message(bridge_services, candidate, text, last_agent_text(history), recent_context, diagnostics,
+                                      language=preferred_language)
+        if still_waiting is not None and not still_waiting():
+            selected = ""
         diagnostics["bridge_ready_ms"] = round((perf_counter() - started) * 1000)
         return spoken_bridge(selected, preferred_language)  # in the call's language (only neutral ones there)
 
-    def start_reply(text: str, bridge_ready=None, bridge_diagnostics=None) -> Dict[str, Any]:
+    async def get_prepared_bridge(prepared: Dict[str, Any]) -> str:
+        state = prepared["bridge_state"]
+        task = state.get("task")
+        if task is None:
+            task = asyncio.create_task(prepare_bridge(
+                prepared["text"], prepared["history"], prepared["bridge_diagnostics"],
+                still_waiting=lambda: not prepared["first"].done()))
+            state["task"] = task
+        return await asyncio.shield(task)
+
+    def claim_bridge_line(line: str) -> bool:
+        history_text = [str(item.get("content") or "") for item in memory.history()
+                        if item.get("role") in {"assistant", "agent"}]
+        if bridge_is_duplicate(line, [*recent_bridges, *history_text]):
+            return False
+        recent_bridges.append(line)
+        return True
+
+    def start_reply(text: str, bridge_state=None, bridge_diagnostics=None) -> Dict[str, Any]:
         """Prepare the real answer independently of semantic bridge selection."""
         history = memory.history()
         diagnostics = bridge_diagnostics if bridge_diagnostics is not None else {}
-        bridge_ready = bridge_ready if bridge_ready is not None else asyncio.create_task(prepare_bridge(text, history, diagnostics))
+        bridge_state = bridge_state if bridge_state is not None else {"task": None}
         reply_timings: Dict[str, Any] = {}
 
         async def stream():
@@ -1448,7 +1478,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     yield sentence
 
         sentences = stream().__aiter__()
-        return {"text": text, "language": preferred_language, "bridge_ready": bridge_ready, "bridge_diagnostics": diagnostics,
+        return {"text": text, "history": history, "language": preferred_language,
+                "bridge_state": bridge_state, "bridge_diagnostics": diagnostics,
                 "reply_timings": reply_timings, "sentences": sentences,
                 "first": asyncio.ensure_future(sentences.__anext__()), "started": perf_counter()}
 
@@ -1456,7 +1487,9 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         """Throw away a reply that was prepared early but will not be used (the caller said something else)."""
         if not prepared:
             return
-        prepared["bridge_ready"].cancel()
+        bridge_task = prepared["bridge_state"].get("task")
+        if bridge_task and not bridge_task.done():
+            bridge_task.cancel()
         if prepared["first"].done():
             asyncio.ensure_future(prepared["sentences"].aclose())
         else:
@@ -1514,30 +1547,32 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     return
 
             async def make_bridge():
-                return await prepared["bridge_ready"]
+                return await get_prepared_bridge(prepared)
 
             def record_bridge(line):
                 nonlocal bridge_pending
                 bridge_pending = True
                 bridge_timing["bridge_ms"] = round((perf_counter() - heard_at) * 1000)
 
+            def cancel_bridge_choice():
+                task = prepared["bridge_state"].get("task")
+                if task and not task.done():
+                    task.cancel()
+
             deadline = (_filler_after_seconds() or max(bridge_delay_seconds(), status_after_seconds())) if bridges_enabled() else 0
-            stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at, record_bridge,
-                                      late_line="" if prefix or not bridges_enabled() else spoken_bridge(
-                                          late_filler([bridge_said(line) or line for line in recent_bridges]), preferred_language),
-                                      late_after=late_filler_seconds(),
-                                      silence_line="" if prefix or not bridges_enabled() else spoken_bridge(
-                                          late_filler([bridge_said(line) or line for line in recent_bridges]), preferred_language),
-                                      silence_after=silence_filler_seconds())
+            stream = with_wait_bridge(first_sentence(), make_bridge, "", 0 if prefix else deadline, heard_at,
+                                      record_bridge, claim_bridge=claim_bridge_line,
+                                      cancel_bridge=cancel_bridge_choice)
             try:
                 sentence = ""
                 async with contextlib.aclosing(stream):
                     async for chunk in stream:
                         if bridge_pending:
                             bridge_pending = False
+                            if first.done():
+                                continue
                             filler_spoken = True
                             line = chunk.strip()
-                            recent_bridges.append(line)
                             spoken.append(line)
                             spoke_at = utc_iso()
                             audio_delay = await speak(line, cache_key=_audio_cache_key(line, engine, preferred_language))
@@ -1590,10 +1625,12 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                                            "stopped_ms": round((perf_counter() - heard_at) * 1000)})
             elif "interrupted" not in timing:
                 timing["interrupted"] = True
-            prepared["bridge_ready"].cancel()
+            bridge_task = prepared["bridge_state"].get("task")
+            if bridge_task and not bridge_task.done():
+                bridge_task.cancel()
             if not first.done():
                 first.cancel()  # interrupted before the first sentence: stop the model request too
-            await asyncio.gather(first, prepared["bridge_ready"], return_exceptions=True)
+            await asyncio.gather(first, *([bridge_task] if bridge_task else []), return_exceptions=True)
             await sentences.aclose()
             # Record what the caller actually heard, also when they interrupted part-way through.
             if spoken:

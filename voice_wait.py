@@ -1,8 +1,9 @@
 """A single wait acknowledgement that never holds up a ready voice answer."""
 
 import asyncio
-import json
 import os
+import re
+from difflib import SequenceMatcher
 from time import perf_counter
 
 
@@ -53,93 +54,171 @@ async def stream_in_background(iterator):
         worker.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)
 
 
-async def wait_message(services, fallback, caller_text, agent_text="", recent=(), diagnostics=None):
-    """Ask the small model to choose a safe bridge while the real answer runs; always keep the approved fallback."""
-    if not fallback:
+_BRIDGE_ANSWER_CUES = re.compile(
+    r"\d|[$€£]|\b(?:yes|no|yeah|nope|costs?|priced|in stock|available)\b", re.I
+)
+_BRIDGE_STOCK_OPENER = re.compile(r"^\s*(?:mm+|um+|one moment|just a moment|okay[, ]+just a moment)\b", re.I)
+_BRIDGE_LOOKUP_VERB = re.compile(r"\b(?:check\w*|look\w*|find\w*|see|pull\w*)\b", re.I)
+
+
+def bridge_is_duplicate(line, recent, threshold=0.82):
+    """Match a progress line against every prior sentence said during this call."""
+    normalized = " ".join(re.findall(r"[^\W_]+", str(line or "").casefold()))
+    if not normalized:
+        return False
+    recent = [recent] if isinstance(recent, str) else recent
+    for previous in recent or ():
+        for sentence in re.split(r"(?<=[.!?؟۔])\s+", str(previous or "")):
+            candidate = " ".join(re.findall(r"[^\W_]+", sentence.casefold()))
+            if not candidate:
+                continue
+            if normalized == candidate or SequenceMatcher(None, normalized, candidate).ratio() >= threshold:
+                return True
+            words, other_words = set(normalized.split()), set(candidate.split())
+            if len(words | other_words) >= 4 and len(words & other_words) / len(words | other_words) >= 0.78:
+                return True
+    return False
+
+
+def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
+    """Accept one brief progress line, never an answer, repeated line, or generic waiting phrase."""
+    recent = [recent] if isinstance(recent, str) else list(recent or ())
+    line = " ".join(str(text or "").replace('"', "").replace("`", "").split()).strip(" '`")
+    line = re.split(r"(?<=[.!?؟۔])\s+", line, maxsplit=1)[0].strip()
+    words = line.split()
+    if not 4 <= len(words) <= 6 or "?" in line or "؟" in line or _BRIDGE_ANSWER_CUES.search(line):
         return ""
-    started = perf_counter()
-    from voice_turns import STATUS_PHRASES, bridge_line_model, bridge_model_seconds
+    if _BRIDGE_STOCK_OPENER.search(line):
+        return ""
+    if language == "en" and bool(_BRIDGE_LOOKUP_VERB.search(line)) != bool(lookup):
+        return ""  # only claim to check something when the live lookup actually runs
+    if bridge_is_duplicate(line, (*recent, semantic_candidate)):
+        return ""
+    if line[-1:] not in ".!؟۔":
+        line += "."
+    return line
 
-    # VOICE_BRIDGE_MODEL (default off): the line passed in is already chosen by meaning for this turn. Asking the
-    # small model to re-pick it timed out on 4 of 10 production Retell attempts (450 ms each) for no better line.
-    if os.getenv("VOICE_BRIDGE_MODEL", "false").strip().lower() not in {"1", "true", "yes", "on"}:
-        if diagnostics is not None:
-            diagnostics.update(bridge_selector="semantic", bridge_model_attempted=False,
-                               bridge_model_status="off", bridge_model_ms=0)
-        return fallback
 
-    model = bridge_line_model()
+async def request_bridge_line(services, messages, cleaner, budget, max_tokens=16, temperature=0.7):
+    """Try the fast bridge model, then its configured backup inside one shared deadline."""
+    from voice_turns import bridge_fallback_model, bridge_line_model
+
     client = getattr(services, "openai_client", None)
-    if not model or client is None:
-        if diagnostics is not None:
-            diagnostics.update(bridge_selector="semantic_fallback", bridge_model_attempted=False,
-                               bridge_model_status="unavailable", bridge_model_ms=0)
-        return fallback
+    if client is None:
+        return "", "", "", "unavailable", 0
 
-    recent = {recent} if isinstance(recent, str) else set(recent or ())
-    choices = list(dict.fromkeys(line for line in (fallback, *STATUS_PHRASES) if line and line not in recent))
-    if not choices:
-        if diagnostics is not None:
-            diagnostics.update(bridge_selector="semantic_fallback", bridge_model_attempted=False,
-                               bridge_model_status="no_options", bridge_model_ms=0)
-        return fallback
-    budget = bridge_model_seconds()
+    configured = [
+        ("primary", bridge_line_model()),
+        ("fallback", bridge_fallback_model(getattr(services, "fallback_model", ""))),
+    ]
+    models = []
+    seen = set()
+    for role, model in configured:
+        if model and model not in seen:
+            models.append((role, model))
+            seen.add(model)
+    if not models:
+        return "", "", "", "unavailable", 0
+
+    started = perf_counter()
+    attempt_state = {"count": 0}
 
     def choose():
-        response = client.with_options(timeout=budget, max_retries=0).chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    "Choose the single approved short waiting line that best fits this phone conversation. "
-                    "The actual answer is being prepared separately. Do not answer, add wording, or reason aloud. "
-                    "Return only JSON: {\"index\": integer}. Approved lines: " + json.dumps(choices)
-                )},
-                {"role": "user", "content": f"Previous agent line: {agent_text}\nCaller: {caller_text}"},
-            ],
-            max_tokens=12,
-            temperature=0,
-            extra_body=getattr(services, "_openrouter_extra_body", lambda _model: None)(model),
-        )
-        body = response.choices[0].message.content or "{}"
-        cleaned = body.strip()
-        payload = None
-        try:
-            payload = json.loads(cleaned)
-        except (json.JSONDecodeError, TypeError):
-            # Some small-model gateways wrap JSON in a code fence or include a
-            # short preamble. Decode the first JSON object without accepting
-            # any free-form bridge text.
-            start = cleaned.find("{")
-            if start >= 0:
-                try:
-                    payload, _ = json.JSONDecoder().raw_decode(cleaned[start:])
-                except json.JSONDecodeError:
-                    payload = None
-        value = payload.get("index") if isinstance(payload, dict) else payload
-        if isinstance(value, str) and value.strip().isdigit():
-            value = int(value.strip())
-        if type(value) is int and 0 <= value < len(choices):
-            return choices[value], True, "selected"
-        # Accept the exact approved line when the model ignores the JSON shape.
-        # Exact membership keeps the model from adding a second response or facts.
-        approved = cleaned.strip("` \n\r\t\"'")
-        if approved in choices:
-            return approved, True, "selected"
-        return fallback, False, "invalid_response"
+        status = "error"
+        attempts = 0
+        for role, model in models:
+            remaining = budget - (perf_counter() - started)
+            if remaining <= 0.025:
+                break
+            attempts += 1
+            attempt_state["count"] = attempts
+            try:
+                response = client.with_options(timeout=remaining, max_retries=0).chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body=getattr(services, "_openrouter_extra_body", lambda _model: None)(model),
+                )
+                line = cleaner(response.choices[0].message.content or "")
+                if line:
+                    return line, model, role, "generated", attempts
+                status = "invalid_response"
+            except Exception as error:
+                status = type(error).__name__.lower()
+        return "", "", "", status, attempts
 
-    selected = fallback
-    model_selected = False
-    model_status = "error"
     try:
-        selected, model_selected, model_status = await asyncio.wait_for(asyncio.to_thread(choose), timeout=budget)
+        return await asyncio.wait_for(asyncio.to_thread(choose), timeout=budget)
     except asyncio.TimeoutError:
-        model_status = "timeout"
+        return "", "", "", "timeout", attempt_state["count"]
     except Exception as error:
-        model_status = type(error).__name__.lower()
+        return "", "", "", type(error).__name__.lower(), 1
+
+
+async def wait_message(services, candidate, caller_text, agent_text="", recent=(), diagnostics=None, language="en"):
+    """Generate a fresh progress line only when a slow turn needs one; never speak fixed fallback wording."""
+    if not candidate:
+        return ""
+    started = perf_counter()
+    from voice_turns import LOOKUP_BRIDGES, bridge_said, dynamic_bridge_seconds
+
+    # VOICE_BRIDGE_MODEL: phrase the already-approved semantic bridge in fresh words for this caller.
+    if os.getenv("VOICE_BRIDGE_MODEL", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        if diagnostics is not None:
+            diagnostics.update(bridge_selector="none", bridge_model_attempted=False,
+                               bridge_model_status="off", bridge_model_ms=0)
+        return ""
+
+    client = getattr(services, "openai_client", None)
+    from voice_turns import bridge_fallback_model, bridge_line_model
+    if not (bridge_line_model() or bridge_fallback_model(getattr(services, "fallback_model", ""))) or client is None:
+        if diagnostics is not None:
+            diagnostics.update(bridge_selector="none", bridge_model_attempted=False,
+                               bridge_model_status="unavailable", bridge_model_ms=0)
+        return ""
+
+    recent = [recent] if isinstance(recent, str) else list(recent or ())
+    from voice_languages import normalize_language
+    language = normalize_language(language)
+    budget = dynamic_bridge_seconds()
+    lookup_requested = bridge_said(candidate) in LOOKUP_BRIDGES
+    language_name = {"en": "English", "ur": "Urdu", "ar": "Arabic"}.get(str(language or "en").lower(), "the caller's language")
+    recent_text = "\n".join(f"- {str(line)[-180:]}" for line in recent[-8:] if line)
+    system_prompt = (
+        "Write one fresh, natural spoken progress update for a live customer-service call. "
+        "Use 4 to 6 words, one sentence, and the caller's language (" + language_name + "). "
+        "Tie it to the topic the caller just raised. Do not answer, guess, give facts, ask a question, "
+        "greet, or use a generic wait phrase such as 'Mm', 'one moment', or 'just a moment'. "
+        "Avoid the wording of the previous agent update. Return only the sentence. "
+    )
+    if lookup_requested:
+        system_prompt += "A store lookup may start after call routing, but it has not started yet; only say you are preparing that topic."
+    else:
+        system_prompt += "No live store lookup is running; say you are preparing the answer, not checking an external source."
+
+    selected, model_used, model_role, model_status, model_attempts = await request_bridge_line(
+        services,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": (
+                f"Previous agent response: {agent_text[-300:]}\n"
+                f"Previous progress updates to avoid:\n{recent_text or '- none'}\n"
+                f"Caller: {caller_text[-500:]}"
+            )},
+        ],
+        lambda text: _clean_dynamic_bridge(text, recent, candidate, False, language),
+        budget,
+        max_tokens=16,
+        temperature=0.7,
+    )
     if diagnostics is not None:
-        diagnostics.update(bridge_selector="fast_model" if model_selected else "semantic_fallback",
+        diagnostics.update(bridge_selector="dynamic_model" if selected else "none",
                            bridge_model_attempted=True, bridge_model_status=model_status,
-                           bridge_model_ms=round((perf_counter() - started) * 1000))
+                           bridge_model_ms=round((perf_counter() - started) * 1000),
+                           bridge_dynamic=bool(selected), bridge_model_used=model_used,
+                           bridge_model_role=model_role, bridge_model_attempts=model_attempts,
+                           bridge_model_fallback_used=model_role == "fallback")
     return selected
 
 
@@ -148,13 +227,14 @@ def bridge_latest_seconds() -> float:
     From the 2026-10-30 calls: bridges decided at 1.5-2.3 s started just as the answer was ready (median 2.1 s) and
     held it back by the phrase's length, 1-2 s; the answer itself was then less than a second away."""
     try:
-        return max(0.0, float(os.getenv("VOICE_BRIDGE_LATEST_MS", "1500"))) / 1000
+        return max(0.0, float(os.getenv("VOICE_BRIDGE_LATEST_MS", "1200"))) / 1000
     except ValueError:
-        return 1.5
+        return 1.2
 
 
 async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started_at, on_bridge=None,
-                           late_line="", late_after=0.0, latest=None, silence_line="", silence_after=0.0):
+                           late_line="", late_after=0.0, latest=None, silence_line="", silence_after=0.0,
+                           claim_bridge=None, cancel_bridge=None):
     """Race the first answer against the wait deadline and bridge generation.
     A semantic rejection remains a rejection after the late deadline. Elapsed
     time alone never gives a turn permission to play a waiting phrase.
@@ -168,6 +248,14 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
 
     def too_late() -> bool:
         return latest > 0 and perf_counter() - started_at > latest
+
+    def claim(line: str) -> bool:
+        if not line or claim_bridge is None:
+            return bool(line)
+        try:
+            return bool(claim_bridge(line))
+        except Exception:
+            return False
 
     iterator = source.__aiter__()
     first = asyncio.create_task(anext(iterator))
@@ -196,6 +284,9 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
                             rejected = not line
                         except Exception:
                             line = fallback
+                    if line and not claim(line):
+                        line = ""
+                        rejected = True
                     if line:
                         said = True
                         if on_bridge is not None:
@@ -206,15 +297,18 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
             if remaining > 0:
                 await asyncio.wait({first}, timeout=remaining)
             if not first.done():
-                said = True
-                if on_bridge is not None:
-                    on_bridge(late_line)
-                yield late_line + " "
-        if not said and silence_line and silence_after > 0 and not first.done():
+                if claim(late_line):
+                    said = True
+                    if on_bridge is not None:
+                        on_bridge(late_line)
+                    yield late_line + " "
+                else:
+                    rejected = True
+        if not said and not rejected and silence_line and silence_after > 0 and not first.done():
             remaining = silence_after - (perf_counter() - started_at)
             if remaining > 0:
                 await asyncio.wait({first}, timeout=remaining)
-            if not first.done():
+            if not first.done() and claim(silence_line):
                 said = True
                 if on_bridge is not None:
                     on_bridge(silence_line)
@@ -226,6 +320,11 @@ async def with_wait_bridge(source, make_bridge, fallback, after_seconds, started
         async for chunk in iterator:
             yield chunk
     finally:
+        if cancel_bridge is not None:
+            try:
+                cancel_bridge()
+            except Exception:
+                pass
         tasks = [task for task in (first, choice) if task is not None]
         for task in tasks:
             if not task.done():

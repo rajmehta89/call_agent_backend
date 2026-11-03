@@ -129,6 +129,11 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     if bridge_selector is not None:
         monkeypatch.setattr(custom, "wait_bridge_phrase", bridge_selector)
         monkeypatch.setattr(custom, "choose_voice_model", lambda *args: None)
+
+        async def dynamic_bridge_line(*args, **kwargs):
+            return "I'm preparing your product options."
+
+        monkeypatch.setattr(custom, "wait_message", dynamic_bridge_line)
     # The live server loads the local search model at startup; here its first load would block the test's event loop.
     monkeypatch.setattr(custom.brain_service, "prefetch_query_embedding", lambda *a, **k: None)
     monkeypatch.setenv("CUSTOM_FILLER_AFTER_SECONDS", "0")
@@ -180,8 +185,8 @@ def test_slow_product_answer_gets_one_bridge_even_when_audio_was_not_warmed(monk
     run_call(monkeypatch, [(0.3, "I'm looking for a round basin.", True, True)],
              tts=tts, bridges=True, model_seconds=0.3, call_seconds=1.2,
              bridge_selector=lambda *args: "Let me check that for you.", logged=logged)
-    assert spoken.count("Let me check that for you.") == 1
-    assert spoken.index("Let me check that for you.") < spoken.index("Here is the answer.")
+    assert spoken.count("I'm preparing your product options.") == 1
+    assert spoken.index("I'm preparing your product options.") < spoken.index("Here is the answer.")
     timing = logged[-1]["voice_turn_timings"][0]
     assert timing["bridge_first_audio_ms"] < timing["first_audio_ms"]
     assert timing["stt_engine"] == "nova"
@@ -675,8 +680,8 @@ def test_slow_semantic_routing_gets_one_bridge_before_the_answer(monkeypatch):
     run_call(monkeypatch, [(0.2, "What services do you provide?", True, True)],
              tts=tts, logged=logged, bridges=True, model_seconds=0.1, call_seconds=1.3,
              bridge_selector=lambda *args: "Just putting that together for you.")
-    assert spoken.count("Just putting that together for you.") == 1
-    assert spoken.index("Just putting that together for you.") < spoken.index("Here is the answer.")
+    assert spoken.count("I'm preparing your product options.") == 1
+    assert spoken.index("I'm preparing your product options.") < spoken.index("Here is the answer.")
     assert logged[-1]["voice_turn_timings"][0]["bridge_first_audio_ms"] < logged[-1]["voice_turn_timings"][0]["first_audio_ms"]
 
 

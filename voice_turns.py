@@ -28,6 +28,13 @@ def bridge_line_model() -> str:
     return os.getenv("VOICE_BRIDGE_LINE_MODEL", "").strip() or fast_voice_model()
 
 
+def bridge_fallback_model(default: str = "") -> str:
+    """Bridge-only override, then the configured answer fallback (or the service's fallback model)."""
+    return (os.getenv("VOICE_BRIDGE_FALLBACK_MODEL", "").strip()
+            or os.getenv("VOICE_FALLBACK_MODEL", "").strip()
+            or str(default or "").strip())
+
+
 def needs_facts(caller_text: str) -> bool:
     """True when the caller asked something (a question needs the main model and the business knowledge)."""
     from turn_meaning import CALLER_TURN
@@ -923,12 +930,15 @@ _SAID_BRIDGES = {translated: english for lines in BRIDGE_TRANSLATIONS.values() f
 
 def spoken_bridge(line: str, language: str = "en") -> str:
     """The bridge to say in the caller's language: English as is; in another language its translation, or ""
-    for an acknowledgement that has none (see NEUTRAL_BRIDGES)."""
+    for a fixed acknowledgement with no translation (see NEUTRAL_BRIDGES). Generated bridges are already localized."""
     from voice_languages import normalize_language
     code = normalize_language(language)
     if not line or code == "en":
         return line
-    return BRIDGE_TRANSLATIONS.get(code, {}).get(line, "")
+    translated = BRIDGE_TRANSLATIONS.get(code, {}).get(line)
+    if translated:
+        return translated
+    return "" if line in ALL_BRIDGES else line
 
 
 def bridge_lines(language: str = "en") -> tuple:
@@ -988,7 +998,7 @@ def status_after_seconds() -> float:
 
 
 def bridges_enabled() -> bool:
-    """VOICE_BRIDGE: say a short acknowledgement that fits what the caller said, while the answer is prepared."""
+    """VOICE_BRIDGE: say a brief, caller-specific status while a slower answer is prepared."""
     return os.getenv("VOICE_BRIDGE", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
@@ -1036,23 +1046,29 @@ def bridge_kind(caller_text: str, earlier: str = "") -> str:
     itself must handle that). A question the live store answers gets a short "let me check" (`earlier`: what the
     caller said before, for follow-ups such as "how much is that one?")."""
     words = re.findall(r"[a-z']+", caller_text.lower())
-    if len(words) < 4:
-        return ""  # "Hello?", "Yes", "So what?": answer straight away
+    if len(words) < 4 and not (earlier and (store_lookup_runs(caller_text, earlier)
+                                             or store_question(caller_text, earlier))):
+        return ""  # "Hello?", "Yes", "So what?": answer straight away; product follow-ups use their context
     if pause_request(caller_text) or is_acknowledgement(caller_text):
         return ""
     from turn_meaning import CALLER_TURN, CONTACT
     turn_text = kind_of_turn_text(caller_text)
     kind = CALLER_TURN.best(turn_text)
     if kind is None:
-        return ""  # Do not invent an intent when the semantic model is unavailable.
+        # Product and order intent has its own semantic classifier: a slow store-related answer still merits an update
+        # even when the general turn classifier cannot choose a category.
+        return "search" if CONTACT.best(caller_text) != "email" and store_question(caller_text, earlier) else ""
     if kind == "request" and not _clear_lead(CALLER_TURN.rank(turn_text)):
         # "What's your phone number?" scored request, detail and question within 0.01: "Yeah, I can sort that out."
         # before a plain answer sounded wrong. Only a clear request ("Can someone call me back?") gets one.
         kind = "question"
     if kind in ("clarify", "request", "problem"):
         return kind
-    if kind not in ("acknowledge", "closing", "sensitive") and CONTACT.best(caller_text) != "email" and store_lookup_runs(caller_text, earlier):
-        return "lookup"  # A shopping statement can be labelled "detail" even though it starts a catalogue lookup.
+    if kind not in ("acknowledge", "closing", "sensitive") and CONTACT.best(caller_text) != "email":
+        if store_lookup_runs(caller_text, earlier):
+            return "lookup"  # A shopping statement can be labelled "detail" even though it starts a catalogue lookup.
+        if store_question(caller_text, earlier):
+            return "search"  # Product/order answers can still take time when no live catalogue is connected.
     if kind == "compound":
         return "detail"
     if kind in ("", "acknowledge", "closing", "detail", "sensitive"):
@@ -1101,7 +1117,8 @@ def wait_bridge_phrase(caller_text: str, recent=(), earlier: str = "") -> str:
     if pause_request(caller_text) or is_acknowledgement(caller_text):
         return ""
     words = re.findall(r"[a-z']+", caller_text.lower())
-    if len(words) < 3 and not (earlier and store_lookup_runs(caller_text, earlier)):
+    if len(words) < 3 and not (earlier and (store_lookup_runs(caller_text, earlier)
+                                              or store_question(caller_text, earlier))):
         return ""  # Do not turn a one-word repair like "What?" into a wait or clarification loop.
     phrase = bridge_phrase(caller_text, recent, earlier)
     if phrase:
@@ -1128,6 +1145,14 @@ def bridge_model_seconds() -> float:
         return min(450.0, max(100.0, float(os.getenv("VOICE_BRIDGE_MODEL_MS", "450")))) / 1000
     except ValueError:
         return 0.45
+
+
+def dynamic_bridge_seconds() -> float:
+    """VOICE_DYNAMIC_BRIDGE_MS: budget for generating a fresh, caller-specific status line."""
+    try:
+        return min(800.0, max(100.0, float(os.getenv("VOICE_DYNAMIC_BRIDGE_MS", "400")))) / 1000
+    except ValueError:
+        return 0.4
 
 
 # The small model only phrases what to say while the store lookup runs; it is given no facts and must not answer.

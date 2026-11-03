@@ -25,9 +25,9 @@ from typing import Any, Dict, List, Optional
 from voice_keyterms import business_name
 from voice_turns import prepare_turn_meaning, needs_facts
 from voice_turns import asks_to_repeat, pause_request, pause_reply, status_after_seconds, status_phrase, is_acknowledgement, contact_email_followup_note, contact_email_from_messages
-from voice_wait import stream_in_background, with_wait_bridge, wait_message
-from voice_turns import wait_bridge_phrase, late_filler, late_filler_seconds
-from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_line_model, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
+from voice_wait import bridge_is_duplicate, request_bridge_line, stream_in_background, with_wait_bridge, wait_message
+from voice_turns import wait_bridge_phrase
+from voice_turns import caller_country_line, caller_region, describe_caller_id, name_note, NumberSpeaker, known_numbers, reply_known_numbers, caller_number_digits, choose_voice_model, contact_check, last_agent_text, place_note, careful_voice_model, earlier_caller_texts, bridges_enabled, bridge_phrase, bridge_note, bridge_delay_seconds, ALL_BRIDGES, FAST_TURN_NOTE, LOOKUP_BRIDGES, bridge_model_seconds, clean_lookup_bridge, fast_voice_model, lookup_bridge_messages, call_is_over, yes_to_offer_note, search_text, bridge_said, spoken_bridge
 
 from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 
@@ -643,7 +643,7 @@ def _voice_prompt(business: str, channel: Dict[str, Any], caller: str, phone: Op
         "the fuller answer; a simple yes or no question can be shorter.\n"
         "- Every detail you add must be written in the business knowledge. Never add offers, discounts, free delivery, thresholds, "
         "times, or promises that are not written there; if there is nothing more to add, a shorter answer is better than an invented one.\n"
-        "- Start straight with the answer. Never open with filler such as Sure, Great, Absolutely, Certainly, Of course, Got it, Perfect, or I'd love to.\n"
+        "- Start straight with the answer and avoid filler. The call system may give a brief, contextual progress update while preparing it; do not repeat or paraphrase that update.\n"
         "- Ask at most one question per reply, and only when you need it to help them. Never ask for something they already told you.\n"
         "- Plain spoken words only: no lists, bullet points, symbols, emojis, links, or formatting.\n"
         "- You are the assistant, not the owner: refer to the owner by name in the third person, never 'I build' or 'my rate'.\n"
@@ -1029,7 +1029,8 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
             bridge = spoken_bridge(bridge, language)
         elif bridge:
             if bridge in LOOKUP_BRIDGES:
-                bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), bridge, call_id, response_id)
+                bridge = await _lookup_bridge(services, caller_text, last_agent_text(transcript), call_id, response_id,
+                                              recent=said)
             else:
                 await asyncio.sleep(bridge_delay_seconds())  # caller carries on: Retell cancels this reply before it is said
         if bridge:
@@ -1140,33 +1141,29 @@ async def _stream_reply_with_facts(services, transcript, caller_number, call_id,
                     pass
 
 
-async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, fallback: str, call_id: str, response_id: int,
-                         delay_seconds: Optional[float] = None) -> str:
-    """What to say while the store lookup runs, phrased for this question by the small fast model ("Let me check the
-    Lydia mixer for you."): no facts, no reasoning, just the line. Never said before bridge_delay_seconds (if the caller
-    carries on, Retell cancels this reply first); slower than bridge_model_seconds or unsafe, the fixed phrase."""
+async def _lookup_bridge(services: AIServices, caller_text: str, agent_text: str, call_id: str, response_id: int,
+                         recent=(), delay_seconds: Optional[float] = None) -> str:
+    """Phrase a lookup update with the fast model and its fallback under one shared deadline; unsafe or repeated lines
+    are skipped. The answer continues if neither model supplies a fresh line."""
     started = perf_counter()
-    model = bridge_line_model()
-    client = getattr(services, "openai_client", None)
-    line = ""
-    if model and client is not None:
-        def ask() -> str:
-            response = client.chat.completions.create(
-                model=model, messages=lookup_bridge_messages(caller_text, agent_text), max_tokens=24, temperature=0.5,
-                extra_body=services._openrouter_extra_body(model), timeout=bridge_model_seconds(),
-            )
-            return response.choices[0].message.content or ""
-        try:
-            line = clean_lookup_bridge(await asyncio.wait_for(asyncio.to_thread(ask), timeout=bridge_model_seconds()))
-        except Exception as error:
-            logger.info("voice: lookup bridge from %s skipped (%s)", model, type(error).__name__)
+    recent = [recent] if isinstance(recent, str) else list(recent or ())
+
+    def clean_fresh_lookup(text: str) -> str:
+        line = clean_lookup_bridge(text)
+        return "" if bridge_is_duplicate(line, recent) else line
+
+    line, model_used, model_role, status, attempts = await request_bridge_line(
+        services, lookup_bridge_messages(caller_text, agent_text), clean_fresh_lookup,
+        bridge_model_seconds(), max_tokens=24, temperature=0.5,
+    )
     waited = perf_counter() - started
     delay = bridge_delay_seconds() if delay_seconds is None else delay_seconds
-    if waited < delay:
+    if line and waited < delay:
         await asyncio.sleep(delay - waited)
-    _trace(f"retell_lookup_bridge call={call_id} response_id={response_id} source={'model' if line else 'fixed'} "
-           f"ms={waited * 1000:.0f} said={(line or fallback)!r}")
-    return line or fallback
+    _trace(f"retell_lookup_bridge call={call_id} response_id={response_id} source={model_role or 'none'} "
+           f"model={model_used or 'none'} fallback={model_role == 'fallback'} status={status} attempts={attempts} "
+           f"ms={waited * 1000:.0f} said={line!r}")
+    return line
 
 
 @router.get("/config", dependencies=[Depends(require_user)])
@@ -1365,6 +1362,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
     handoff_pending = False
     user_messages: List[Dict[str, str]] = []
     agent_messages: List[Dict[str, str]] = []
+    recent_bridges: List[str] = []  # every progress line reserved for speech during this call
     live_messages: List[Dict[str, str]] = []  # ordered transcript for the inbox, saved after every turn
     prefetched_text, prefetched_at = "", 0.0  # last caller words sent for an early knowledge-search embedding
     semantic_prefetch = _SemanticPrefetch()
@@ -1424,6 +1422,13 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
         async with send_lock:
             await websocket.send_json(payload)
 
+    def claim_bridge_line(line: str) -> bool:
+        previous = [*recent_bridges, *(str(item.get("content") or "") for item in agent_messages)]
+        if bridge_is_duplicate(line, previous):
+            return False
+        recent_bridges.append(line)
+        return True
+
     def save_progress(transcript: Any, reply: str = "") -> None:
         """Rebuild the ordered transcript from Retell's (it is always complete and in order) and save it.
         Lines keep the time they were first seen; Retell's live transcript carries no timings."""
@@ -1482,21 +1487,31 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         streamed = False
         bridge_prelude = ""
-        recent = [phrase for item in transcript if item.get("role") == "assistant"
-                  if (phrase := bridge_said(item.get("content", "")))][-3:]
+        prior_agent_text = [str(item.get("content") or "") for item in transcript if item.get("role") == "assistant"]
+        recent = [*recent_bridges, *prior_agent_text]
         bridge_language = text_language(caller_text) or "en"  # bridges are said in the caller's language
 
         async def prepare_notice():
             if not caller_text or not bridges_enabled():
                 return ""
             bridge_started = perf_counter()
+            if early_first is not None and early_first.done():
+                timing.update(bridge_candidate=False, bridge_selector="none",
+                              bridge_ready_ms=round((perf_counter() - bridge_started) * 1000))
+                return ""
             earlier = " ".join(" ".join(earlier_caller_texts(transcript, caller_text)[-8:]).split()[-25:])
             await asyncio.to_thread(prepare_turn_meaning, caller_text, last_agent_text(transcript), earlier)
-            candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent,
+            candidate = await asyncio.to_thread(wait_bridge_phrase, caller_text, recent_bridges,
                 " ".join(earlier_caller_texts(transcript, caller_text)[-8:]))
             if candidate:
                 timing.update(bridge_candidate=True, bridge_eligibility_ms=round((perf_counter() - bridge_started) * 1000))
-                selected = await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent, timing)
+                if early_first is not None and early_first.done():
+                    timing.update(bridge_selector="none", bridge_ready_ms=round((perf_counter() - bridge_started) * 1000))
+                    return ""
+                selected = await wait_message(services, candidate, caller_text, last_agent_text(transcript), recent, timing,
+                                             language=bridge_language)
+                if early_first is not None and early_first.done():
+                    selected = ""
                 timing["bridge_ready_ms"] = round((perf_counter() - bridge_started) * 1000)
                 return spoken_bridge(selected, bridge_language)
             else:
@@ -1505,8 +1520,7 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                               bridge_selector="none")
             return candidate
 
-        bridge_ready = asyncio.create_task(prepare_notice())
-        asyncio.current_task().add_done_callback(lambda _: bridge_ready.cancel())
+        bridge_state: Dict[str, Optional[asyncio.Task[str]]] = {"task": None}
         # The prompt with business facts builds while the handoff check runs: on production it took 0.7-2.2 s.
         facts_prompt = (start_facts_prompt(caller_text, transcript, caller_number)
                         if caller_text and event.get("interaction_type") == "response_required" else None)
@@ -1521,10 +1535,23 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             early_first = asyncio.ensure_future(anext(early_reply))
             asyncio.current_task().add_done_callback(lambda _: early_first.cancel())
 
+        async def get_bridge():
+            task = bridge_state["task"]
+            if task is None:
+                task = asyncio.create_task(prepare_notice())
+                bridge_state["task"] = task
+            return await asyncio.shield(task)
+
+        def cancel_bridge_on_done(_):
+            task = bridge_state["task"]
+            if task is not None and not task.done():
+                task.cancel()
+
+        asyncio.current_task().add_done_callback(cancel_bridge_on_done)
+
         async def routing_notice():
-            line = await asyncio.shield(bridge_ready)
-            # A live lookup has not started until routing completes.
-            return spoken_bridge("I'm working through the details now.", bridge_language) if bridge_said(line) in LOOKUP_BRIDGES else line
+            line = await get_bridge()
+            return "" if early_first is not None and early_first.done() else line
 
         async def resolve():
             direct = await asyncio.to_thread(call_forwarding.contextual_handoff_intent, caller_text, last_agent_text(transcript), callback_requested)
@@ -1547,11 +1574,17 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
 
         if caller_text:
             async with contextlib.aclosing(with_wait_bridge(resolve(), routing_notice, "",
-                    status_after_seconds() if bridges_enabled() else 0, speech_ended)) as routed:
+                    status_after_seconds() if bridges_enabled() else 0, speech_ended,
+                    claim_bridge=claim_bridge_line)) as routed:
                 async for item in routed:
                     if isinstance(item, tuple):
                         transfer_intent, ending = item
                     else:
+                        if response_id != latest_response_id:
+                            _trace(f"retell_llm_stale_bridge call={call_id} response_id={response_id}")
+                            return
+                        if early_first is not None and early_first.done():
+                            continue
                         bridge_prelude = item
                         timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
                         await send_event({"response_type": "response", "response_id": response_id,
@@ -1627,21 +1660,32 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                 source = _stream_reply(services, transcript, caller_number, call_id, response_id, reminder=reminder,
                                        started_at=turn_started, timings=timing, inline_bridge=False, facts_prompt=facts_prompt)
             async def make_bridge():
-                return await asyncio.shield(bridge_ready)
+                return await get_bridge()
+
+            def cancel_bridge_choice():
+                task = bridge_state["task"]
+                if task is not None and not task.done():
+                    task.cancel()
 
             fallback = ""  # make_bridge supplies a phrase only after this turn has qualified.
+            bridge_pending = False
             def record_bridge(line):
+                nonlocal bridge_pending
+                bridge_pending = True
                 timing["bridge_ms"] = round((perf_counter() - turn_started) * 1000)
             stream = with_wait_bridge(source, make_bridge, fallback,
                                       status_after_seconds() if bridges_enabled() and not reminder and not bridge_prelude else 0, speech_ended,
-                                      on_bridge=record_bridge,
-                                      late_line="" if reminder or bridge_prelude or not bridges_enabled() else spoken_bridge(late_filler(recent), bridge_language),
-                                      late_after=late_filler_seconds())
+                                      on_bridge=record_bridge, claim_bridge=claim_bridge_line,
+                                      cancel_bridge=cancel_bridge_choice)
             async with contextlib.aclosing(stream):
                 async for chunk in stream:
                     if response_id != latest_response_id:
                         _trace(f"retell_llm_stale_response call={call_id} response_id={response_id}")
                         return
+                    if bridge_pending:
+                        bridge_pending = False
+                        if early_first is not None and early_first.done():
+                            continue
                     answer_parts.append(chunk)
                     if not streamed:
                         timing["first_text_ms"] = round((perf_counter() - turn_started) * 1000)
