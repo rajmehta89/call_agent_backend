@@ -243,7 +243,7 @@ def _display_name(key: str, lead: Optional[Dict[str, Any]], owners: Dict[str, st
 # The sidebar, the list and the open conversation all poll; reuse the thread list briefly instead of
 # re-reading every caller summary each time. Only changes to thread state invalidate this cache; raw call
 # transcript events are summarized asynchronously and do not make the cached rows stale.
-THREADS_CACHE_SECONDS = 5
+THREADS_CACHE_SECONDS = 30
 _threads_cache: Dict[str, Any] = {"version": -1, "at": 0.0, "rows": []}
 _threads_cache_lock = threading.Lock()
 
