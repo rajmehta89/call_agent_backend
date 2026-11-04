@@ -21,12 +21,17 @@ SUPPORTED_LANGUAGES: Dict[str, Dict[str, Any]] = {
     "ar": {"label": "Arabic", "native_label": "العربية", "locale": "ar-SA", "also_called": [], "understands": []},
     "ur": {"label": "Urdu", "native_label": "اردو", "locale": "ur-PK", "also_called": ["Hindi"],
            "understands": ["Hindi", "Hinglish"]},
+    # Punjabi as spoken and written in India (Gurmukhi script, pa-IN). Speech recognition is Deepgram Nova-3 "pa" (not
+    # in Flux or Nova-3 multi) and the voice is ElevenLabs (Deepgram has no Punjabi voice): see custom_twilio_voice_api.
+    "pa": {"label": "Punjabi", "native_label": "ਪੰਜਾਬੀ", "locale": "pa-IN", "also_called": [], "understands": []},
 }
 # The switches are read on every voice turn (the language rule); a short cache keeps that off the database.
 _ENABLED_CACHE_SECONDS = 30.0
 _enabled_cache: Dict[str, Any] = {"codes": None, "at": 0.0}
 _enabled_lock = threading.Lock()
-DEFAULT_ENABLED_LANGUAGES = tuple(SUPPORTED_LANGUAGES.keys())
+# Switched on until a workspace saves its own choice. Punjabi is added later and is switched on from the Call languages
+# page: it needs the ElevenLabs voice, and a workspace that saved its switches before keeps them as they were.
+DEFAULT_ENABLED_LANGUAGES = ("en", "ar", "ur")
 
 _ALIASES = {
     "english": "en", "en-us": "en", "en-in": "en", "en-gb": "en", "en": "en",
@@ -34,6 +39,8 @@ _ALIASES = {
     "urdu": "ur", "اردو": "ur", "ur-pk": "ur", "ur-in": "ur", "ur": "ur",
     # Spoken Hindi and Urdu are the same for callers: speech recognition reporting Hindi ("hi") answers in Urdu.
     "hindi": "ur", "हिन्दी": "ur", "हिंदी": "ur", "hi": "ur", "hi-in": "ur",
+    "punjabi": "pa", "panjabi": "pa", "ਪੰਜਾਬੀ": "pa", "پنجابی": "pa", "पंजाबी": "pa", "pa": "pa", "pa-in": "pa",
+    "pa-guru-in": "pa",
 }
 
 
@@ -54,22 +61,26 @@ _URDU_LETTERS = frozenset("ٹڈڑںےہھکگپچژی")
 
 def text_language(text: Any) -> str:
     """Which enabled language a caller's words are written in, from their alphabet (Retell gives no language per
-    turn): Hindi (Devanagari) script = Urdu; Arabic script with Urdu's own letters = Urdu, without = Arabic; Latin =
-    English. The script only, never the words' meaning. "" when there are no letters."""
-    devanagari = arabic = latin = 0
+    turn): Gurmukhi = Punjabi; Hindi (Devanagari) script = Urdu; Arabic script with Urdu's own letters = Urdu, without =
+    Arabic; Latin = English. The script only, never the words' meaning. "" when there are no letters."""
+    devanagari = arabic = latin = gurmukhi = 0
     urdu = False
     for character in str(text or ""):
         if "ऀ" <= character <= "ॿ":
             devanagari += 1
+        elif "਀" <= character <= "੿":
+            gurmukhi += 1
         elif "؀" <= character <= "ۿ":
             arabic += 1
             urdu = urdu or character in _URDU_LETTERS
         elif character.isascii() and character.isalpha():
             latin += 1
-    if not (devanagari or arabic or latin):
+    if not (devanagari or arabic or latin or gurmukhi):
         return ""
-    if latin >= devanagari + arabic:
+    if latin >= devanagari + arabic + gurmukhi:
         code = "en"
+    elif gurmukhi >= devanagari + arabic:
+        code = "pa"
     else:
         code = "ur" if devanagari >= arabic or urdu else "ar"
     return code if code in enabled_language_codes() else DEFAULT_LANGUAGE
@@ -120,7 +131,7 @@ def _read_enabled_language_codes() -> List[str]:
         raw = (document.get("value") or {}).get("enabled_languages")
         if not isinstance(raw, list):
             return list(DEFAULT_ENABLED_LANGUAGES)
-        enabled = [code for code in DEFAULT_ENABLED_LANGUAGES if code in {normalize_language(item) for item in raw}]
+        enabled = [code for code in SUPPORTED_LANGUAGES if code in {normalize_language(item) for item in raw}]
         return enabled or [DEFAULT_LANGUAGE]
     except Exception:
         return list(DEFAULT_ENABLED_LANGUAGES)
@@ -143,7 +154,7 @@ def language_options() -> List[Dict[str, Any]]:
 
 
 def set_enabled_language_codes(values: Iterable[Any], updated_by: str = "") -> List[str]:
-    enabled = [code for code in DEFAULT_ENABLED_LANGUAGES if code in {normalize_language(item) for item in values}]
+    enabled = [code for code in SUPPORTED_LANGUAGES if code in {normalize_language(item) for item in values}]
     if not enabled:
         raise ValueError("At least one call language must remain enabled")
     if not mongo_client or not mongo_client.is_connected():
@@ -186,6 +197,11 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
                         " Say shop and product words the way Urdu speakers say them, as the English word written in "
                         "Urdu script (باتھ روم، کچن، ٹائلز، شاور، ڈیلیوری), and product and brand names unchanged; "
                         "never translate them into literary Urdu.")
+    if "pa" in enabled:
+        # Gurmukhi, the script the Punjabi voice reads; Shahmukhi (Arabic-script Punjabi) would be read as Urdu.
+        script_note += (" Write Punjabi in Gurmukhi script (ਗੁਰਮੁਖੀ), never in Shahmukhi or Devanagari. Say shop and "
+                        "product words the way Punjabi speakers say them, as the English word written in Gurmukhi "
+                        "(ਬਾਥਰੂਮ, ਕਿਚਨ, ਟਾਈਲਾਂ, ਸ਼ਾਵਰ, ਡਿਲੀਵਰੀ), and product and brand names unchanged.")
     # "Can you tell me in English what you're looking for?" was the reply to a Hindi caller on an Urdu call: the
     # check for unclear words read as leave to switch (2026-10-29). Unclear words are answered in the reply language.
     # "room dear पर मुझे क्या सहायता करता है?" (Home DFO misheard) got "I didn't quite catch that. Which language do you
@@ -197,6 +213,8 @@ def language_rule(current: Any = "", follow_caller: bool = True) -> str:
     # Hindi or Urdu speakers often use English words ("Home DFO kya help karta hai?"): that is still Hindi/Urdu.
     mixing = (" English words inside Hindi or Urdu speech (product names, \"help\", \"price\") are still Hindi or Urdu: "
               "reply in Urdu then." if "ur" in enabled else "")
+    if "pa" in enabled:
+        mixing += " English words inside Punjabi speech are still Punjabi: reply in Punjabi then."
     if follow_caller:
         return (f"Language: callers may speak {_spoken_list(labels)}. Reply in the language of the caller's latest turn, "
                 "even where the instructions above say English: those describe how to speak English, not a limit. "
@@ -226,10 +244,10 @@ def requested_language(text: str, current: Any = "") -> str:
     return code if code != effective_language(current) and language_enabled(code) else ""
 
 
-def language_greeting(value: Any, configured_english: str) -> str:
+def language_greeting(value: Any, configured_english: str, wait: float = 0.0) -> str:
     """Keep the configured English greeting, with safe multilingual defaults for the other choices.
 
-    Teams can override these with VOICE_GREETING_AR / VOICE_GREETING_UR without changing code.
+    Teams can override these with VOICE_GREETING_AR / VOICE_GREETING_UR (VOICE_GREETING_<LANG> for others) without changing code.
     """
     code = normalize_language(value)
     if code == "en":
@@ -238,6 +256,14 @@ def language_greeting(value: Any, configured_english: str) -> str:
 
     if code == "ar":
         return os.getenv("VOICE_GREETING_AR", "مرحبًا، هذا مساعد راج الذكي. كيف يمكنني مساعدتك اليوم?").strip()
+    if code not in ("ar", "ur"):
+        # No hand-written greeting (Punjabi): VOICE_GREETING_<LANG>, else the business's own greeting written in the
+        # language by the voice model (voice_localize; waits up to `wait` seconds, else the English one for now).
+        configured_line = os.getenv(f"VOICE_GREETING_{code.upper()}", "").strip()
+        if configured_line:
+            return configured_line
+        from voice_localize import localized
+        return localized(configured_english, code, wait=wait)
     return os.getenv("VOICE_GREETING_UR", "السلام علیکم، یہ راج کا AI معاون ہے۔ میں آج آپ کی کیسے مدد کر سکتا ہوں؟").strip()
 
 

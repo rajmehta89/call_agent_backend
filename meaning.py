@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -27,11 +28,16 @@ _INFLIGHT: Dict[str, Future] = {}
 # scored as nothing and was never put through (2026-10-29). A multilingual model needs ~516 MB more than the 512 MB
 # server has, so their words are read in English instead: each new turn is translated once by the voice language
 # model and cached, and a context made of earlier turns reuses their translations (so one call per new turn).
-_FOREIGN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ]")
-_FOREIGN_RUN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ][^A-Za-z]*")
+# Punjabi (Gurmukhi, ਀-੿) is read the same way.
+_FOREIGN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ਀-੿]")
+_FOREIGN_RUN = re.compile(r"[؀-ۿݐ-ݿऀ-ॿ਀-੿][^A-Za-z]*")
+_GURMUKHI = re.compile(r"[਀-੿]")
 _TRANSLATIONS: "OrderedDict[str, str]" = OrderedDict()
 _TRANSLATIONS_SIZE = 256
 _TRANSLATING: Dict[str, Future] = {}
+# A turn whose translation just failed: every meaning check asks for it, and each waited out its own timeout (8 s, 2026-11-04).
+_UNTRANSLATED: Dict[str, float] = {}
+_RETRY_AFTER_SECONDS = 20.0
 _TRANSLATE_LOCK = threading.Lock()
 _translator = None
 
@@ -46,13 +52,28 @@ def _translate(text: str) -> str:
         model = (os.getenv("TRANSLATION_MODEL") or os.getenv("RETELL_OPENROUTER_MODEL")
                  or ("openai/gpt-4.1-mini" if _translator.provider == "openrouter" else "gpt-4.1-mini"))
         timeout = float(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "2.5") or 2.5)
+        # Punjabi recognition mishears shop words as ordinary ones ("kitchen sink" came out as ਕਿਤਨ ਸਿੰਘ, "Kitan Singh",
+        # and "product" as "problem", 2026-11-04), and the knowledge search then finds nothing. The business's own words
+        # (voice_keyterms, from the knowledge) let the translation restore what was meant.
+        hint = ""
+        if _GURMUKHI.search(text):
+            from voice_keyterms import current_keyterms
+            terms = current_keyterms()[:60]
+            if terms:
+                hint = (" Speech recognition often mishears shop words as similar-sounding ordinary words or names, for "
+                        "this home products shop. Where words make no sense for a call to it, write the shop words that "
+                        "SOUND closest, going by sound and not by topic: they may be two of these together, or any "
+                        "everyday word a caller to a shop would use: " + ", ".join(terms) + ". A word that sounds like none of them, and a "
+                        "person's name given as a name, stays as it is. Words may also be split or joined in the wrong place "
+                        "(ਪੈਸੇਵ ਆਪਸ for ਪੈਸੇ ਵਾਪਸ). If the words still make no sense, translate them as they are; never "
+                        "invent a sensible sentence.")
         # The voice model's routing (thinking off, fast provider first): without it DeepSeek V4.1 Flash thought through
         # its 160 tokens and every Hindi turn came back untranslated, after up to 5.7 s (2026-10-31).
         response = _translator.openai_client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
             model=model, max_tokens=160, temperature=0, extra_body=_translator._openrouter_extra_body(model),
             messages=[{"role": "system", "content": "Translate what a phone caller said into plain English, keeping its "
-                       "meaning and tone. The words come from speech recognition and may be in Urdu, Hindi, Arabic or "
-                       "a mix with English. Reply with the English only."},
+                       "meaning and tone. The words come from speech recognition and may be in Urdu, Hindi, Punjabi, Arabic or "
+                       "a mix with English." + hint + " Reply with the English only."},
                       {"role": "user", "content": text}])
         return " ".join((response.choices[0].message.content or "").split())
     except Exception as error:
@@ -69,6 +90,8 @@ def english_text(text: str) -> str:
         if key in _TRANSLATIONS:
             _TRANSLATIONS.move_to_end(key)
             return _TRANSLATIONS[key]
+        if time.monotonic() - _UNTRANSLATED.get(key, -_RETRY_AFTER_SECONDS) < _RETRY_AFTER_SECONDS:
+            return key
         known = list(_TRANSLATIONS.items())
     # Earlier turns in a context: put their English in place, longest first (one may contain another).
     rest = key
@@ -100,6 +123,11 @@ def english_text(text: str) -> str:
                 _TRANSLATIONS[key] = english
                 while len(_TRANSLATIONS) > _TRANSLATIONS_SIZE:
                     _TRANSLATIONS.popitem(last=False)
+            else:
+                now = time.monotonic()
+                for old in [item for item, at in _UNTRANSLATED.items() if now - at >= _RETRY_AFTER_SECONDS]:
+                    del _UNTRANSLATED[old]
+                _UNTRANSLATED[key] = now
             _TRANSLATING.pop(key, None)
         waiting.set_result(english)
     return english or key  # no translation: the words as said (the checks then work as before)
@@ -232,5 +260,5 @@ def most_similar(text: str, candidates: Sequence[str]) -> List[Tuple[int, float]
 
 
 def is_foreign(text: str) -> bool:
-    """Words in a script the meaning model cannot read (Urdu, Hindi or Arabic): they go through english_text."""
+    """Words in a script the meaning model cannot read (Urdu, Hindi, Punjabi or Arabic): they go through english_text."""
     return bool(_FOREIGN.search(text or ""))

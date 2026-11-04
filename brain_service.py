@@ -1141,7 +1141,9 @@ class BrainService:
         channel_config = self.channel_config(channel)
         if language:
             from voice_languages import language_label, normalize_language
-            channel_config = {**channel_config, "language": language_label(normalize_language(language))}
+            code = normalize_language(language)
+            # Punjabi voices read Gurmukhi only.
+            channel_config = {**channel_config, "language": language_label(code) + (" (written in Gurmukhi script)" if code == "pa" else "")}
         instructions = str(channel_config.get("instructions") or "").strip()
         # The base business prompt is already the model's system prompt; only add channel-specific overrides.
         if instructions == agent_config.get_system_prompt().strip():

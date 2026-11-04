@@ -346,7 +346,7 @@ class PipecatVoiceRuntime:
         return await connection.open()
 
     def _speech(self, engine, language):
-        from routers.custom_twilio_voice_api import _elevenlabs_voice, _tts_engine_for_language
+        from routers.custom_twilio_voice_api import _elevenlabs_voice, _tts_engine_for_language, elevenlabs_model
         # Apply the same language routing to warmup, direct synthesis and controller replies.
         # In particular, an Arabic call must not get the default English Deepgram voice.
         language = normalize_language(language)
@@ -361,7 +361,7 @@ class PipecatVoiceRuntime:
             service = cls(api_key=os.getenv("DEEPGRAM_API_KEY", ""), sample_rate=8000,
                           settings=cls.Settings(voice=voice))
         else:
-            model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"
+            model = elevenlabs_model(language)  # e.g. Punjabi: a model that speaks it (eleven_v4_turbo)
             cls = ElevenLabsDialogueTTSService if model.startswith(("eleven_v3", "eleven_v4")) else ElevenLabsTTSService
             service = cls(
                 api_key=os.getenv("ELEVENLABS_API_KEY", ""), sample_rate=8000,

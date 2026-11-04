@@ -68,10 +68,17 @@ def asks_to_repeat(caller_text: str, spoke_over_agent: bool = False) -> bool:
     return bool(kinds) and kinds[0] == "clarify" and not set(kinds[1:]) & {"question", "search", "request", "compound"}
 
 
+PAUSE_LINE = "Of course. Go ahead."
+
+
 def pause_reply(caller_text: str, language: str = "en") -> str:
     from voice_languages import normalize_language
-    return {"ur": "جی ضرور، آپ اپنی بات مکمل کریں۔", "ar": "بالتأكيد، تفضل."}.get(
-        normalize_language(language), "Of course. Go ahead.")
+    code = normalize_language(language)
+    written = {"ur": "جی ضرور، آپ اپنی بات مکمل کریں۔", "ar": "بالتأكيد، تفضل."}
+    if code in written:
+        return written[code]
+    from voice_localize import localized  # e.g. Punjabi: the model's translation, warmed when the call took the language
+    return localized(PAUSE_LINE, code)
 
 
 def choose_voice_model(caller_text: str, agent_text: str = "", earlier: str = "") -> Optional[str]:
@@ -669,8 +676,8 @@ def provided_contact_phone(caller_text: str, agent_text: str = "", earlier: List
 def agent_question(agent_text: str) -> str:
     """What our last reply asked: its last question, or the whole reply when it asked none. "You can pick up your order
     from our store. Would you like details on collection?" asked about collection, not for an order number."""
-    # Urdu and Arabic end sentences with ۔ and ask with ؟.
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?۔؟])\s+", agent_text or "") if part.strip()]
+    # Urdu and Arabic end sentences with ۔ and ask with ؟; Punjabi ends them with ।.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?۔؟।])\s+", agent_text or "") if part.strip()]
     questions = [sentence for sentence in sentences if sentence.endswith(("?", "؟"))]
     return questions[-1] if questions else (agent_text or "").strip()
 

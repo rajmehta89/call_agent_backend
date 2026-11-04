@@ -79,7 +79,7 @@ def bridge_is_duplicate(line, recent, threshold=0.82):
         return False
     recent = [recent] if isinstance(recent, str) else recent
     for previous in recent or ():
-        for sentence in re.split(r"(?<=[.!?؟۔])\s+", str(previous or "")):
+        for sentence in re.split(r"(?<=[.!?؟۔।])\s+", str(previous or "")):
             candidate = " ".join(re.findall(r"[^\W_]+", sentence.casefold()))
             if not candidate:
                 continue
@@ -95,7 +95,7 @@ def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
     """Accept one brief progress line, never an answer, repeated line, or generic waiting phrase."""
     recent = [recent] if isinstance(recent, str) else list(recent or ())
     line = " ".join(str(text or "").replace('"', "").replace("`", "").split()).strip(" '`")
-    line = re.split(r"(?<=[.!?؟۔])\s+", line, maxsplit=1)[0].strip()
+    line = re.split(r"(?<=[.!?؟۔।])\s+", line, maxsplit=1)[0].strip()
     words = line.split()
     if not 4 <= len(words) <= 8 or "?" in line or "؟" in line or _BRIDGE_ANSWER_CUES.search(line):
         return ""
@@ -107,7 +107,7 @@ def _clean_dynamic_bridge(text, recent, semantic_candidate, lookup, language):
         return ""  # only claim to check something when the live lookup actually runs
     if bridge_is_duplicate(line, (*recent, semantic_candidate)):
         return ""
-    if line[-1:] not in ".!؟۔":
+    if line[-1:] not in ".!؟۔।":
         line += "."
     return line
 
@@ -203,7 +203,7 @@ async def wait_message(services, candidate, caller_text, agent_text="", recent=(
     language = normalize_language(language)
     budget = dynamic_bridge_seconds()
     lookup_requested = bridge_said(candidate) in LOOKUP_BRIDGES
-    language_name = {"en": "English", "ur": "Urdu", "ar": "Arabic"}.get(str(language or "en").lower(), "the caller's language")
+    language_name = {"en": "English", "ur": "Urdu", "ar": "Arabic", "pa": "Punjabi, in Gurmukhi script"}.get(str(language or "en").lower(), "the caller's language")
     recent_text = "\n".join(f"- {str(line)[-180:]}" for line in recent[-8:] if line)
     system_prompt = (
         "Write one fresh, natural spoken acknowledgement for a live customer-service call. "

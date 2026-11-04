@@ -51,7 +51,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
-from voice_languages import effective_language, enabled_language_codes, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
+from voice_languages import DEFAULT_LANGUAGE, effective_language, enabled_language_codes, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
 from voice_runtime import create_runtime, runtime_status
 
 logger = logging.getLogger(__name__)
@@ -77,19 +77,32 @@ def _to_ws_url(http_url: str) -> str:
     return base
 
 
+# Languages Deepgram hears only with their own Nova-3 model (not Flux, not Nova-3 "multi").
+_MONOLINGUAL_ONLY = frozenset({"pa"})
+# Languages Deepgram has no voice for: spoken by ElevenLabs even on the Deepgram-voice stack.
+_ELEVENLABS_ONLY = frozenset({"pa"})
+# ElevenLabs models per language when ELEVENLABS_MODEL_ID (Flash v2.5 by default) cannot speak it: Flash v2.5 and
+# Multilingual v2 have no Punjabi; v4 Turbo has it and is ElevenLabs' low-latency model (checked 2026-11-04).
+_ELEVENLABS_LANGUAGE_MODELS = {"pa": "eleven_v4_turbo"}
+
+
 def _deepgram_url(language: str = "en") -> str:
     code = normalize_language(language)
     # Nova-3 "multi" hears English, Arabic and Hindi; spoken Urdu comes back as Hindi (normalize_language maps it to
     # Urdu). Tested on 8 kHz phone audio 2026-10-29. Arabic calls listen with it, and so does the language watch
     # beside Flux, so a caller can change language any time.
-    auto_language = _auto_language_enabled()
-    model = os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip() or os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() or "nova-3"
+    # Punjabi is only in monolingual Nova-3 ("pa"), never in "multi": a Punjabi call always listens in Punjabi.
+    auto_language = _auto_language_enabled() and code not in _MONOLINGUAL_ONLY
+    model = ((os.getenv("CUSTOM_DEEPGRAM_MODEL_MULTI", "").strip() if auto_language else "")
+             or os.getenv(f"CUSTOM_DEEPGRAM_MODEL_{code.upper()}", "").strip()
+             or (os.getenv("CUSTOM_DEEPGRAM_MODEL", "nova-3").strip() if code not in _MONOLINGUAL_ONLY else "")
+             or "nova-3")
     # Words callers say that speech recognition could get wrong (business, brand and product names), taken from the
     # knowledge automatically (voice_keyterms.py) plus any extras in .env. Nova-3 listens for them ("keyterm").
     keyterms = current_keyterms()
     return (
         "wss://api.deepgram.com/v1/listen?"
-        f"model={model}&language={quote('multi' if auto_language else {'en': 'en-US', 'ar': 'ar', 'ur': 'ur'}.get(code, 'en-US'))}&encoding=mulaw&sample_rate=8000&channels=1"
+        f"model={model}&language={quote('multi' if auto_language else {'en': 'en-US', 'ar': 'ar', 'ur': 'ur', 'pa': 'pa'}.get(code, 'en-US'))}&encoding=mulaw&sample_rate=8000&channels=1"
         "&interim_results=true&smart_format=true&punctuate=true"
         f"&endpointing={os.getenv('CUSTOM_ENDPOINTING_MS', '500')}"
         f"&utterance_end_ms={os.getenv('CUSTOM_UTTERANCE_END_MS', '1000')}&vad_events=true"
@@ -111,7 +124,7 @@ def _auto_language_enabled() -> bool:
 def _use_flux_for_language(language: str) -> bool:
     """Flux decides turn ends from what the caller says (better than a fixed silence). With CUSTOM_AUTO_LANGUAGE it
     is Flux Multilingual, which hears English and Hindi/Urdu; Arabic is not in it, so Arabic calls use Nova-3."""
-    code = normalize_language(language)
+    code = normalize_language(language)  # Punjabi is not in Flux: Nova-3 "pa"
     return _use_flux() and (code == "en" or (_auto_language_enabled() and code == "ur"))
 
 
@@ -144,14 +157,29 @@ def _flux_url(language: str = "en") -> str:
 
 def _elevenlabs_voice(language: str = "en") -> str:
     code = normalize_language(language)
-    voice_variable = {"ar": "ELEVENLABS_VOICE_AR", "ur": "ELEVENLABS_VOICE_UR"}.get(code, "ELEVENLABS_VOICE_ID")
+    voice_variable = {"ar": "ELEVENLABS_VOICE_AR", "ur": "ELEVENLABS_VOICE_UR", "pa": "ELEVENLABS_VOICE_PA"}.get(code, "ELEVENLABS_VOICE_ID")
     return os.getenv(voice_variable, "").strip() or os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+
+
+def elevenlabs_model(language: str = "en") -> str:
+    """ELEVENLABS_MODEL_ID_<LANG> (e.g. ELEVENLABS_MODEL_ID_PA), else a model that speaks the language, else
+    ELEVENLABS_MODEL_ID."""
+    code = normalize_language(language)
+    return (os.getenv(f"ELEVENLABS_MODEL_ID_{code.upper()}", "").strip() or _ELEVENLABS_LANGUAGE_MODELS.get(code)
+            or os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5")
+
+
+def can_speak_language(language: str = "en") -> bool:
+    """False for a language whose only voice (ElevenLabs, for Punjabi) is not configured: the call is not moved to it."""
+    if normalize_language(language) not in _ELEVENLABS_ONLY:
+        return True
+    return bool(os.getenv("ELEVENLABS_API_KEY", "").strip() and _elevenlabs_voice(language))
 
 
 def _elevenlabs_request(language: str = "en") -> tuple[str, Dict[str, str], str]:
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     voice_id = _elevenlabs_voice(language)
-    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip() or "eleven_flash_v2_5"
+    model_id = elevenlabs_model(language)
     if not api_key or not voice_id:
         raise RuntimeError("ElevenLabs voice is not configured")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=ulaw_8000"
@@ -410,10 +438,14 @@ async def _warm_tts_connection(engine: str) -> None:
 
 
 def _tts_engine_for_language(engine: str, language: str = "en") -> str:
-    """Use ElevenLabs automatically for Arabic when Deepgram has no Arabic TTS model configured."""
-    if engine == "deepgram" and normalize_language(language) == "ar" and not os.getenv("DEEPGRAM_TTS_VOICE_AR", "").strip():
+    """Use ElevenLabs automatically for Arabic when Deepgram has no Arabic TTS model configured, and always for Punjabi
+    (Deepgram has no Punjabi voice)."""
+    code = normalize_language(language)
+    if engine == "deepgram" and code == "ar" and not os.getenv("DEEPGRAM_TTS_VOICE_AR", "").strip():
         if os.getenv("ELEVENLABS_API_KEY", "").strip() and _elevenlabs_voice(language):
             return "elevenlabs"
+    if engine == "deepgram" and code in _ELEVENLABS_ONLY and not os.getenv(f"DEEPGRAM_TTS_VOICE_{code.upper()}", "").strip():
+        return "elevenlabs"
     return engine
 
 
@@ -421,6 +453,18 @@ def _tts_stream(text: str, engine: str, language: str = "en") -> AsyncIterator[b
     """Speech for one sentence from the provider selected for this language."""
     selected_engine = _tts_engine_for_language(engine, language)
     return _deepgram_tts_stream(text, language) if selected_engine == "deepgram" else _elevenlabs_stream(text, language)
+
+
+async def _in_call_language(sentence: str, language: str) -> str:
+    """A sentence written in English on a Punjabi call is put into Punjabi before it is said: one real call was answered
+    in English from its third turn (2026-11-04). A name, email or two product words alone are left as they are."""
+    if language not in _ELEVENLABS_ONLY or re.search(r"[਀-੿]", sentence):
+        return sentence
+    if sum(word.strip(".,!?").isalpha() and word.isascii() for word in sentence.split()) < 3:
+        return sentence
+    from voice_localize import localized
+    logger.warning("custom voice: reply came in English on a %s call; translating it", language)
+    return await asyncio.to_thread(localized, sentence, language, 2.5)
 
 
 async def _speech(text: str, engine: str, language: str = "en") -> bytes:
@@ -480,9 +524,9 @@ def _voice_services() -> AIServices:
     return services
 
 
-# Urdu and Arabic end sentences with ۔ and ؟ and pause at ، and ؛: without them an Urdu reply went to the voice
+# Punjabi ends sentences with । (danda). Urdu and Arabic end sentences with ۔ and ؟ and pause at ، and ؛: without them an Urdu reply went to the voice
 # only once the model had written all of it (first audio 5-6 s, 2026-10-29).
-_SENTENCE_BREAK = re.compile(r"[.!?۔؟](?=\s)")
+_SENTENCE_BREAK = re.compile(r"[.!?۔؟।](?=\s)")
 _CLAUSE_BREAK = re.compile(r"[,;:—–،؛](?=\s)")
 
 
@@ -572,6 +616,10 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
         checks_ms = round((perf_counter() - checks_started) * 1000)
         if details_problem:
             turn_model = None  # a wrong number or email needs the careful model
+        if language != DEFAULT_LANGUAGE:
+            # The fast model is kept from foreign text by its script, but a call in another language also hears Latin
+            # words ("Hi", "Shawar"): llama-3.1-8b answered those in broken Punjabi or English (2026-11-04).
+            turn_model = None
         if places:
             turn_model = careful_voice_model(services.fallback_model) or None  # the main model tends to say "yes, covered"
         if question or turn_model is None or places:
@@ -625,6 +673,18 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
     misheard = name_note(text, business_name())
     if misheard:
         messages.append({"role": "system", "content": misheard})
+    if language in _ELEVENLABS_ONLY:
+        # Punjabi recognition turns shop words into ordinary ones and the reply said them back: "shower screen" was
+        # heard as "sherbet screen", and the caller was told there was no price for a sherbet screen (2026-11-04).
+        # The translation restores them from the knowledge's words (and is usually cached by the turn's meaning checks).
+        from meaning import english_text, is_foreign
+        meant = await asyncio.to_thread(english_text, text)
+        if meant and not is_foreign(meant):
+            messages.append({"role": "system", "content": (
+                f"Speech recognition may have misheard this caller. They most likely said, in English: \"{meant}\" "
+                "Take that as their words and follow all your rules for it: only the business facts above, nothing "
+                "made up. Name products by their real names, and never repeat a word of theirs that makes no sense for "
+                "this business. If what they said still makes no sense, ask them to say it again.")})
     if bridge:
         messages.append({"role": "system", "content": bridge_note(bridge)})
     elif turn_model is not None and not places:
@@ -662,7 +722,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                         # When the reply had its first sentence, before the voice took it (first_sentence_ms is that).
                         timings["first_sentence_ready_ms"] = round((perf_counter() - started) * 1000)
                     yielded = True
-                    yield sentence
+                    yield await _in_call_language(sentence, language)
             if guard.done:
                 break
         pending += numbers.feed(guard.flush()) + numbers.flush()
@@ -683,7 +743,7 @@ async def _voice_sentences(services: AIServices, text: str, history: List[Dict[s
                 except Exception:
                     pass
     if pending.strip():
-        yield pending.strip()
+        yield await _in_call_language(pending.strip(), language)
 
 
 def _hang_up(call_sid: str) -> None:
@@ -737,20 +797,42 @@ async def _warm_audio_cache(texts: tuple[str, ...], engine: str, language: str =
 def _greeting_text(language: str = "en") -> str:
     configured = os.getenv("CUSTOM_VOICE_GREETING", "").strip()
     if configured:
-        return configured if normalize_language(language) == "en" else language_greeting(language, configured)
+        return configured if normalize_language(language) == "en" else language_greeting(language, configured, wait=_GREETING_WAIT)
     try:
         configured = str(brain_service.channel_config("voice").get("greeting") or "").strip() or "Hello, how can I help you today?"
-        return language_greeting(language, configured)
+        return language_greeting(language, configured, wait=_GREETING_WAIT)
     except Exception:
-        return language_greeting(language, "Hello, how can I help you today?")
+        return language_greeting(language, "Hello, how can I help you today?", wait=_GREETING_WAIT)
+
+
+# _greeting_text runs in a worker thread: a greeting not yet written in the call's language (Punjabi, written by the
+# voice model once and then cached; warm_configured_greetings does it at start-up) may wait this long for it.
+_GREETING_WAIT = 3.0
+
+
+def _warm_language_lines(language: str) -> None:
+    """A call now in a language without hand-written system lines (Punjabi): have the model write them in it in the
+    background, so the transfer, callback, pause and "I can hear you" lines are ready when they are said."""
+    code = normalize_language(language)
+    if code == "en":
+        return
+    from voice_localize import warm
+    from voice_presence import connection_reply_lines
+    from voice_turns import PAUSE_LINE
+    call_forwarding.warm_caller_lines(code)
+    warm((PAUSE_LINE, *connection_reply_lines()), code)
 
 
 async def warm_configured_greetings() -> None:
     """Cache the current business opening before a call needs its first speech connection."""
+    languages = await asyncio.to_thread(enabled_language_codes)
+    for language in languages:
+        # Greetings in a language without a hand-written one (Punjabi) are written by the model once, here, so the
+        # ConversationRelay path, which cannot wait for it while answering, has it ready too.
+        await asyncio.to_thread(_greeting_text, language)
     if not await asyncio.to_thread(custom_stack_enabled):
         return
     engine = await asyncio.to_thread(custom_voice_engine)
-    languages = await asyncio.to_thread(enabled_language_codes)
     for language in languages:
         greeting = await asyncio.to_thread(_greeting_text, language)
         await _warm_audio_cache((greeting,), engine, language)
@@ -1501,6 +1583,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                     raise
                 # ElevenLabs refused or cut off the sentence (out of credits, a dropped stream): the rest of the call
                 # speaks with the Deepgram voice, starting with this whole sentence again, instead of going silent.
+                if preferred_language in _ELEVENLABS_ONLY:
+                    # Deepgram cannot say Punjabi: the call goes on in English and says so, instead of reading
+                    # Gurmukhi with an English voice.
+                    logger.warning("custom voice: %s voice failed; continuing in English call=%s", preferred_language, call_sid)
+                    switch_language(DEFAULT_LANGUAGE)
+                    from meaning import english_text
+                    text = await asyncio.to_thread(english_text, text)  # this sentence, said in English
                 await use_deepgram_voice(error)
                 retry_started = perf_counter() - started
                 retry_first_audio = await speak_audio(text, forced_engine="deepgram",
@@ -2068,6 +2157,10 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             return
         # "Can you speak Urdu?": decided by meaning, with the vector the checks above already made for these words.
         wanted_language = await asyncio.to_thread(requested_language, text, preferred_language)
+        if wanted_language and not can_speak_language(wanted_language):
+            # Punjabi without its ElevenLabs voice: switching would leave the caller in silence.
+            logger.warning("custom voice: caller asked for %s but no voice is configured for it call=%s", wanted_language, call_sid)
+            wanted_language = ""
         # Prepared before the turn ended and the call learned its language: every call starts in English, so a
         # Hindi caller's first reply was written in English and used (2026-10-29). Not reused in another language.
         if prepared and (not _same_words(prepared["text"], text) or prepared.get("language") != preferred_language):
@@ -2379,6 +2472,7 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if language_switch_task is not None and not language_switch_task.done():
             language_switch_task.cancel()
         language_switch_task = asyncio.create_task(reconnect_recognition(code, previous))
+        _warm_language_lines(code)
         if bridges_enabled():
             asyncio.create_task(_warm_audio_cache(bridge_lines(code), engine, code))
 
@@ -2424,7 +2518,13 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         params = start.get("customParameters") or {}
                         caller = str(params.get("caller") or caller)
                         preferred_language = effective_language(params.get("preferred_language"))
+                        if not can_speak_language(preferred_language):
+                            # e.g. a lead saved as Punjabi while the ElevenLabs voice is not configured.
+                            logger.warning("custom voice: no %s voice configured; call=%s starts in English",
+                                           preferred_language, params.get("call_sid"))
+                            preferred_language = DEFAULT_LANGUAGE
                         languages_used.add(preferred_language)
+                        _warm_language_lines(preferred_language)
                         call_sid = str(params.get("call_sid") or call_sid)
                         bind_call(call_sid)
                         if not valid_stream_token(call_sid, str(params.get("stream_token") or "")):

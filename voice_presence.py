@@ -49,53 +49,67 @@ def is_connection_check(text: str, earlier: str = "") -> bool:
     return CONNECTION_CHECK.close(contextual) == ["presence"]
 
 
+_CONNECTION_LINES = {
+    "en": {
+        False: (
+            "Yes, I can hear you. Please go ahead.",
+            "I'm here, and I can hear you.",
+            "Yes, I'm here. What can I help with?",
+            "I can hear you clearly. Go ahead.",
+        ),
+        True: (
+            "Yes, I heard your question. I'll answer that.",
+            "I'm here, and I heard what you asked.",
+            "Yes, I have your question. Please go ahead.",
+            "I can hear you. I have your question.",
+        ),
+    },
+    "ur": {
+        False: (
+            "جی، آپ کی آواز آ رہی ہے۔ بتائیے۔",
+            "جی، میں سن رہا ہوں۔ آپ کہیے۔",
+            "میں آپ کو صاف سن سکتا ہوں۔",
+            "جی، میں موجود ہوں۔ آپ بتائیں۔",
+        ),
+        True: (
+            "جی، میں موجود ہوں۔ میں نے آپ کا سوال سن لیا ہے۔",
+            "جی، میں سن رہا ہوں۔ آپ اپنا سوال جاری رکھیں۔",
+            "آپ کی بات سن لی ہے۔ میں جواب دیتا ہوں۔",
+            "جی، آپ کا سوال میں نے سن لیا ہے۔",
+        ),
+    },
+    "ar": {
+        False: (
+            "نعم، أسمعك. تفضل.",
+            "أنا هنا وأسمعك بوضوح.",
+            "نعم، أنا هنا. كيف أساعدك؟",
+            "أسمعك جيدًا. تفضل.",
+        ),
+        True: (
+            "نعم، أنا هنا وقد سمعت سؤالك.",
+            "أسمعك، وقد فهمت ما سألت عنه.",
+            "نعم، سمعت سؤالك. تفضل.",
+            "أنا هنا، ويمكنك متابعة سؤالك.",
+        ),
+    },
+}
+
+
+def connection_reply_lines() -> tuple:
+    """The English lines, for writing them in a language with no hand-written copy (voice_localize)."""
+    return (*_CONNECTION_LINES["en"][False], *_CONNECTION_LINES["en"][True])
+
+
 def connection_reply(language: str, pending: bool, recent=()) -> str:
     """Return a short, natural line without repeating one just heard in this call."""
-    lines = {
-        "en": {
-            False: (
-                "Yes, I can hear you. Please go ahead.",
-                "I'm here, and I can hear you.",
-                "Yes, I'm here. What can I help with?",
-                "I can hear you clearly. Go ahead.",
-            ),
-            True: (
-                "Yes, I heard your question. I'll answer that.",
-                "I'm here, and I heard what you asked.",
-                "Yes, I have your question. Please go ahead.",
-                "I can hear you. I have your question.",
-            ),
-        },
-        "ur": {
-            False: (
-                "جی، آپ کی آواز آ رہی ہے۔ بتائیے۔",
-                "جی، میں سن رہا ہوں۔ آپ کہیے۔",
-                "میں آپ کو صاف سن سکتا ہوں۔",
-                "جی، میں موجود ہوں۔ آپ بتائیں۔",
-            ),
-            True: (
-                "جی، میں موجود ہوں۔ میں نے آپ کا سوال سن لیا ہے۔",
-                "جی، میں سن رہا ہوں۔ آپ اپنا سوال جاری رکھیں۔",
-                "آپ کی بات سن لی ہے۔ میں جواب دیتا ہوں۔",
-                "جی، آپ کا سوال میں نے سن لیا ہے۔",
-            ),
-        },
-        "ar": {
-            False: (
-                "نعم، أسمعك. تفضل.",
-                "أنا هنا وأسمعك بوضوح.",
-                "نعم، أنا هنا. كيف أساعدك؟",
-                "أسمعك جيدًا. تفضل.",
-            ),
-            True: (
-                "نعم، أنا هنا وقد سمعت سؤالك.",
-                "أسمعك، وقد فهمت ما سألت عنه.",
-                "نعم، سمعت سؤالك. تفضل.",
-                "أنا هنا، ويمكنك متابعة سؤالك.",
-            ),
-        },
-    }
-    options = lines[normalize_language(language)][bool(pending)]
+    lines = _CONNECTION_LINES
+    code = normalize_language(language)
+    if code in lines:
+        options = lines[code][bool(pending)]
+    else:
+        # A language with no hand-written lines (Punjabi): the model's translations of the English ones.
+        from voice_localize import localized
+        options = tuple(localized(line, code) for line in lines["en"][bool(pending)])
     recent_items = [recent] if isinstance(recent, str) else (recent or ())
     recent_lines = [str(line).strip() for line in recent_items]
     for line in options:

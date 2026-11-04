@@ -87,7 +87,14 @@ def caller_line(line: str, language: str = "en", **values: Any) -> str:
     are filled in after."""
     from voice_languages import normalize_language
     code = normalize_language(language)
-    template = CALLER_LINES.get(code, {}).get(line, line) if code != "en" else line
+    if code == "en":
+        template = line
+    elif code in CALLER_LINES:
+        template = CALLER_LINES[code].get(line, line)
+    else:
+        # A language with no hand-written lines (Punjabi): the voice model's translation (voice_localize).
+        from voice_localize import localized
+        template = localized(line, code)
     return template.format(**values) if values else template
 # Twilio <Say> voice for the lines spoken outside the AI voice (on hold, and to the agent). Change with FORWARDING_SAY_VOICE.
 SAY_VOICE = os.getenv("FORWARDING_SAY_VOICE", "Polly.Joanna-Neural")
@@ -100,6 +107,21 @@ TEAM_BUSY_SAY = {
            "माफ़ कीजिए, अभी टीम में कोई जवाब नहीं दे सका। आपकी बात आगे पहुँचा दी गई है। अगर हमारे पास आपका नंबर है तो टीम आपको "
            "वापस कॉल करेगी, नहीं तो कृपया अपने नंबर के साथ दोबारा संपर्क करें।"),
 }
+
+# Twilio voices for a language that has no hand-written TEAM_BUSY_SAY line: the line is the model's translation.
+SAY_VOICES_BY_LANGUAGE = {"pa": os.getenv("FORWARDING_SAY_VOICE_PA", "Google.pa-IN-Wavenet-A")}  # Google, Gurmukhi
+
+
+def warm_caller_lines(language: str) -> None:
+    """Have the lines above written in a call language with no hand-written copy (Punjabi) before they are said."""
+    from voice_languages import normalize_language
+    code = normalize_language(language)
+    if code == "en" or code in CALLER_LINES:
+        return
+    from voice_localize import warm
+    warm((CONNECTING_LINE, TRANSFER_FAILED_LINE, CALLBACK_NOTED_LINE, CALLBACK_NUMBER_LINE, NO_LIVE_TRANSFER_PREFIX,
+          NOW_OR_LATER_LINE, NAMED_REQUEST_LINE, ANYTHING_ELSE_LINE, READY_WHEN_YOU_ARE_LINE, WELCOME_LINE, OF_COURSE_LINE,
+          TEAM_BUSY_LINE), code)
 
 
 def _region() -> str:
@@ -722,7 +744,13 @@ def dial_result_twiml(accepted: bool, language: str = "en") -> str:
     caller, in their language, that the team will call back."""
     if accepted:
         return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-    voice, line = TEAM_BUSY_SAY.get(normalize_language(language), (SAY_VOICE, TEAM_BUSY_LINE))
+    code = normalize_language(language)
+    voice, line = TEAM_BUSY_SAY.get(code, (SAY_VOICE, TEAM_BUSY_LINE))
+    if code in SAY_VOICES_BY_LANGUAGE:
+        from voice_localize import localized
+        translated = localized(TEAM_BUSY_LINE, code)  # translated when the transfer started (warm_caller_lines)
+        if translated != TEAM_BUSY_LINE:
+            voice, line = SAY_VOICES_BY_LANGUAGE[code], translated
     return (f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="{html.escape(voice, quote=True)}">{html.escape(line)}</Say>'
             "<Hangup/></Response>")
 

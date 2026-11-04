@@ -30,7 +30,7 @@ from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
 from conversation_memory import ConversationMemory
-from voice_languages import effective_language, language_config, language_for_call, language_greeting, language_enabled, normalize_language
+from voice_languages import SUPPORTED_LANGUAGES, effective_language, enabled_language_codes, language_config, language_for_call, language_greeting, language_enabled, normalize_language, requested_language
 import call_forwarding
 
 load_project_env()
@@ -101,14 +101,41 @@ def _browser_caller_phone(value: Any) -> str:
     return f"+{digits}"
 
 
+# Languages ConversationRelay hears and speaks with Google (Punjabi: not in Deepgram "multi" or ElevenLabs Flash).
+_GOOGLE_RELAY_LANGUAGES = frozenset({"pa"})
+
+
+def _relay_voice(code: str) -> str:
+    return os.getenv(f"TWILIO_RELAY_VOICE_{code.upper()}", "").strip() or "pa-IN-Wavenet-A"
+
+
+def _relay_language_node(code: str) -> str:
+    item = language_config(code)
+    if code in _GOOGLE_RELAY_LANGUAGES:
+        return (f'<Language code="{item["locale"]}" ttsProvider="Google" voice="{html.escape(_relay_voice(code), quote=True)}" '
+                'transcriptionProvider="Google" />')
+    return f'<Language code="{item["locale"]}" ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" />'
+
+
+def _relay_language_message(code: str) -> Dict[str, str]:
+    """ConversationRelay's switch to a call language. Deepgram "multi" keeps hearing the languages it knows; a Google
+    language (Punjabi) is heard in that language only, until the caller asks for another one."""
+    locale = language_config(code)["locale"]
+    return {"type": "language", "ttsLanguage": locale,
+            "transcriptionLanguage": locale if code in _GOOGLE_RELAY_LANGUAGES else "multi"}
+
+
 def _build_conversation_twiml(public_base_url: Optional[str] = None, language: str = "en", caller_phone: str = "") -> str:
     ws_url = f"{_get_ws_base_url(public_base_url)}/api/twilio/ws"
-    selected = language_config(language)
+    selected = language_config(effective_language(language))
     greeting = html.escape(language_greeting(selected["code"], agent_config.get_greeting_message()), quote=True)
-    language_nodes = "".join(
-        f'<Language code="{item["locale"]}" ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" />'
-        for item in (language_config("en"), language_config("ar"), language_config("ur"))
-    )
+    language_nodes = "".join(_relay_language_node(code) for code in enabled_language_codes())
+    if selected["code"] in _GOOGLE_RELAY_LANGUAGES:
+        providers = (f'language="{selected["locale"]}" ttsProvider="Google" voice="{html.escape(_relay_voice(selected["code"]), quote=True)}" '
+                     'transcriptionProvider="Google"')
+    else:
+        providers = 'ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" ttsLanguage="multi" transcriptionLanguage="multi"'
+
     caller_phone_node = (
         f'<Parameter name="caller_phone" value="{html.escape(_browser_caller_phone(caller_phone), quote=True)}" />'
         if _browser_caller_phone(caller_phone)
@@ -119,7 +146,7 @@ def _build_conversation_twiml(public_base_url: Optional[str] = None, language: s
         "<Response>"
         "<Connect>"
         f'<ConversationRelay url="{ws_url}" welcomeGreeting="{greeting}" '
-        f'ttsProvider="ElevenLabs" transcriptionProvider="Deepgram" ttsLanguage="multi" transcriptionLanguage="multi">{language_nodes}'
+        f'{providers}>{language_nodes}'
         f'<Parameter name="preferred_language" value="{selected["code"]}" />'
         f'{caller_phone_node}'
         f'<Parameter name="stream_token" value="{stream_token(RELAY_TOKEN_SUBJECT)}" />'
@@ -147,7 +174,7 @@ def _normalize_agent(agent: Dict[str, Any]) -> Dict[str, Any]:
     preferred_languages = []
     for value in agent.get("preferred_languages") or agent.get("languages") or []:
         code = normalize_language(value)
-        if str(value or "").strip().lower() in {"en", "ar", "ur"} and code not in preferred_languages:
+        if str(value or "").strip().lower() in SUPPORTED_LANGUAGES and code not in preferred_languages:
             preferred_languages.append(code)
     return {
         "name": str(agent.get("name", "")).strip(),
@@ -513,15 +540,17 @@ async def twilio_conversation_ws(websocket: WebSocket):
                 continue
 
             detected_language = str(data.get("lang") or "").strip()
-            if detected_language:
+            # "Can you speak Punjabi?": decided by meaning. Deepgram "multi" never reports Punjabi, so a caller gets
+            # it by asking (or from their saved language).
+            wanted_language = await asyncio.to_thread(requested_language, caller_text, session["preferred_language"])
+            if wanted_language:
+                session["preferred_language"] = wanted_language
+                await websocket.send_text(json.dumps(_relay_language_message(wanted_language)))
+            elif detected_language:
                 detected_code = normalize_language(detected_language)
                 if language_enabled(detected_code):
                     session["preferred_language"] = effective_language(detected_code)
-                await websocket.send_text(json.dumps({
-                    "type": "language",
-                    "ttsLanguage": language_config(session["preferred_language"])["locale"],
-                    "transcriptionLanguage": "multi",
-                }))
+                await websocket.send_text(json.dumps(_relay_language_message(session["preferred_language"])))
 
             timestamp = utc_iso()
             user_transcript.append({"content": caller_text, "timestamp": timestamp, "language": session.get("preferred_language", "en")})

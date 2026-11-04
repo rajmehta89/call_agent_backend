@@ -325,6 +325,7 @@ def _language_request_kinds() -> dict:
         "en": ["انگریزی میں بات کریں۔", "تكلم بالإنجليزية من فضلك."],
         "ar": ["هل تتكلم العربية؟", "بالعربي من فضلك.", "ممكن نتكلم عربي؟"],
         "ur": ["کیا آپ اردو بول سکتے ہیں؟", "اردو میں بات کریں۔", "مجھ سے اردو میں بات کریں۔"],
+        "pa": ["ਕੀ ਤੁਸੀਂ ਪੰਜਾਬੀ ਬੋਲ ਸਕਦੇ ਹੋ?", "ਪੰਜਾਬੀ ਵਿੱਚ ਗੱਲ ਕਰੋ।", "क्या आप पंजाबी में बात कर सकते हैं?"],
     }
     kinds = {code: _language_request_examples(item["label"], item.get("also_called") or []) + native.get(code, [])
              for code, item in SUPPORTED_LANGUAGES.items()}
@@ -332,7 +333,12 @@ def _language_request_kinds() -> dict:
                      "Can I speak to someone about my order?", "Okay, speak soon.", "Hello, can you hear me?",
                      "Do you deliver overseas?", "What's the price?", "Yes, please.", "Sorry, I didn't catch that.",
                      "My English is not very good.", "Do you have the instructions in another language?",
-                     "I'm looking for a basin.", "Thank you, bye."]
+                     "I'm looking for a basin.", "Thank you, bye.",
+                     # Saying where they are from is not asking for a language: "My name is Harpreet from Punjab" moved
+                     # a call to Punjabi (2026-11-04).
+                     "I am from Punjab.", "My family is from Punjab.", "We moved here from Pakistan.",
+                     "I'm calling from Saudi Arabia.", "My name is Ali and I am from Lahore.",
+                     "I grew up in India.", "My wife is Punjabi.", "We are a Punjabi family."]
     return kinds
 
 

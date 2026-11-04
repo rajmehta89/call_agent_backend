@@ -62,11 +62,13 @@ async def benchmark(args):
         for question in questions:
             started = perf_counter()
             timings = {}
-            stream = _voice_sentences(services, question, history, "unknown", "", timings=timings).__aiter__()
+            stream = _voice_sentences(services, question, history, "unknown", "", language=args.language,
+                                      timings=timings).__aiter__()
             try:
                 sentence = await anext(stream)
                 first_sentence = perf_counter() - started
-                row = {"question": question, "repeat": repeat + 1,
+                reply = [sentence]
+                row = {"language": args.language, "question": question, "repeat": repeat + 1,
                        "first_sentence_ms": round(first_sentence * 1000),
                        **{key: timings[key] for key in ("requested_model", "preparation_ms", "semantic_checks_ms",
                                                         "first_model_text_ms", "model_wait_ms") if key in timings}}
@@ -85,8 +87,16 @@ async def benchmark(args):
                                 pass
                     finally:
                         await speech.aclose()
+                if args.conversation:
+                    # A real call: the whole reply is heard, and the next question follows on from it.
+                    async for more in stream:
+                        reply.append(more)
+                    row["reply_ms"] = round((perf_counter() - started) * 1000)
+                    history.extend([{"role": "user", "content": question},
+                                    {"role": "assistant", "content": " ".join(reply)}])
+                row["reply"] = " ".join(reply)[:300]
                 report["results"].append(row)
-                print(json.dumps(row), flush=True)
+                print(json.dumps(row, ensure_ascii=False), flush=True)
             finally:
                 await stream.aclose()
     if speaker is not None:
@@ -104,8 +114,13 @@ def main():
     parser.add_argument("--engine", choices=["elevenlabs", "deepgram"], default="elevenlabs")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--question", action="append")
+    parser.add_argument("--questions-file", type=Path, help="JSON list of questions (one call's turns, in order)")
+    parser.add_argument("--language", default="en", help="call language: en, ur, ar or pa")
+    parser.add_argument("--conversation", action="store_true", help="keep each reply in the history, as on a call")
     parser.add_argument("--output", type=Path, default=Path("logs/voice_latency_benchmark.json"))
     args = parser.parse_args()
+    if args.questions_file:
+        args.question = json.loads(args.questions_file.read_text(encoding="utf-8"))
     if not 1 <= args.repeats <= 10:
         parser.error("Select between one and ten repeats")
     asyncio.run(benchmark(args))

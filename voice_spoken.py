@@ -81,9 +81,16 @@ def _urdu_address(text: str) -> str:
     return f"{dotted(name)} ایٹ {dotted(domain)}" if at else dotted(name)
 
 
+_ARABIC_LETTERS = re.compile(r"[؀-ۿ]")
+
+
 def for_voice(text: str, language: str = "en") -> str:
     """The text the voice should read for a reply in this language (unchanged where the voice reads it well)."""
-    if normalize_language(language) != "ur" or not text:
+    code = normalize_language(language)
+    if code == "pa" and text:
+        # The model sometimes ends a Gurmukhi word with an Arabic letter ("ਐਪਲਾਇੰਸز", 2 of 10 replies, 2026-11-04).
+        return re.sub(r"\s{2,}", " ", _ARABIC_LETTERS.sub("", text)).strip()
+    if code != "ur" or not text:
         return text
     spoken = _LATIN_BRACKET.sub("", text)
     spoken = _EMAIL.sub(lambda match: _urdu_address(match.group(0)), spoken)
