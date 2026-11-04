@@ -57,6 +57,28 @@ def test_real_worker_reuses_speech_service_and_converts_phone_audio():
     asyncio.run(run())
 
 
+def test_completed_speech_without_audio_fails_and_closes_the_worker():
+    class EmptySpeech(voice.FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, voice.TTSSpeakFrame):
+                await self.push_frame(voice.TTSStoppedFrame())
+            else:
+                await self.push_frame(frame, direction)
+
+    async def run():
+        speech = voice.PipecatSpeech(EmptySpeech(), [])
+        try:
+            with pytest.raises(voice.SpeechRuntimeError, match="without audio"):
+                _ = [chunk async for chunk in speech.stream("A greeting that never arrived.")]
+            assert speech.channel.closing
+            assert speech.channel.runner_task.done()
+        finally:
+            await speech.close()
+
+    asyncio.run(run())
+
+
 def test_concurrent_warm_and_speech_use_one_worker():
     async def run():
         speech = voice.PipecatSpeech(FakeSpeech(), [])

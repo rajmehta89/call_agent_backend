@@ -78,7 +78,8 @@ class FakeDeepgram:
 
 def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_seconds=3.0,
              bridges=False, model_seconds=0.6, bridge_selector=None, logged=None,
-             answer_text="Here is the answer.", caller="unknown", language="en"):
+             answer_text="Here is the answer.", caller="unknown", language="en",
+             engine="elevenlabs", wait_for_greeting=True):
     starts, finished = [], []
     saved = Event()
 
@@ -111,7 +112,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     monkeypatch.setattr(custom, "custom_stack_enabled", lambda: True)
     monkeypatch.setattr(custom, "_active_custom", lambda snapshot: {"ready": True})
     monkeypatch.setattr(custom, "provider_snapshot", lambda: {})
-    monkeypatch.setattr(custom, "custom_voice_engine", lambda: "elevenlabs")
+    monkeypatch.setattr(custom, "custom_voice_engine", lambda: engine)
     monkeypatch.setattr(custom, "valid_stream_token", lambda *a: True)
     monkeypatch.setattr(custom.websockets, "connect", fake_connect)
     monkeypatch.setattr(custom, "_voice_sentences", fake_sentences)
@@ -148,7 +149,7 @@ def run_call(monkeypatch, script, stt="nova", tts=None, answer_force=True, call_
     t0 = time.perf_counter()
     with TestClient(app) as client, client.websocket_connect("/api/custom-voice/media") as ws:
         ws.send_text(json.dumps({"event": "start", "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {"caller": caller, "preferred_language": language}}}))
-        while True:  # like Twilio: report the greeting's playback marker once it has played
+        while wait_for_greeting:  # like Twilio: acknowledge the greeting after playback
             message = json.loads(ws.receive_text())
             if message.get("event") == "mark":
                 ws.send_text(json.dumps({"event": "mark", "mark": message["mark"]}))

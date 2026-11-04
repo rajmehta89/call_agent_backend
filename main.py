@@ -214,10 +214,11 @@ async def keep_connections_warm() -> None:
     """Open every connection a call needs as the server starts, and keep them open between calls, so no call waits on
     a secure handshake (0.1-0.5 s each, from here to the US): the voice model (OpenRouter), the voices (ElevenLabs,
     Deepgram), Shopify and Retell. Each ping is a free request (key info, model or project list, the shop's name),
-    every KEEP_WARM_SECONDS (default 25: Retell dropped idle connections after 30-60 s; 0 = only once at startup)."""
+    every KEEP_WARM_SECONDS (default 25: Retell dropped idle connections after 30-60 s; 0 = only once at startup).
+    Configured greetings are synthesized once per voice/language and cached before calls arrive."""
     import asyncio
     from ai_services import AIServices, warm_model_connection
-    from routers.custom_twilio_voice_api import _warm_tts_connection, warm_retell_connection
+    from routers.custom_twilio_voice_api import _warm_tts_connection, warm_retell_connection, warm_configured_greetings
     from routers.retell_api import configure_voice_services
     from shopify_service import shopify_service
 
@@ -236,6 +237,7 @@ async def keep_connections_warm() -> None:
             asyncio.to_thread(warm_model_connection, services),
             asyncio.to_thread(shopify_service.keep_warm),
             warm_retell_connection(),
+            warm_configured_greetings(),
             *(_warm_tts_connection(engine) for engine in voices),
             return_exceptions=True,
         )

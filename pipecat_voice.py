@@ -295,6 +295,7 @@ class PipecatSpeech:
     async def stream(self, text):
         async with self.lock:
             complete = False
+            received_audio = False
             try:
                 try:
                     first_timeout = max(0.5, float(os.getenv("CUSTOM_TTS_FIRST_AUDIO_TIMEOUT_MS", "2500")) / 1000)
@@ -311,9 +312,14 @@ class PipecatSpeech:
                         if isinstance(item, Exception):
                             raise item
                         if item is None:
+                            if not received_audio:
+                                raise SpeechRuntimeError("Pipecat speech completed without audio")
                             complete = True
                             break
+                        if not item:
+                            continue
                         deadline.reschedule(None)
+                        received_audio = True
                         yield item
             except TimeoutError:
                 raise SpeechRuntimeError("Pipecat speech audio timed out") from None

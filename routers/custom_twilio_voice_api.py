@@ -51,7 +51,7 @@ from twilio_security import stream_token, valid_stream_token, verify_twilio_requ
 from routers.calls_api import log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
-from voice_languages import effective_language, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
+from voice_languages import effective_language, enabled_language_codes, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
 from voice_runtime import create_runtime, runtime_status
 
 logger = logging.getLogger(__name__)
@@ -726,7 +726,10 @@ async def _warm_audio_cache(texts: tuple[str, ...], engine: str, language: str =
         key = _audio_cache_key(text, engine, language)
         if key not in _cached_audio:
             try:
-                _cached_audio[key] = await _speech(text, engine, language)
+                audio = await _speech(text, engine, language)
+                if not audio:
+                    raise RuntimeError("Speech provider completed without audio")
+                _cached_audio[key] = audio
             except Exception as error:
                 logger.warning("could not pre-generate voice phrase %r: %s", text, error)
 
@@ -740,6 +743,17 @@ def _greeting_text(language: str = "en") -> str:
         return language_greeting(language, configured)
     except Exception:
         return language_greeting(language, "Hello, how can I help you today?")
+
+
+async def warm_configured_greetings() -> None:
+    """Cache the current business opening before a call needs its first speech connection."""
+    if not await asyncio.to_thread(custom_stack_enabled):
+        return
+    engine = await asyncio.to_thread(custom_voice_engine)
+    languages = await asyncio.to_thread(enabled_language_codes)
+    for language in languages:
+        greeting = await asyncio.to_thread(_greeting_text, language)
+        await _warm_audio_cache((greeting,), engine, language)
 
 
 def _active_custom(providers: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -925,6 +939,8 @@ async def custom_media_stream(websocket: WebSocket) -> None:
     memory = ConversationMemory(keep_recent_messages=60, max_messages=120, token_budget=voice_history_token_budget())
     transcript: List[Dict[str, str]] = []
     responses: List[Dict[str, str]] = []
+    greeting_delivery: Dict[str, Any] = {"status": "not_started"}
+    speech_recoveries: List[Dict[str, str]] = []
     send_lock = asyncio.Lock()
     speech_lock = asyncio.Lock()
     speech_allowed = asyncio.Event()
@@ -1150,7 +1166,26 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         save_progress()
 
     async def play_greeting(text: str) -> None:
-        await speak(text, cache_key=_audio_cache_key(text, engine, preferred_language))
+        greeting_delivery.update(status="synthesizing",
+                                 started_ms=round((perf_counter() - call_started) * 1000))
+
+        def record_audio_sent(first_audio: float) -> None:
+            greeting_delivery.update(status="audio_sent", tts_first_audio_ms=round(first_audio * 1000),
+                                     stream_to_first_audio_ms=round((perf_counter() - call_started) * 1000))
+            responses.append({"content": text, "timestamp": utc_iso(), "language": preferred_language})
+            memory.add_assistant(text)
+            save_progress()
+
+        try:
+            await speak(text, cache_key=_audio_cache_key(text, engine, preferred_language),
+                        on_first_audio=record_audio_sent)
+        except asyncio.CancelledError:
+            greeting_delivery["status"] = ("interrupted" if greeting_delivery["status"] == "audio_sent"
+                                           else "cancelled_before_audio")
+            raise
+        except Exception as error:
+            greeting_delivery.update(status="failed", error_type=type(error).__name__)
+            raise
         if active:
             # A silent first turn gets a patient, neutral nudge after playback, never an
             # accusation that the caller was unclear based on VAD noise alone.
@@ -1400,12 +1435,14 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         # Acknowledgements are only said from recorded audio: record the Deepgram versions in the background.
         asyncio.create_task(_warm_audio_cache(bridge_lines(preferred_language) if bridges_enabled() else (), engine, preferred_language))
 
-    async def speak(text: str, cache_key: str = "", forced_engine: Optional[str] = None) -> float:
+    async def speak(text: str, cache_key: str = "", forced_engine: Optional[str] = None,
+                    on_first_audio=None) -> float:
         async with speech_lock:
             await speech_allowed.wait()
-            return await speak_audio(text, cache_key, forced_engine)
+            return await speak_audio(text, cache_key, forced_engine, on_first_audio=on_first_audio)
 
-    async def speak_audio(text: str, cache_key: str = "", forced_engine: Optional[str] = None) -> float:
+    async def speak_audio(text: str, cache_key: str = "", forced_engine: Optional[str] = None,
+                          on_first_audio=None, direct_tts: bool = False) -> float:
         """Stream speech to Twilio; returns seconds until the first audio chunk was sent."""
         nonlocal pending_mark, mark_count
         text = for_voice(text, preferred_language)  # e.g. Urdu numbers as words: the Urdu voice misreads digits
@@ -1422,30 +1459,55 @@ async def custom_media_stream(websocket: WebSocket) -> None:
             await speech_allowed.wait()
             await send_audio(leveller.whole(cached) if leveller else cached)
             first_audio = perf_counter() - started
+            if on_first_audio is not None:
+                on_first_audio(first_audio)
         else:
             chunks: List[bytes] = []
             try:
                 # aclosing: when playback stops early (call ended, caller interrupted) the voice stream is closed at
                 # once, which releases the live Deepgram line instead of holding it until garbage collection.
-                audio = (speech_runtime.tts_stream(text, selected_engine, preferred_language) if speech_runtime is not None else
+                audio = (_tts_stream(text, selected_engine, preferred_language) if direct_tts else
+                         speech_runtime.tts_stream(text, selected_engine, preferred_language) if speech_runtime is not None else
                          _deepgram_speaker_stream(selected_speaker, text, preferred_language) if selected_speaker else
                          _tts_stream(text, selected_engine, preferred_language))
                 async with contextlib.aclosing(audio):
                     async for chunk in audio:
+                        if not chunk:
+                            continue
                         if not active:
                             return first_audio
                         await speech_allowed.wait()
-                        if not first_audio:
-                            first_audio = perf_counter() - started
                         chunks.append(chunk)  # the cache keeps the original audio; it is levelled when played
                         await send_audio(leveller.process(chunk) if leveller else chunk)
+                        if not first_audio:
+                            first_audio = perf_counter() - started
+                            if on_first_audio is not None:
+                                on_first_audio(first_audio)
+                if not chunks:
+                    raise RuntimeError("Speech provider completed without audio")
             except (httpx.HTTPError, RuntimeError) as error:
+                if speech_runtime is not None and not direct_tts and not chunks:
+                    logger.warning("Pipecat %s speech produced no audio (%s); retrying the same provider directly",
+                                   selected_engine, type(error).__name__)
+                    speech_recoveries.append({"engine": selected_engine, "from": "pipecat",
+                                              "to": "direct", "error_type": type(error).__name__})
+                    retry_started = perf_counter() - started
+                    retry_first_audio = await speak_audio(text, cache_key, selected_engine,
+                        on_first_audio=(lambda delay: on_first_audio(retry_started + delay))
+                            if on_first_audio is not None else None,
+                        direct_tts=True)
+                    return retry_started + retry_first_audio
                 if selected_engine != "elevenlabs" or not os.getenv("DEEPGRAM_API_KEY", "").strip():
                     raise
                 # ElevenLabs refused or cut off the sentence (out of credits, a dropped stream): the rest of the call
                 # speaks with the Deepgram voice, starting with this whole sentence again, instead of going silent.
                 await use_deepgram_voice(error)
-                return await speak_audio(text, forced_engine="deepgram")
+                retry_started = perf_counter() - started
+                retry_first_audio = await speak_audio(text, forced_engine="deepgram",
+                    on_first_audio=(lambda delay: on_first_audio(retry_started + delay))
+                        if on_first_audio is not None and not chunks else None,
+                    direct_tts=direct_tts)
+                return first_audio if chunks else retry_started + retry_first_audio
             if cache_key:
                 _cached_audio[cache_key] = b"".join(chunks)
         mark_count += 1
@@ -2401,9 +2463,6 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                         deepgram_ready = asyncio.create_task(open_deepgram())
                         greeting = await asyncio.to_thread(_greeting_text, preferred_language)
                         logger.info("custom voice: greeting starts %.2fs after the call audio connected", perf_counter() - call_started)
-                        responses.append({"content": greeting, "timestamp": utc_iso(), "language": preferred_language})
-                        memory.add_assistant(greeting)
-                        save_progress()
                         reply_task = asyncio.create_task(play_greeting(greeting))
                         asyncio.create_task(warm_call())
                         reply_task.add_done_callback(log_reply_failure)
@@ -2481,16 +2540,19 @@ async def custom_media_stream(websocket: WebSocket) -> None:
         if last_words and not any(last_words in " ".join(str(turn.get("content") or "").split()) for turn in transcript):
             transcript.append({"content": last_words, "timestamp": utc_iso(), "language": preferred_language,
                                "turn_kind": "unanswered_at_hangup"})
-        if transcript or responses:
+        if transcript or responses or greeting_delivery["status"] == "failed":
             await asyncio.to_thread(log_call, caller, None, {
                 "direction": "inbound",
-                "status": "transfer_requested" if callback_requested else "failed" if stream_failure else "completed",
+                "status": "transfer_requested" if callback_requested else "failed" if (
+                    stream_failure or (not responses and greeting_delivery["status"] == "failed")) else "completed",
                 "duration": int(round(perf_counter() - call_started)),
                 "provider": "custom_twilio",
                 "provider_call_id": call_sid or stream_sid,
                 "channel_type": "phone_call",
                 "provider_call_status": "ended",
                 "provider_metadata": {"stt_engine": "flux" if flux else "nova", "tts_engine": engine, **runtime_info,
+                                      "greeting": dict(greeting_delivery),
+                                      "speech_recoveries": speech_recoveries[-20:],
                                       "stream_end_event": stream_end_event,
                                       "websocket_close_code": websocket_close_code,
                                       "loop_lag_max_ms": loop_lag["max_ms"], "loop_lag_over_250ms": loop_lag["over_250ms"],
