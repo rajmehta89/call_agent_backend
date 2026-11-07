@@ -1,8 +1,11 @@
+import logging
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import quote
 
 from mongo_client import mongo_client
+
+logger = logging.getLogger(__name__)
 
 
 def notify_human_assignment(
