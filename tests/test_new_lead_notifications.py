@@ -49,6 +49,7 @@ def test_new_lead_posts_to_team_and_notifies_sales_member(monkeypatch):
     assert notifications.documents[0]["channel"] == "lead"
     assert notifications.documents[0]["recipient"] == member["email"]
     assert notifications.documents[0]["lead_id"] == "lead-1"
+    assert notifications.documents[0]["link"] == "/leads"
     assert notifications.documents[0]["read"] is False
     assert published[0][0] == ("lead",)
     assert published[0][1] == {"key": "lead-1", "workspace": "default"}

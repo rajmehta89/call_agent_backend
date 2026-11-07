@@ -99,7 +99,8 @@ def notify_new_lead(lead: Dict[str, Any], *, workspace_id: str = "default", sour
     email = str(lead.get("email") or "").strip()[:180]
     source_label = {"voice": "phone call", "retell": "phone call", "sms": "SMS", "manual": "CRM entry"}.get(source.lower(), source.replace("_", " "))
     now = datetime.utcnow()
-    link = "/inbox/channel"
+    channel_link = "/inbox/channel"
+    lead_link = "/leads"
     details = [f"Name: {name}"]
     if phone:
         details.append(f"Phone: {phone}")
@@ -123,7 +124,7 @@ def notify_new_lead(lead: Dict[str, Any], *, workspace_id: str = "default", sour
             "read_by": [],
             "type": "new_lead",
             "lead_id": lead_id,
-            "link": link,
+            "link": channel_link,
             "created_at": now,
         })
     except Exception:
@@ -153,7 +154,7 @@ def notify_new_lead(lead: Dict[str, Any], *, workspace_id: str = "default", sour
                     "recipient_id": str(member.get("_id") or ""),
                     "workspace_id": workspace,
                     "lead_id": lead_id,
-                    "link": link,
+                    "link": lead_link,
                     "created_at": now,
                     "read": False,
                 })

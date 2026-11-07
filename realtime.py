@@ -84,6 +84,12 @@ async def _stream(user: Dict[str, Any]) -> AsyncIterator[str]:
                 continue
             if event.get("workspace") not in (None, workspace):
                 continue
+            kind = event.get("kind")
+            if kind == "lead":
+                if not (has_permission(user, "handle_conversations") or has_permission(user, "manage_assigned_leads")):
+                    continue
+            elif not has_permission(user, "handle_conversations"):
+                continue
             yield f"data: {json.dumps(event)}\n\n"
     finally:
         _subscribers.discard(queue)
@@ -95,7 +101,7 @@ def events(token: str = Query(..., min_length=10)):
     user = user_from_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Your session has expired")
-    if not has_permission(user, "handle_conversations"):
-        raise HTTPException(status_code=403, detail="Permission required: handle_conversations")
+    if not (has_permission(user, "handle_conversations") or has_permission(user, "manage_assigned_leads")):
+        raise HTTPException(status_code=403, detail="Permission required: handle_conversations or manage_assigned_leads")
     return StreamingResponse(_stream(user), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
