@@ -80,6 +80,8 @@ AUTH_SECRET=replace-with-a-long-random-secret
 APP_ENV=production
 ALLOW_PUBLIC_SIGNUP=false
 WORKSPACE_NAME=Your business name
+# Required only when unauthenticated voice/SMS webhooks serve multiple workspaces from one database.
+INBOUND_WORKSPACE_ID=
 PUBLIC_APP_URL=http://127.0.0.1:3000
 SMTP_HOST=
 SMTP_PORT=587

@@ -16,7 +16,7 @@ from resource_scopes import intersect
 from voice_languages import normalize_language
 import realtime
 from call_status import schedule_auto_status
-from notification_service import notify_new_lead
+from notification_service import notify_new_lead, resolve_inbound_workspace_id
 
 FORWARDING_MODE = "ring_all_answer"  # call_forwarding.py marks forwarded calls with this transfer_mode
 FORWARDING_MODES = {FORWARDING_MODE, "ring_all_press_1"}  # preserve results from calls made before the change
@@ -183,6 +183,7 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
     clean_email = str(email or "").strip()[:180]
     clean_phone = re.sub(r"[^\d+]", "", str(phone or "").strip())[:40]
     clean_language = normalize_language(preferred_language)
+    workspace_id = resolve_inbound_workspace_id()
     now = utc_now()
     existing = mongo_client.leads.find_one({"$or": [{"browser_identity": identity}, {"phone": identity}]})
     if not existing and clean_phone:
@@ -201,6 +202,8 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
         values["phone"] = clean_phone
 
     if existing:
+        if not existing.get("workspace_id") or (existing.get("workspace_id") == "default" and workspace_id != "default"):
+            values["workspace_id"] = workspace_id
         mongo_client.leads.update_one({"_id": existing["_id"]}, {"$set": values})
         if clean_phone:
             try:
@@ -218,6 +221,7 @@ def upsert_browser_lead(browser_phone: str, name: str = "", email: str = "", pho
         "notes": "Automatically captured from a browser voice test.",
         "status": "new",
         "source": "voice",
+        "workspace_id": workspace_id,
         "call_attempts": 0,
         "created_at": now,
     })
@@ -333,10 +337,14 @@ def _ensure_inbound_lead(
         return None, None
 
     session_id = str(data.get("call_session_id") or "").strip()
+    workspace_id = resolve_inbound_workspace_id(data.get("workspace_id"))
     lead_phone = f"web:{session_id}" if raw_identifier.lower() == "web caller" and session_id else raw_identifier
     existing = mongo_client.leads.find_one({"browser_identity": raw_identifier}) if raw_identifier.startswith("client:browser_") else None
     existing = existing or mongo_client.leads.find_one({"phone": lead_phone})
     if existing:
+        if not existing.get("workspace_id") or (existing.get("workspace_id") == "default" and workspace_id != "default"):
+            mongo_client.leads.update_one({"_id": existing["_id"]}, {"$set": {"workspace_id": workspace_id, "updated_at": now}})
+            existing["workspace_id"] = workspace_id
         return str(existing["_id"]), existing
 
     label = "Web caller" if raw_identifier.lower() == "web caller" else "Browser caller" if raw_identifier.startswith("client:") else "Inbound caller"
@@ -350,6 +358,7 @@ def _ensure_inbound_lead(
         "notes": "Automatically captured from an inbound voice call.",
         "status": "new",
         "source": "retell" if data.get("provider") == "retell" else "voice",
+        "workspace_id": workspace_id,
         "call_attempts": 0,
         "last_call": now,
         "created_at": now,
@@ -364,7 +373,7 @@ def _ensure_inbound_lead(
         if existing:
             return str(existing["_id"]), existing
         raise
-    notify_new_lead(lead, source=lead.get("source") or "voice")
+    notify_new_lead(lead, workspace_id=workspace_id, source=lead.get("source") or "voice")
     logger.info(f"Created inbound lead {lead['_id']} from {label}")
     return str(inserted.inserted_id), lead
 

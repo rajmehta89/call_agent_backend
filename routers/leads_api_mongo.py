@@ -32,7 +32,7 @@ load_project_env()
 
 from auth_service import can_assign_conversations, require_permission, require_user
 from voice_languages import normalize_language
-from notification_service import notify_new_lead
+from notification_service import notify_new_lead, notify_new_leads_imported, resolve_inbound_workspace_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_permission("manage_assigned_leads"))])  # dashboard API: sign-in required for every route
@@ -358,6 +358,7 @@ async def upload_leads_csv(file: UploadFile = File(...), user: Dict[str, Any] = 
 
     imported_count = 0
     errors = []
+    workspace_id = str(user.get("workspace_id") or "default")
     for row_num, row in enumerate(csv_reader, start=2):
         try:
             if not row.get("name") or not row.get("phone"):
@@ -376,6 +377,8 @@ async def upload_leads_csv(file: UploadFile = File(...), user: Dict[str, Any] = 
                     "notes": row.get("notes", "").strip(),
                     "preferred_language": normalize_language(row.get("preferred_language")),
                     "status": "new",
+                    "source": "csv_import",
+                    "workspace_id": workspace_id,
                     "call_attempts": 0,
                     "last_call": None,
                     "created_at": utc_now(),
@@ -386,6 +389,9 @@ async def upload_leads_csv(file: UploadFile = File(...), user: Dict[str, Any] = 
             imported_count += 1
         except Exception as exc:
             errors.append(f"Row {row_num}: {str(exc)}")
+
+    if imported_count:
+        notify_new_leads_imported(imported_count, workspace_id=workspace_id)
 
     return {
         "success": True,
@@ -553,7 +559,13 @@ async def receive_inbound_sms(request: Request):
     if answered and ObjectId.is_valid(str(answered.get("lead_id"))):
         lead = mongo_client.leads.find_one({"_id": ObjectId(str(answered["lead_id"]))})
     lead = lead or mongo_client.leads.find_one({"phone": {"$in": [from_number, raw_from]}})
-    workspace_id = (answered or {}).get("workspace_id") or (lead or {}).get("workspace_id") or "default"
+    workspace_id = (answered or {}).get("workspace_id") or (lead or {}).get("workspace_id") or ""
+    resolved_workspace = resolve_inbound_workspace_id()
+    if not workspace_id or (workspace_id == "default" and resolved_workspace != "default"):
+        workspace_id = resolved_workspace
+    if lead and lead.get("workspace_id") != workspace_id:
+        mongo_client.leads.update_one({"_id": lead["_id"]}, {"$set": {"workspace_id": workspace_id, "updated_at": utc_now()}})
+        lead["workspace_id"] = workspace_id
     now = utc_now()
     if not lead:
         lead = {

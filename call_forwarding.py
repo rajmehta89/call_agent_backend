@@ -343,7 +343,9 @@ def assign_lead_to_requested_agent(
             logger.warning("call forwarding: named agent %s is not a registered active user; lead stays unassigned", matched.get("name"))
             return {"agent": matched, "user": None, "lead": None}
 
+        workspace_id = str(user.get("workspace_id") or "default")
         lead = mongo_client.leads.find_one({"phone": identity})
+        created_lead = False
         if not lead:
             now = datetime.utcnow()
             draft = {
@@ -354,6 +356,7 @@ def assign_lead_to_requested_agent(
                 "notes": "Automatically captured from an inbound voice call.",
                 "status": "new",
                 "source": "voice",
+                "workspace_id": workspace_id,
                 "call_attempts": 0,
                 "last_call": now,
                 "created_at": now,
@@ -363,14 +366,17 @@ def assign_lead_to_requested_agent(
                 inserted = mongo_client.leads.insert_one(draft)
                 draft["_id"] = inserted.inserted_id
                 lead = draft
-                from notification_service import notify_new_lead
-                notify_new_lead(lead, source="voice")
+                created_lead = True
             except Exception:
                 # A concurrent webhook may have created the unique phone row.
                 lead = mongo_client.leads.find_one({"phone": identity})
         if not lead:
             logger.warning("call forwarding: could not find or create lead for %s", identity)
             return {"agent": matched, "user": user, "lead": None}
+
+        if not lead.get("workspace_id") or (lead.get("workspace_id") == "default" and workspace_id != "default"):
+            mongo_client.leads.update_one({"_id": lead["_id"]}, {"$set": {"workspace_id": workspace_id, "updated_at": datetime.utcnow()}})
+            lead["workspace_id"] = workspace_id
 
         assigned_name = user.get("name") or matched.get("name") or "Team member"
         mongo_client.leads.update_one(
@@ -382,6 +388,12 @@ def assign_lead_to_requested_agent(
             }},
         )
         lead.update({"assigned_to": str(user["_id"]), "assigned_to_name": assigned_name})
+        if created_lead:
+            try:
+                from notification_service import notify_new_lead
+                notify_new_lead(lead, workspace_id=workspace_id, source="voice")
+            except Exception:
+                logger.exception("call forwarding: could not notify the team about lead %s", lead.get("_id"))
         logger.info("call forwarding: assigned lead %s to %s (%s)", identity, assigned_name, user.get("_id"))
         return {"agent": matched, "user": user, "lead": lead}
     except Exception as error:
