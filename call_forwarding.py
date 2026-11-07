@@ -363,6 +363,8 @@ def assign_lead_to_requested_agent(
                 inserted = mongo_client.leads.insert_one(draft)
                 draft["_id"] = inserted.inserted_id
                 lead = draft
+                from notification_service import notify_new_lead
+                notify_new_lead(lead, source="voice")
             except Exception:
                 # A concurrent webhook may have created the unique phone row.
                 lead = mongo_client.leads.find_one({"phone": identity})

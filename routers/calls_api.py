@@ -16,6 +16,7 @@ from resource_scopes import intersect
 from voice_languages import normalize_language
 import realtime
 from call_status import schedule_auto_status
+from notification_service import notify_new_lead
 
 FORWARDING_MODE = "ring_all_answer"  # call_forwarding.py marks forwarded calls with this transfer_mode
 FORWARDING_MODES = {FORWARDING_MODE, "ring_all_press_1"}  # preserve results from calls made before the change
@@ -354,10 +355,30 @@ def _ensure_inbound_lead(
         "created_at": now,
         "updated_at": now,
     }
-    inserted = mongo_client.leads.insert_one(lead)
-    lead["_id"] = inserted.inserted_id
+    try:
+        inserted = mongo_client.leads.insert_one(lead)
+        lead["_id"] = inserted.inserted_id
+    except Exception:
+        # A concurrent call or webhook may have created the same unique phone row.
+        existing = mongo_client.leads.find_one({"phone": lead_phone})
+        if existing:
+            return str(existing["_id"]), existing
+        raise
+    notify_new_lead(lead, source=lead.get("source") or "voice")
     logger.info(f"Created inbound lead {lead['_id']} from {label}")
     return str(inserted.inserted_id), lead
+
+
+def ensure_inbound_lead(phone_number: str, call_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Create and announce a first-time inbound caller as soon as the call connects."""
+    if not mongo_client.is_connected():
+        return None
+    try:
+        _, lead = _ensure_inbound_lead(phone_number, None, call_data or {"direction": "inbound"}, utc_now())
+        return str(lead["_id"]) if lead else None
+    except Exception:
+        logger.exception("Could not create inbound lead for %s", caller_identity(phone_number))
+        return None
 
 
 def log_call(phone_number: str, lead_id: Optional[str] = None, call_data: Dict[str, Any] = None, *, _attempt: int = 0) -> Dict[str, Any]:

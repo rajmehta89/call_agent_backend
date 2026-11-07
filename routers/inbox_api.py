@@ -336,9 +336,9 @@ def _unread_channel_query(user: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _read_notifications(user: Dict[str, Any], conversation_id: Optional[str]) -> int:
-    """Mark this user's inbox notifications about a conversation (or, with None, the team channel) as read."""
+    """Mark this user's inbox or lead notifications about a conversation or team channel as read."""
     recipients = [value for value in (user.get("email"), user.get("name")) if value]
-    where = {"channel": "inbox", "read": False, "recipient": {"$in": recipients}}
+    where = {"channel": {"$in": ["inbox", "lead"]}, "read": False, "recipient": {"$in": recipients}}
     where["conversation_id"] = conversation_id if conversation_id else {"$in": [None, ""]}
     return mongo_client.notifications.update_many(where, {"$set": {"read": True, "read_at": datetime.utcnow()}}).modified_count
 

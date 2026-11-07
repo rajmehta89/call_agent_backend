@@ -39,7 +39,7 @@ from brain_service import agent_config, brain_service
 from conversation_memory import bounded_history, voice_history_token_budget
 import call_forwarding
 import live_transcript
-from routers.calls_api import log_call
+from routers.calls_api import ensure_inbound_lead, log_call
 from transfer_service import transfer_service
 from voice_provider_settings import provider_enabled
 from voice_languages import language_for_phone, text_language
@@ -1761,7 +1761,12 @@ async def retell_custom_llm_websocket(websocket: WebSocket, call_id: str) -> Non
             if interaction_type == "call_details":
                 call = event.get("call") or {}
                 caller_number = str(call.get("from_number") or "unknown")
-                transfer_service.register_call(call_id, caller_number, direction=call.get("direction") or "inbound")
+                call_direction = str(call.get("direction") or "inbound").lower()
+                if call_direction == "inbound":
+                    await asyncio.to_thread(ensure_inbound_lead, caller_number, {
+                        "direction": "inbound", "provider": "retell", "call_session_id": call_id,
+                    })
+                transfer_service.register_call(call_id, caller_number, direction=call_direction)
                 _trace(f"retell_call_details call={call_id} direction={call.get('direction') or 'inbound'} caller_known={caller_number != 'unknown'}")
                 try:
                     sensitivity = min(1.0, max(0.0, float(os.getenv("RETELL_INTERRUPTION_SENSITIVITY", "0.85"))))

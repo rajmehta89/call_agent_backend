@@ -48,7 +48,7 @@ from voice_keyterms import business_name, current_keyterms
 import live_transcript
 from logging_setup import bind_call, timed
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
-from routers.calls_api import log_call
+from routers.calls_api import ensure_inbound_lead, log_call
 from voice_provider_settings import custom_stack_enabled, custom_voice_engine, deepgram_voice, provider_enabled, provider_snapshot
 from routers.twilio_api import _browser_caller_phone, _build_conversation_twiml, _get_request_base_url
 from voice_languages import DEFAULT_LANGUAGE, effective_language, enabled_language_codes, language_enabled, language_for_call, language_greeting, normalize_language, requested_language, spoken_language, text_language
@@ -2557,6 +2557,11 @@ async def custom_media_stream(websocket: WebSocket) -> None:
                             logger.warning("closing media stream: the custom stack is off and call %s is not a fallback", call_sid)
                             await websocket.close(code=1008)
                             return
+                        if caller and caller.lower() not in {"unknown", "anonymous"}:
+                            await asyncio.to_thread(ensure_inbound_lead, caller, {
+                                "direction": "inbound", "provider": "retell" if fallback_engine else "voice",
+                                "call_session_id": call_sid,
+                            })
                         # Use the authenticated Start parameters before opening STT.
                         # Flux's English model cannot transcribe Arabic or Urdu.
                         flux = _use_flux_for_language(preferred_language)

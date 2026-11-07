@@ -48,6 +48,16 @@ DISCOVERY_FALLBACK_QUERIES = (
     "builders and renovators",
     "dental clinics",
     "auto repair shops",
+    "physiotherapy clinics",
+    "veterinary clinics",
+    "chiropractors",
+    "concreters",
+    "tilers",
+    "fencing contractors",
+    "tree removal services",
+    "garage door repairs",
+    "removalists",
+    "solar installers",
 )
 WORKER_INTERVAL_SECONDS = 30
 
@@ -155,6 +165,7 @@ def campaign_status() -> Dict[str, Any]:
 
 
 ATTACHMENT_NOTE = "P.S. I've attached a 2-page overview with pricing."
+OPT_OUT_LINE = "Not relevant? Reply \"unsubscribe\" and I won't email you again."
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -215,6 +226,8 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
     attachments = campaign_attachments() if use_private_email else []
     if attachments:
         body = f"{body.rstrip()}\n\n{ATTACHMENT_NOTE}"
+    if OPT_OUT_LINE not in body:  # every commercial email needs a way out (Australia's Spam Act)
+        body = f"{body.rstrip()}\n\n{OPT_OUT_LINE}"
     try:
         if attachments:
             result = sender.send([draft.get("recipient_email", "")], draft.get("subject", ""), body, attachments=attachments)
@@ -224,10 +237,10 @@ def _send_draft(draft: Dict[str, Any]) -> Dict[str, Any]:
             mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": {"status": "error", "error": result.get("reason", "Email was not sent"), "updated_at": datetime.utcnow()}})
             return {"status": "error", "reason": result.get("reason", "Email was not sent")}
         now = datetime.utcnow()
-        sent = {"status": "sent", "sent_at": now, "updated_at": now, "delivery": result}
+        # Keep the outbox showing exactly what the recipient got.
+        sent = {"status": "sent", "sent_at": now, "updated_at": now, "delivery": result, "body": body}
         if attachments:
-            # Keep the outbox showing exactly what the recipient got.
-            sent.update({"body": body, "attachments": [os.path.basename(path) for path in attachments]})
+            sent["attachments"] = [os.path.basename(path) for path in attachments]
         mongo_client.email_outbox.update_one({"_id": draft["_id"]}, {"$set": sent})
         return {"status": "sent", "id": str(draft["_id"])}
     except smtplib.SMTPResponseException as exc:
@@ -484,7 +497,9 @@ async def email_campaign_worker() -> None:
         await asyncio.sleep(WORKER_INTERVAL_SECONDS)
         # A discovery outage must not skip approvals or already approved mail.
         # Every phase keeps its synchronous provider/DB work off the event loop.
-        for phase, operation in (("discovery", refill_campaign_candidates),
+        from campaign_replies import check_replies
+        for phase, operation in (("reply check", check_replies),  # first: a stop request must beat the next send
+                                 ("discovery", refill_campaign_candidates),
                                  ("approval digest", notify_pending_approval_digest),
                                  ("approved delivery", _deliver_approved_email_outbox)):
             try:

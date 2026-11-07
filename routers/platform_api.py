@@ -202,13 +202,24 @@ def audit_logs(limit: int = Query(100, ge=1, le=500)):
 def notifications(unread_only: bool = False, user: Dict[str, Any] = Depends(require_user)):
     _require_db()
     query: Dict[str, Any] = {"read": False} if unread_only else {}
+    personal_channels = ["inbox", "lead"]
+    own_recipients = [str(user.get("name") or ""), str(user.get("email") or "")]
+    own_personal_notice = {"$or": [{"recipient_id": str(user.get("_id") or user.get("id") or "")},
+                                   {"recipient": {"$in": own_recipients}}]}
     if user.get("role") in {"owner", "admin"}:
-        # Admins oversee handoff alerts, but inbox notices (assignments, mentions) belong to the person they name.
-        mine = {"$or": [{"channel": {"$ne": "inbox"}}, {"recipient": {"$in": [str(user.get("name") or ""), str(user.get("email") or "")]}}]}
-        query = {"$and": [query, mine]} if query else mine
+        # Admins oversee operational alerts, while personal inbox and lead alerts belong to their named recipient.
+        access = {"$or": [{"channel": {"$nin": personal_channels}},
+                          {"channel": {"$in": personal_channels}, **own_personal_notice}]}
+        query = {"$and": [query, access]} if query else access
     else:
-        recipients = [str(user.get("name") or ""), str(user.get("email") or ""), "Human team", "team"]
-        query = {"$and": [query, {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}]} if query else {"$or": [{"recipient": {"$in": recipients}}, {"recipient": {"$exists": False}}]}
+        team_recipients = own_recipients + ["Human team", "team"]
+        access = {"$or": [
+            {"channel": {"$in": personal_channels}, **own_personal_notice},
+            {"channel": {"$nin": personal_channels}, "$or": [
+                {"recipient": {"$in": team_recipients}}, {"recipient": {"$exists": False}}
+            ]},
+        ]}
+        query = {"$and": [query, access]} if query else access
     return {"success": True, "data": _serialize(list(mongo_client.notifications.find(query).sort("created_at", -1).limit(100)))}
 
 
@@ -218,8 +229,17 @@ def mark_notification_read(notification_id: str, user: Dict[str, Any] = Depends(
     if not ObjectId.is_valid(notification_id):
         raise HTTPException(status_code=400, detail="Invalid notification id")
     notification_query: Dict[str, Any] = {"_id": ObjectId(notification_id)}
-    if user.get("role") not in {"owner", "admin"}:
-        notification_query["recipient"] = {"$in": [str(user.get("name") or ""), str(user.get("email") or ""), "Human team", "team"]}
+    own_recipients = [str(user.get("name") or ""), str(user.get("email") or "")]
+    if user.get("role") in {"owner", "admin"}:
+        notification_query["$or"] = [
+            {"channel": {"$nin": ["inbox", "lead"]}},
+            {"channel": {"$in": ["inbox", "lead"]}, "$or": [
+                {"recipient_id": str(user.get("_id") or user.get("id") or "")},
+                {"recipient": {"$in": own_recipients}},
+            ]},
+        ]
+    else:
+        notification_query["recipient"] = {"$in": own_recipients + ["Human team", "team"]}
     result = mongo_client.notifications.update_one(
         notification_query,
         {"$set": {"read": True, "read_at": datetime.utcnow()}},

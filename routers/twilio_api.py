@@ -25,7 +25,7 @@ from logging_setup import bind_call
 from twilio_security import stream_token, valid_stream_token, verify_twilio_request
 from env_loader import load_project_env
 from qa_engine import DynamicQA
-from routers.calls_api import log_call, record_failed_call, update_call_from_twilio, upsert_browser_lead
+from routers.calls_api import ensure_inbound_lead, log_call, record_failed_call, update_call_from_twilio, upsert_browser_lead
 from brain_service import brain_service
 from transfer_service import transfer_service
 from notification_service import notify_recipients
@@ -516,6 +516,10 @@ async def twilio_conversation_ws(websocket: WebSocket):
                     session["phone_number"] = outbound_context.get("phone_number") or session["phone_number"]
                     session["lead_id"] = outbound_context.get("lead_id")
                     session["direction"] = "outbound"
+                elif session["direction"].lower() == "inbound":
+                    session["lead_id"] = await asyncio.to_thread(ensure_inbound_lead, session["phone_number"], {
+                        "direction": "inbound", "provider": "voice", "call_session_id": session["session_id"],
+                    })
                 transfer_service.register_call(
                     session["session_id"],
                     session["phone_number"],

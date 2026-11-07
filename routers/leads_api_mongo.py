@@ -32,6 +32,7 @@ load_project_env()
 
 from auth_service import can_assign_conversations, require_permission, require_user
 from voice_languages import normalize_language
+from notification_service import notify_new_lead
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/leads", tags=["Leads Management"], dependencies=[Depends(require_permission("manage_assigned_leads"))])  # dashboard API: sign-in required for every route
@@ -216,7 +217,7 @@ def get_leads(filters: Dict | None = None, limit: int = 50, skip: int = 0, scope
     }
 
 
-def add_lead(lead_data: Dict[str, Any], owner: Optional[str] = None):
+def add_lead(lead_data: Dict[str, Any], owner: Optional[str] = None, workspace_id: str = "default"):
     _require_db()
     if not lead_data.get("name") or not lead_data.get("phone"):
         raise HTTPException(status_code=400, detail={"success": False, "error": "Name and phone are required"})
@@ -232,6 +233,8 @@ def add_lead(lead_data: Dict[str, Any], owner: Optional[str] = None):
         "notes": lead_data.get("notes", ""),
         "preferred_language": normalize_language(lead_data.get("preferred_language")),
         "status": "new",
+        "source": "manual",
+        "workspace_id": workspace_id or "default",
         "call_attempts": 0,
         "last_call": None,
         "created_at": utc_now(),
@@ -240,6 +243,7 @@ def add_lead(lead_data: Dict[str, Any], owner: Optional[str] = None):
     }
     result = mongo_client.leads.insert_one(lead_doc)
     lead_doc["_id"] = str(result.inserted_id)
+    notify_new_lead(lead_doc, workspace_id=workspace_id, source="manual")
     return {"success": True, "data": lead_doc}
 
 
@@ -333,7 +337,8 @@ def get_leads_endpoint(
 @router.post("/")
 def add_lead_endpoint(lead: Lead, user: Dict[str, Any] = Depends(require_user)):
     # A team member's new lead is theirs; an admin's starts unassigned.
-    return add_lead(lead.dict(exclude_unset=True), owner=owner_scope(user).get("assigned_to"))
+    return add_lead(lead.dict(exclude_unset=True), owner=owner_scope(user).get("assigned_to"),
+                    workspace_id=user.get("workspace_id", "default"))
 
 
 @router.get("/stats")
@@ -548,6 +553,7 @@ async def receive_inbound_sms(request: Request):
     if answered and ObjectId.is_valid(str(answered.get("lead_id"))):
         lead = mongo_client.leads.find_one({"_id": ObjectId(str(answered["lead_id"]))})
     lead = lead or mongo_client.leads.find_one({"phone": {"$in": [from_number, raw_from]}})
+    workspace_id = (answered or {}).get("workspace_id") or (lead or {}).get("workspace_id") or "default"
     now = utc_now()
     if not lead:
         lead = {
@@ -559,13 +565,14 @@ async def receive_inbound_sms(request: Request):
             "preferred_language": "en",
             "status": "new",
             "source": "sms",
+            "workspace_id": workspace_id,
             "call_attempts": 0,
             "created_at": now,
             "updated_at": now,
         }
         lead["_id"] = mongo_client.leads.insert_one(lead).inserted_id
+        notify_new_lead(lead, workspace_id=workspace_id, source="sms")
     lead_id = str(lead["_id"])
-    workspace_id = (answered or {}).get("workspace_id") or lead.get("workspace_id") or "default"
     media_urls = [str(form.get(f"MediaUrl{index}") or "").strip() for index in range(4)]
     media_urls = [url for url in media_urls if url]
     media_names = [str(form.get(f"MediaContentType{index}") or "Attachment").split("/")[-1].upper() + " attachment" for index in range(len(media_urls))]

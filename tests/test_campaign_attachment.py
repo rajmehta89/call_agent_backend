@@ -21,7 +21,8 @@ def test_brochure_is_attached_and_noted(tmp_path):
          patch("private_email_service.PrivateEmailService.configured", new_callable=PropertyMock, return_value=True):
         assert email_campaign._send_draft(draft)["status"] == "sent"
     body = send.call_args[0][2]
-    assert body.endswith(email_campaign.ATTACHMENT_NOTE) and send.call_args[1]["attachments"] == [str(brochure)]
+    assert body.endswith(email_campaign.OPT_OUT_LINE) and send.call_args[1]["attachments"] == [str(brochure)]
+    assert email_campaign.ATTACHMENT_NOTE in body
     saved = mongo.email_outbox.update_one.call_args[0][1]["$set"]
     assert saved["body"] == body and saved["attachments"] == ["Overview.pdf"]
 
